@@ -14,6 +14,9 @@ pub enum StorageError {
     /// 建目录等文件系统操作失败。
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// 任务日志行等 JSON 互转失败。
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
     /// 试图收尾一个不存在的任务行。
     #[error("task not found: {0}")]
     TaskNotFound(String),

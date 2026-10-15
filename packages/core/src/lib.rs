@@ -2,4 +2,5 @@
 
 pub mod config;
 pub mod security;
+pub mod task;
 pub mod tools;
