@@ -1,7 +1,7 @@
 //! Demo B 端到端：真二进制 + 脚本化假模型，跨进程验证「记住 → 复用 → 纠正 → 纠正生效」，
-//! 外加技能发现与执行（验收 #5）。
+//! 外加技能发现与执行（验收 #5：两个技能都要被真的发现与执行）。
 //!
-//! 五个段落各自起一次 `ignis run` 进程，共享同一个 `IGNIS_HOME` 与工作区副本——记忆要跨进程
+//! 六个段落各自起一次 `ignis run` 进程，共享同一个 `IGNIS_HOME` 与工作区副本——记忆要跨进程
 //! （重启）才算记住。段与段之间的断言全部落在真库、真 JSONL 与假模型实际收到的请求上。
 //! 夹具是 `examples/uv-project`；uv 与 pytest **不必真装**，这里只断言「选了 uv 工作流」。
 
@@ -20,12 +20,13 @@ fn uv_fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/uv-project")
 }
 
-/// 五个段落的 prompt：逐字照抄 brief。
+/// 六个段落的 prompt：逐字照抄 brief（第六段是验收 #5 要求的第二个技能）。
 const PROMPT_REMEMBER: &str = "这个项目使用 uv 管理 Python 环境，请记住";
 const PROMPT_REUSE: &str = "帮我检查这个项目的依赖并运行测试";
 const PROMPT_CORRECT: &str = "不对，这个项目改用 pip 了";
 const PROMPT_PLAIN: &str = "随便跑个任务";
 const PROMPT_SKILLS: &str = "检查一下服务器健康状况";
+const PROMPT_ANALYZE: &str = "分析一下这个项目";
 
 /// 事实的位置：两次写入同一个 key 就构成「纠正」。
 const FACT_KEY: &str = "pkg_manager";
@@ -33,13 +34,17 @@ const FACT_KEY: &str = "pkg_manager";
 const UV_TEXT: &str = "使用 uv 管理 Python 环境";
 const PIP_TEXT: &str = "使用 pip 管理 Python 环境";
 
-/// 内置技能的目录名（`skills/<name>/SKILL.md`）。
+/// 内置技能的目录名（`skills/<name>/SKILL.md`）：验收 #5 要求这两个都被真的发现与执行。
 const SERVER_HEALTH_SKILL: &str = "server-health";
+const PROJECT_ANALYZER_SKILL: &str = "project-analyzer";
 /// `server-health` 正文里的一句（`skills/server-health/SKILL.md`）。
 ///
 /// 只可能经 `load_skill` 的工具结果进入请求：系统提示里的技能目录只有名称与描述（渐进披露），
 /// 目录与系统提示都不含这句正文。
 const SKILL_BODY_MARKER: &str = "任何一步失败都记录原因后继续";
+/// `project-analyzer` 正文里的一句（`skills/project-analyzer/SKILL.md`），口径同上：
+/// 目录注入只带名称与描述（`description` 是英文那句），正文只可能经 `load_skill` 到达模型。
+const ANALYZER_BODY_MARKER: &str = "先拿证据再下结论";
 
 /// 跑一次 `ignis run <prompt> --yes`（独立进程），返回输出；退出码与内容由调用方断言。
 fn run_ignis(home: &Path, project: &Path, model: &ScriptedModelHandle, prompt: &str) -> Output {
@@ -59,6 +64,31 @@ fn system_message(request: &Value) -> &str {
     let first = messages.first().expect("请求至少带一条 system 消息");
     assert_eq!(first["role"], "system", "{request:#?}");
     first["content"].as_str().expect("system 消息应为文本")
+}
+
+/// stdout 里的结束行：渲染的文本增量不补换行，结束行可能紧跟最终答复在同一行，所以按
+/// `contains` 找行；调用方再钉它的行尾（技能标注就挂在行尾）。
+fn finished_line(stdout: &str) -> Option<&str> {
+    stdout.lines().find(|line| line.contains("● Finished:"))
+}
+
+/// 任务日志（`IGNIS_HOME/logs/<task_id>.jsonl`）的原文；断言失败时贴进消息里便于定位。
+fn task_log(home: &Path, task_id: &str) -> String {
+    fs::read_to_string(home.join("logs").join(format!("{task_id}.jsonl"))).expect("任务日志应存在")
+}
+
+/// 日志里的 `tool_exec` 序列：`(name, args)`，按发生顺序——钉住模型实际调用了什么。
+fn tool_exec_sequence(raw: &str) -> Vec<(String, String)> {
+    raw.lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("日志行应是 JSON"))
+        .filter(|line| line["type"] == "tool_exec")
+        .map(|line| {
+            (
+                line["name"].as_str().unwrap_or_default().to_owned(),
+                line["args"].to_string(),
+            )
+        })
+        .collect()
 }
 
 #[test]
@@ -195,7 +225,7 @@ fn demo_b_remembers_reuses_and_corrects_across_processes() {
 
     // 发现：第一份系统提示列出技能目录（内置三个，这里钉两个名字）
     let discovery = system_message(&requests[0]);
-    for name in ["project-analyzer", SERVER_HEALTH_SKILL] {
+    for name in [PROJECT_ANALYZER_SKILL, SERVER_HEALTH_SKILL] {
         assert!(discovery.contains(&format!("- {name}: ")), "{discovery}");
     }
     // 执行：正文只经 `load_skill` 的工具结果进入请求——系统提示里没有它（渐进披露），
@@ -215,36 +245,78 @@ fn demo_b_remembers_reuses_and_corrects_across_processes() {
     );
 
     // 端行按首次加载顺序标注用过的技能：`skills_used` 恰好是 [server-health]（行尾没有第二项），
-    // 任务与 JSONL 都要对得上。渲染的文本增量不补换行，结束行可能紧跟最终答复在同一行，
-    // 所以按 `contains` 找行、再钉它的行尾。
-    let end_line = stdout
-        .lines()
-        .find(|line| line.contains("● Finished:"))
-        .unwrap_or_else(|| panic!("结束行缺失：{text}"));
+    // 任务与 JSONL 都要对得上。
+    let end_line = finished_line(&stdout).unwrap_or_else(|| panic!("结束行缺失：{text}"));
     assert!(
         end_line.ends_with(&format!("· skills: {SERVER_HEALTH_SKILL}")),
         "{end_line}"
     );
     let (task_id, status, error) = latest_task(&db);
     assert_eq!((status.as_str(), error.as_str()), ("success", ""), "{text}");
-    let raw = fs::read_to_string(home.join("logs").join(format!("{task_id}.jsonl")))
-        .expect("任务日志应存在");
-    let tools: Vec<(String, String)> = raw
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).expect("日志行应是 JSON"))
-        .filter(|line| line["type"] == "tool_exec")
-        .map(|line| {
-            (
-                line["name"].as_str().unwrap_or_default().to_owned(),
-                line["args"].to_string(),
-            )
-        })
-        .collect();
+    let raw = task_log(&home, &task_id);
     assert_eq!(
-        tools,
+        tool_exec_sequence(&raw),
         [
             ("load_skill", json!({"name": SERVER_HEALTH_SKILL})),
             ("shell_run", json!({"command": "df -h"})),
+        ]
+        .map(|(name, args)| (name.to_owned(), args.to_string())),
+        "{raw}"
+    );
+
+    // ---- 6. 第二个技能（验收 #5）：project-analyzer 也要被真的发现、选择和执行 ----
+    // 段 5 只跑通了 `server-health`，`project-analyzer` 此前只出现在目录注入的断言里；
+    // 验收清单要求「至少 2 个 Skill 能被正确发现、选择和执行」，所以再起一个进程跑完整路径：
+    // 目录发现 → `load_skill` 读全文 → 按技能的第一步跑 `shell_run` → 端行标注。
+    let model = ScriptedModel::start(vec![
+        tool_call("load_skill", json!({"name": PROJECT_ANALYZER_SKILL})),
+        tool_call("shell_run", json!({"command": "ls -la"})),
+        ScriptStep::Text("项目分析完成：顶层结构如上。".into()),
+    ]);
+    let output = run_ignis(&home, &project, &model, PROMPT_ANALYZE);
+    let text = output_text(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    let requests = model.requests();
+    assert_eq!(requests.len(), 3, "{requests:#?}");
+
+    // 发现：目录（名称 + 描述）在第一份系统提示里，正文不在——与段 5 同一套渐进披露
+    // （段 4 留下的 pip 事实也在这份系统提示里：同一工作区、同一份记忆）
+    let discovery = system_message(&requests[0]);
+    assert!(
+        discovery.contains(&format!("- {PROJECT_ANALYZER_SKILL}: ")),
+        "{discovery}"
+    );
+    assert!(!discovery.contains(ANALYZER_BODY_MARKER), "{discovery}");
+    // 执行：第二次请求的 tool 消息带回 SKILL.md 正文，说明模型真的读到了
+    let messages = requests[1]["messages"]
+        .as_array()
+        .expect("请求体里的 messages 应为数组");
+    assert!(
+        messages.iter().any(|message| {
+            message["role"] == "tool"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains(ANALYZER_BODY_MARKER))
+        }),
+        "第二次请求应带回 project-analyzer 的 SKILL.md 正文：{messages:#?}"
+    );
+
+    // 端行只标注这一次真正加载的技能（行尾没有第二项）
+    let end_line = finished_line(&stdout).unwrap_or_else(|| panic!("结束行缺失：{text}"));
+    assert!(
+        end_line.ends_with(&format!("· skills: {PROJECT_ANALYZER_SKILL}")),
+        "{end_line}"
+    );
+    // JSONL 钉住真落盘的调用序列：先读技能，再按技能的第一步动手
+    let (task_id, status, error) = latest_task(&db);
+    assert_eq!((status.as_str(), error.as_str()), ("success", ""), "{text}");
+    let raw = task_log(&home, &task_id);
+    assert_eq!(
+        tool_exec_sequence(&raw),
+        [
+            ("load_skill", json!({"name": PROJECT_ANALYZER_SKILL})),
+            ("shell_run", json!({"command": "ls -la"})),
         ]
         .map(|(name, args)| (name.to_owned(), args.to_string())),
         "{raw}"

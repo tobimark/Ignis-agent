@@ -7,6 +7,6 @@ def test_greet_uses_the_given_name() -> None:
     assert greet("ignis") == "Hello, ignis!"
 
 
-def test_greet_is_not_case_sensitive_about_the_surroundings() -> None:
+def test_greet_handles_another_name() -> None:
     # 第二个测试只是让「可被收集」不止一个用例
     assert greet("uv") == "Hello, uv!"
