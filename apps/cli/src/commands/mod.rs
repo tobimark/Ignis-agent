@@ -13,7 +13,9 @@ use std::time::Instant;
 
 use anyhow::{Result, bail};
 use ignis_core::config::{Config, ensure_home, ignis_home, load_config};
+use ignis_core::memory::MemoryStore;
 use ignis_core::security::{ApprovalMode, Policy};
+use ignis_core::skills::SkillCatalog;
 use ignis_core::task::{TaskKind, TaskOutcome, TaskRequest, TaskRunner};
 use ignis_runtime::native::NativeRuntime;
 use ignis_runtime::openai::OpenAiClient;
@@ -87,6 +89,10 @@ impl Session {
         };
 
         let config = Arc::new(config);
+        // 记忆与技能目录都落在 `~/.ignis` 下：运行器在组装期把已知事实与技能目录注入系统提示，
+        // 也把 `remember`/`load_skill` 两个元工具挂进注册表
+        let memory = MemoryStore::new(Arc::clone(&db), home.join("memory"));
+        let skills = SkillCatalog::load(&home.join("skills"));
         let runner = TaskRunner::new(
             Arc::clone(&db),
             Arc::clone(&config),
@@ -94,6 +100,8 @@ impl Session {
             policy,
             approvals,
             home.join("logs"),
+            memory,
+            skills,
         );
 
         Ok(Self { workspace, runner })

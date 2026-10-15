@@ -1,10 +1,11 @@
 //! 任务编排：上下文组装、JSONL 任务日志、记账与脱敏。
 //!
 //! [`TaskRunner::run`] 的一次运行：生成 task id → 写 `tasks` 行（`running`）与 JSONL 首行
-//! `task_start` → 用 [`ToolRuntime`] 与 [`prompts::build_system_prompt`] 组装 [`RunRequest`]
-//! → 消费内核事件（每行带 `ts` 且整行过 [`Redactor`] 后落盘，同时转发给 sink、累加用量）
-//! → 终态时 `finish_task` 并补 JSONL 收尾行 `task_end`（与首行 `task_start` 对称；内核自己的
-//! `Done` 事件已落成一行 `done`，收尾行不能与它同名）。
+//! `task_start` → 向记忆层取已知事实（失败只警告，见 [`TaskRunner::run`] 的说明）、把内置工具与
+//! 元工具组装成 [`ToolRuntime`]，连事实与技能目录一起交给 [`prompts::build_system_prompt`]
+//! → 消费内核事件（每行带 `ts` 且整行过 [`Redactor`] 后落盘，同时转发给 sink、累加用量、记下
+//! 真正加载过的技能）→ 终态时 `finish_task` 并补 JSONL 收尾行 `task_end`（与首行 `task_start`
+//! 对称；内核自己的 `Done` 事件已落成一行 `done`，收尾行不能与它同名）。
 
 pub mod prompts;
 
@@ -23,8 +24,10 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
+use crate::memory::MemoryStore;
 use crate::security::{Policy, Redactor};
-use crate::tools::{ToolRuntime, default_registry};
+use crate::skills::SkillCatalog;
+use crate::tools::{ToolRuntime, default_registry, meta_tools};
 
 /// 任务来源：`ignis run` 的一次性运行，或 REPL 的一轮输入。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +77,9 @@ pub struct TaskOutcome {
     pub error: Option<String>,
     pub usage: Usage,
     pub messages: Vec<ChatMessage>,
+    /// 本次任务真正加载过的技能：事件流里 `load_skill` 调用按首次出现顺序去重（重复加载只记一次）；
+    /// 事件流没以 `Done` 收尾时只记已经看到的那些。命令层的结束行据此标注 `skills: …`。
+    pub skills_used: Vec<String>,
 }
 
 /// 任务编排的失败原因；内核自身的失败是 `Done{Failed}` 事件，不走这里。
@@ -98,10 +104,17 @@ pub struct TaskRunner {
     log_dir: PathBuf,
     /// 任务日志与服务层的脱敏器；工具执行器另持一份（[`Redactor`] 不派生 `Clone`）。
     redactor: Redactor,
+    /// 长期记忆：组装期注入已知事实，元工具 `remember` 往这里写。
+    memory: Arc<MemoryStore>,
+    /// 技能目录：组装期注入目录（渐进披露第一步），元工具 `load_skill` 读正文。
+    skills: Arc<SkillCatalog>,
 }
 
 impl TaskRunner {
     /// 装配运行器：依赖全部由调用方注入，便于替换内核与审批方。
+    ///
+    /// 参数较多是计划钉死的构造签名（P2 Task 5 在末尾追加了记忆与技能目录），不做参数对象包装。
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: Arc<Db>,
         config: Arc<Config>,
@@ -109,6 +122,8 @@ impl TaskRunner {
         policy: Arc<Policy>,
         approvals: Arc<dyn ApprovalHandler>,
         log_dir: PathBuf,
+        memory: Arc<MemoryStore>,
+        skills: Arc<SkillCatalog>,
     ) -> Self {
         Self {
             db,
@@ -118,6 +133,8 @@ impl TaskRunner {
             policy,
             approvals,
             log_dir,
+            memory,
+            skills,
         }
     }
 
@@ -128,6 +145,9 @@ impl TaskRunner {
     ///
     /// 基础设施失败（含事件循环里的落盘失败）也会先把任务行收成 `failed` 再返回 `Err`
     /// （见 [`TaskRunner::fail_infrastructure`]）：任务行不允许停在 `running`。
+    ///
+    /// 组装期向记忆层取事实是 fail-soft 的：读不出来（表缺失、库损坏……）只往 stderr 打一行警告，
+    /// 本轮不注入事实，任务照跑——记忆不是任务的前提，技能段与工具装配都不受它影响。
     pub async fn run(
         &self,
         req: TaskRequest,
@@ -197,8 +217,24 @@ impl TaskRunner {
         let mut messages = req.history;
         messages.push(chat_message(Role::User, req.prompt.clone()));
 
+        // 组装期向记忆层要「这次任务该知道的事实」（本工作区的 project 事实 + 按 prompt 检索到的
+        // user/global 事实）。任何失败都只是这一轮没有事实可注入：一行警告、空事实集，任务照跑。
+        let facts = match self.memory.prompt_facts(&workspace, &req.prompt) {
+            Ok(facts) => facts,
+            Err(error) => {
+                eprintln!("warning: 读取记忆失败，本次任务不注入已知事实：{error}");
+                Vec::new()
+            }
+        };
+
+        // 注册表 = 内置工具 + 元工具（remember 写记忆、load_skill 取技能正文）；顺序即模型看到的
+        // 工具表顺序，元工具排在末尾
+        let mut registry = default_registry();
+        for tool in meta_tools(Arc::clone(&self.memory), Arc::clone(&self.skills)) {
+            registry.register(tool);
+        }
         let executor = Arc::new(ToolRuntime::new(
-            default_registry(),
+            registry,
             Arc::clone(&self.policy),
             Arc::clone(&self.approvals),
             Arc::clone(&self.db),
@@ -209,7 +245,12 @@ impl TaskRunner {
         ));
         let request = RunRequest {
             messages: messages.clone(),
-            system_prompt: prompts::build_system_prompt(&workspace, &executor.specs()),
+            system_prompt: prompts::build_system_prompt(
+                &workspace,
+                &executor.specs(),
+                &facts,
+                self.skills.metas(),
+            ),
             model: self.config.model.clone(),
             limits: self.config.limits,
             executor,
@@ -217,6 +258,8 @@ impl TaskRunner {
 
         // 事件循环：落盘 → 转发给调用方 → 记账，全程保持内核事件顺序
         let mut done = None;
+        // 用过的技能：只认 `load_skill` 的调用，按首次出现顺序去重；无终态事件时也带着已看到的那些
+        let mut skills_used: Vec<String> = Vec::new();
         let mut stream = self.runtime.run(request, cancel).await;
         while let Some(event) = stream.next().await {
             self.append_jsonl(log, task_id, serde_json::to_value(&event)?)?;
@@ -232,6 +275,14 @@ impl TaskRunner {
                     usage.input_tokens = usage.input_tokens.saturating_add(*input_tokens);
                     usage.output_tokens = usage.output_tokens.saturating_add(*output_tokens);
                     usage.estimated |= *estimated;
+                }
+                // 参数缺 `name` 或类型不是字符串的调用不算数：没读到任何一个技能
+                RuntimeEvent::ToolExec { name, args, .. }
+                    if name == "load_skill"
+                        && let Some(skill) = args.get("name").and_then(Value::as_str)
+                        && !skills_used.iter().any(|seen| seen == skill) =>
+                {
+                    skills_used.push(skill.to_owned());
                 }
                 RuntimeEvent::Done {
                     status,
@@ -293,6 +344,7 @@ impl TaskRunner {
             error,
             usage: *usage,
             messages,
+            skills_used,
         })
     }
 
@@ -371,6 +423,7 @@ fn now_millis() -> i64 {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -382,6 +435,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
+    use crate::memory::FactScope;
     use crate::security::ApprovalMode;
 
     /// 单个测试独占的临时目录：工作区、日志与真实 DB 文件都在里面，析构时清理。
@@ -415,6 +469,10 @@ mod tests {
         dir: TempDir,
         db: Arc<Db>,
         runtime: Arc<MockRuntime>,
+        /// 记忆层：事实写真实库，镜像写临时目录。
+        memory: Arc<MemoryStore>,
+        /// 技能目录：内置三技能 + 临时目录里的 `my-skill`。
+        skills: Arc<SkillCatalog>,
         runner: TaskRunner,
         log_dir: PathBuf,
     }
@@ -430,6 +488,17 @@ mod tests {
                 api_key: api_key.map(str::to_string),
                 ..Config::default()
             });
+            // 一个用户技能：技能段里的 `(user)` 标注与描述都靠它断言（内置三技能随目录自带）
+            let skills_dir = dir.path().join("skills");
+            fs::create_dir_all(skills_dir.join("my-skill")).unwrap();
+            fs::write(
+                skills_dir.join("my-skill").join("SKILL.md"),
+                "---\nname: my-skill\ndescription: Temporary skill for the task runner tests.\n\
+                 ---\n# my-skill\n正文\n",
+            )
+            .unwrap();
+            let memory = MemoryStore::new(Arc::clone(&db), dir.path().join("memory"));
+            let skills = SkillCatalog::load(&skills_dir);
             let runner = TaskRunner::new(
                 Arc::clone(&db),
                 config,
@@ -440,11 +509,15 @@ mod tests {
                 })),
                 ScriptedApproval::new(Vec::new()),
                 log_dir.clone(),
+                Arc::clone(&memory),
+                Arc::clone(&skills),
             );
             Self {
                 dir,
                 db,
                 runtime,
+                memory,
+                skills,
                 runner,
                 log_dir,
             }
@@ -452,12 +525,33 @@ mod tests {
 
         /// 一条一次性运行请求：工作区就是临时目录，无历史轮次。
         fn request(&self, prompt: &str) -> TaskRequest {
+            self.request_in(self.dir.path(), prompt)
+        }
+
+        /// 指定工作区的一条一次性运行请求。
+        fn request_in(&self, workspace: &Path, prompt: &str) -> TaskRequest {
             TaskRequest {
                 prompt: prompt.into(),
                 history: Vec::new(),
                 kind: TaskKind::Run,
-                workspace: self.dir.path().to_path_buf(),
+                workspace: workspace.to_path_buf(),
             }
+        }
+
+        /// 记一条绑定给定工作区的 `project` 事实。
+        fn remember_project(&self, workspace: &Path, key: &str, text: &str) {
+            self.memory
+                .remember(FactScope::Project, Some(workspace), key, text, None)
+                .unwrap();
+        }
+
+        /// 内核每次请求看到的 system prompt（一次 `run` 对应一份）。
+        fn system_prompts(&self) -> Vec<String> {
+            self.runtime
+                .requests()
+                .into_iter()
+                .map(|request| request.system_prompt)
+                .collect()
         }
 
         /// 跑一次任务，返回结果、sink 转发的事件与落盘行。
@@ -966,5 +1060,205 @@ mod tests {
         assert!(rows[0].ended_at.is_some());
         let message = rows[0].error.as_deref().unwrap();
         assert!(message.contains("Permission denied"), "{message}");
+    }
+
+    /// 组装期把记忆与技能目录注入 system prompt：段头逐字、事实逐条一行、project 在检索之前。
+    #[tokio::test]
+    async fn system_prompt_carries_known_facts_and_available_skills() {
+        let env = Env::new("injected", vec![success(Some("done"))], None);
+        let workspace = env.dir.path().to_path_buf();
+        env.remember_project(&workspace, "pkg_manager", "这个项目用 uv 管理依赖");
+        env.memory
+            .remember(FactScope::User, None, "editor", "偏好 Neovim 编辑", None)
+            .unwrap();
+
+        let report = env.run(env.request("依赖帮我用 Neovim 改一下")).await;
+
+        assert_eq!(report.outcome.status, RunStatus::Success);
+        let prompts = env.system_prompts();
+        assert_eq!(prompts.len(), 1);
+        let prompt = &prompts[0];
+        // 两段都追加在英文骨架之后，段头逐字（用户技能与内置技能同在一张目录里）
+        assert!(prompt.contains("\nKnown facts:\n"), "{prompt}");
+        assert!(
+            prompt.contains("\nAvailable skills (call load_skill to read one):\n"),
+            "{prompt}"
+        );
+        // 事实逐条一行：project 事实无条件注入，user 事实靠 prompt 里的检索项命中
+        let project = prompt
+            .find("- [project/pkg_manager] 这个项目用 uv 管理依赖")
+            .unwrap_or_else(|| panic!("project 事实段缺失：{prompt}"));
+        let retrieved = prompt
+            .find("- [user/editor] 偏好 Neovim 编辑")
+            .unwrap_or_else(|| panic!("检索事实段缺失：{prompt}"));
+        assert!(
+            project < retrieved,
+            "project 事实必须排在检索事实之前：{prompt}"
+        );
+        assert!(
+            prompt.contains("\n- my-skill: Temporary skill for the task runner tests. (user)\n"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("\n- server-health: "), "{prompt}");
+        // 目录一行一条，与技能目录的元信息一一对应（不多不少）
+        let skills_section = prompt
+            .split_once("\nAvailable skills (call load_skill to read one):\n")
+            .unwrap_or_else(|| panic!("技能段缺失：{prompt}"))
+            .1;
+        assert_eq!(
+            skills_section.lines().count(),
+            env.skills.metas().len(),
+            "{skills_section}"
+        );
+        // 原有骨架没被替换
+        assert!(prompt.contains("You are Ignis"), "{prompt}");
+        assert!(
+            prompt.contains("Answer in the user's language."),
+            "{prompt}"
+        );
+    }
+
+    /// A/B 工作区隔离经完整注入链再验一遍：B 的 project 事实不会出现在 A 的 system prompt 里。
+    #[tokio::test]
+    async fn workspace_isolation_holds_through_the_runner() {
+        let env = Env::new("isolation", vec![success(Some("done"))], None);
+        let other = env.dir.path().join("other");
+        fs::create_dir_all(&other).unwrap();
+        env.remember_project(env.dir.path(), "pkg_manager", "A 用 uv 管理依赖");
+        env.remember_project(&other, "pkg_manager", "B 用 poetry 管理依赖");
+
+        // 两个工作区各跑一次，prompt 用同一句话（`run_raw`：同一环境跑两次不留两套日志断言）
+        let a = env
+            .run_raw(env.request("环境和依赖都怎么装"))
+            .await
+            .unwrap()
+            .0;
+        let b = env
+            .run_raw(env.request_in(&other, "环境和依赖都怎么装"))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            (a.status, b.status),
+            (RunStatus::Success, RunStatus::Success)
+        );
+
+        let prompts = env.system_prompts();
+        assert_eq!(prompts.len(), 2);
+        assert!(
+            prompts[0].contains("- [project/pkg_manager] A 用 uv 管理依赖"),
+            "{}",
+            prompts[0]
+        );
+        assert!(
+            !prompts[0].contains("B 用 poetry 管理依赖"),
+            "{}",
+            prompts[0]
+        );
+        assert!(
+            prompts[1].contains("- [project/pkg_manager] B 用 poetry 管理依赖"),
+            "{}",
+            prompts[1]
+        );
+        assert!(!prompts[1].contains("A 用 uv 管理依赖"), "{}", prompts[1]);
+    }
+
+    /// `load_skill` 的调用按序去重记进 [`TaskOutcome::skills_used`]；别的工具与坏参数不算数。
+    #[tokio::test]
+    async fn skills_used_collects_load_skill_calls_in_order_without_duplicates() {
+        let env = Env::new(
+            "skills-used",
+            vec![
+                tool_exec("load_skill", json!({ "name": "my-skill" })),
+                tool_exec("load_skill", json!({ "name": "server-health" })),
+                tool_exec("load_skill", json!({ "name": "my-skill" })),
+                tool_exec("fs_read", json!({ "path": "a.txt" })),
+                // 参数不合法（缺 name）：系统提示里没有这个技能可加载，不算用过
+                tool_exec("load_skill", json!({})),
+                success(Some("done")),
+            ],
+            None,
+        );
+
+        let report = env.run(env.request("用技能干活")).await;
+
+        assert_eq!(report.outcome.skills_used, ["my-skill", "server-health"]);
+    }
+
+    /// 事件流没以 `Done` 收尾（内核实现缺陷）时，已看到的技能照样交回调用方。
+    #[tokio::test]
+    async fn skills_used_is_collected_without_a_done_event() {
+        let env = Env::new(
+            "skills-used-no-done",
+            vec![
+                tool_exec("load_skill", json!({ "name": "server-health" })),
+                RuntimeEvent::TextDelta {
+                    text: "半截".into(),
+                },
+            ],
+            None,
+        );
+
+        let report = env.run(env.request("检查服务器")).await;
+
+        assert_eq!(report.outcome.status, RunStatus::Failed);
+        assert_eq!(report.outcome.skills_used, ["server-health"]);
+    }
+
+    /// 子进程专用：真正跑 `facts` 表不可用时的 fail-soft 场景，让警告落到 stderr。
+    ///
+    /// 「警告确实写到了 stderr」只能在进程边界上观察：libtest 的输出捕获会把测试线程
+    /// （以及它派生出的线程）里的打印宏收走，同进程里读不到 fd 2。父用例
+    /// [`missing_facts_table_warns_and_the_task_still_succeeds`] 用
+    /// `--include-ignored --nocapture` 在子进程里拉起本用例，再读它的 stderr。
+    #[ignore = "由 missing_facts_table_warns_and_the_task_still_succeeds 在子进程里拉起"]
+    #[tokio::test]
+    async fn fail_soft_child_reports_a_missing_facts_table_on_stderr() {
+        let env = Env::new("fail-soft-child", vec![success(Some("done"))], None);
+        // 事实表没了（库被换过、迁移中途失败）：组装期只能退化成空事实集
+        env.db
+            .with_conn(|conn| conn.execute_batch("DROP TABLE facts"))
+            .unwrap();
+
+        let report = env.run(env.request("读一下项目配置")).await;
+
+        assert_eq!(report.outcome.status, RunStatus::Success);
+        let prompts = env.system_prompts();
+        assert_eq!(prompts.len(), 1);
+        assert!(!prompts[0].contains("Known facts:"), "{}", prompts[0]);
+        // 技能段不归记忆管：两条注入链互不牵连
+        assert!(prompts[0].contains("Available skills"), "{}", prompts[0]);
+    }
+
+    /// 记忆不可用时任务照跑（不因记忆失败而失败），只在 stderr 留一行警告。
+    #[test]
+    fn missing_facts_table_warns_and_the_task_still_succeeds() {
+        let exe = std::env::current_exe().unwrap();
+        let output = Command::new(&exe)
+            .args(["--include-ignored", "--nocapture", "fail_soft_child"])
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "子进程应全绿（场景断言都在里面）：{:?}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout)
+        );
+        // 一行警告，任务不失败：fail-soft 的全部含义
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(stderr.lines().count(), 1, "{stderr}");
+        assert!(stderr.contains("warning: 读取记忆失败"), "{stderr}");
+        // 底层原因也带上，便于排查是哪儿断了
+        assert!(stderr.contains("no such table: facts"), "{stderr}");
+    }
+
+    /// 一条工具执行事件（`ToolExec`）；`summary` 不在本模块的断言范围里。
+    fn tool_exec(name: &str, args: Value) -> RuntimeEvent {
+        RuntimeEvent::ToolExec {
+            name: name.to_string(),
+            summary: format!("Running {name}"),
+            args,
+        }
     }
 }
