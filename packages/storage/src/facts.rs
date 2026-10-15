@@ -6,11 +6,9 @@
 //! 全文索引 `facts_fts` 是 external content 表，正文靠迁移 002 的三个触发器同步，DAO 不直接
 //! 写它。
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use crate::db::{Db, Result, StorageError};
+use crate::db::{Db, Result, StorageError, now_millis};
 
 /// 新建事实行的字段。
 ///
@@ -76,14 +74,6 @@ fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<FactRecord> {
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
-}
-
-/// 当前 epoch 毫秒；系统时钟早于 `UNIX_EPOCH` 时取 0（不 panic）。
-fn now_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// FTS5 的 `MATCH` 查询串：整体包成一个短语，内部引号翻倍转义。
@@ -301,8 +291,8 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use super::{fts_phrase, like_pattern, now_millis};
-    use crate::db::{Db, StorageError};
+    use super::{fts_phrase, like_pattern};
+    use crate::db::{Db, StorageError, now_millis};
     use crate::facts::NewFact;
 
     fn fact(scope: &str, workspace: Option<&str>, key: &str, text: &str) -> NewFact {

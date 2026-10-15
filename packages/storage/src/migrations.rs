@@ -46,6 +46,35 @@ CREATE TRIGGER facts_au AFTER UPDATE ON facts BEGIN
   INSERT INTO facts_fts(rowid, text) VALUES (new.id, new.text);
 END;
 ",
+    // 003：调度任务表、运行留痕表与告警表。
+    //
+    // 取值契约（由上层保证，storage 与 `tasks.status` 一样不做校验）：
+    // - `jobs.schedule_kind`：interval | cron；`jobs.status`：active | paused
+    // - `job_runs.status`：running | success | failed | aborted | limit_reached
+    // - `alerts.severity`：info | warning | critical
+    // `idx_job_runs_job_started` 服务「某 job 的历次运行」倒序取数；`idx_alerts_dedup_created`
+    // 服务去重窗口查询（同键 + 时间下界），`idx_alerts_read` 服务未读列举/计数与翻牌。
+    "
+CREATE TABLE jobs (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, prompt TEXT NOT NULL, schedule_kind TEXT NOT NULL,
+  schedule_expr TEXT NOT NULL, kernel TEXT NOT NULL, profile_json TEXT NOT NULL,
+  limits_json TEXT NOT NULL, workspace TEXT NOT NULL, status TEXT NOT NULL,
+  created_at INTEGER NOT NULL, last_run_at INTEGER
+);
+CREATE TABLE job_runs (
+  id TEXT PRIMARY KEY, job_id TEXT NOT NULL, task_id TEXT, started_at INTEGER NOT NULL,
+  ended_at INTEGER, status TEXT NOT NULL, summary TEXT, error TEXT,
+  input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_job_runs_job_started ON job_runs(job_id, started_at);
+CREATE TABLE alerts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, severity TEXT NOT NULL, title TEXT NOT NULL, body TEXT,
+  source_job_id TEXT, source_task_id TEXT, dedup_key TEXT NOT NULL, created_at INTEGER NOT NULL,
+  read_at INTEGER
+);
+CREATE INDEX idx_alerts_dedup_created ON alerts(dedup_key, created_at);
+CREATE INDEX idx_alerts_read ON alerts(read_at);
+",
 ];
 
 /// 逐条应用未执行的迁移；每条迁移在独立事务中执行并同步推进 `user_version`。

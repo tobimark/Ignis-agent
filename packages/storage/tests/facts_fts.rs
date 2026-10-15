@@ -74,8 +74,8 @@ fn migration_002_creates_the_facts_schema_and_bumps_user_version() {
     let path = dir.join("ignis.db");
 
     let db = Db::open(&path).unwrap();
-    // 两条迁移都已应用
-    assert_eq!(user_version(&db), 2);
+    // 三条迁移都已应用
+    assert_eq!(user_version(&db), 3);
     assert!(object_exists(&db, "table", "facts"));
     // external content 的 FTS5 表也是 sqlite_master 里的 table
     assert!(object_exists(&db, "table", "facts_fts"));
@@ -110,7 +110,7 @@ fn reopening_a_migrated_database_is_idempotent_and_keeps_facts() {
 
     // 第二次打开：迁移是 no-op，事实行与 FTS 索引都还在
     let db = Db::open(&path).unwrap();
-    assert_eq!(user_version(&db), 2);
+    assert_eq!(user_version(&db), 3);
     assert_eq!(
         db.get_fact(id).unwrap().expect("fact row").text,
         "使用 uv 管理 Python 环境"

@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 
@@ -23,6 +24,12 @@ pub enum StorageError {
     /// 试图读改一条不存在的事实行。
     #[error("fact not found: {0}")]
     FactNotFound(i64),
+    /// 试图读改一条不存在的调度任务行。
+    #[error("job not found: {0}")]
+    JobNotFound(String),
+    /// 试图读改一条不存在的调度运行行。
+    #[error("job run not found: {0}")]
+    JobRunNotFound(String),
     /// 数据库的 schema 版本高于本程序已知的迁移数（被更新版本的 ignis 升级过）。
     #[error(
         "数据库版本过新：user_version={found}，本程序只支持 {supported} 个迁移（请升级 ignis）"
@@ -31,6 +38,16 @@ pub enum StorageError {
 }
 
 pub(crate) type Result<T> = std::result::Result<T, StorageError>;
+
+/// 当前 epoch 毫秒；系统时钟早于 `UNIX_EPOCH` 时取 0（不 panic）。
+///
+/// 新建行的 `created_at` 等时间戳由 DAO 自己取，调用方不用传时钟。
+pub(crate) fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 /// SQLite 连接持有者：内部为 `Mutex<Connection>`，DAO 一律经 [`Db::with_conn`] 串行访问。
 pub struct Db {
@@ -124,7 +141,10 @@ mod tests {
         assert!(table_exists(&db, "approvals"));
         assert!(table_exists(&db, "facts"));
         assert!(table_exists(&db, "facts_fts"));
-        assert_eq!(user_version(&db), 2);
+        assert!(table_exists(&db, "jobs"));
+        assert!(table_exists(&db, "job_runs"));
+        assert!(table_exists(&db, "alerts"));
+        assert_eq!(user_version(&db), 3);
         drop(db);
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -149,7 +169,7 @@ mod tests {
 
         // 第二次打开同一路径：迁移已是 no-op，既有数据仍在。
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 2);
+        assert_eq!(user_version(&db), 3);
         assert!(db.get_task("01").unwrap().is_some());
         drop(db);
 
@@ -193,7 +213,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         assert!(table_exists(&db, "tasks"));
         assert!(table_exists(&db, "approvals"));
-        assert_eq!(user_version(&db), 2);
+        assert_eq!(user_version(&db), 3);
         assert!(db.list_tasks(10).unwrap().is_empty());
     }
 }
