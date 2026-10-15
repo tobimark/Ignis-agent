@@ -5,3 +5,5 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
