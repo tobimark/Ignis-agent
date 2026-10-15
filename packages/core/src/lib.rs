@@ -3,6 +3,7 @@
 pub mod config;
 pub mod doctor;
 pub mod memory;
+pub mod scheduler;
 pub mod security;
 pub mod skills;
 pub mod task;
