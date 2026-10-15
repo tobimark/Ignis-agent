@@ -153,7 +153,9 @@ fn render_approvals(approvals: &[ApprovalRecord]) -> String {
 }
 
 /// 极简表格：按列宽左对齐、列间两个空格、行尾不留空格。
-fn render_table(rows: &[Vec<String>]) -> String {
+///
+/// `memory`/`skills` 两个子命令复用同一套渲染（列宽对齐的规则只有一份）。
+pub(crate) fn render_table(rows: &[Vec<String>]) -> String {
     let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
     let mut widths = vec![0; columns];
     for row in rows {
@@ -325,7 +327,9 @@ fn format_duration(started_at: i64, ended_at: Option<i64>) -> String {
 }
 
 /// epoch 毫秒 → RFC 3339 短形（UTC，`2026-10-15T12:00:00Z`）。
-fn format_time(millis: i64) -> String {
+///
+/// `memory list` 的 `updated_at` 列复用同一口径：CLI 不为一行时间格式引入日期库。
+pub(crate) fn format_time(millis: i64) -> String {
     let (date, clock) = utc_parts(millis);
     format!("{date}T{clock}Z")
 }
@@ -378,13 +382,13 @@ fn id_prefix(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
-/// 压成单行：换行/制表/连续空白合成一个空格。
-fn one_line(text: &str) -> String {
+/// 压成单行：换行/制表/连续空白合成一个空格（表格单元格必过这一层，多行文本不会撑破表格）。
+pub(crate) fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// 按**字符**截断并补 `…`（按字节切会切坏 UTF-8）。
-fn truncate(text: &str, max_chars: usize) -> String {
+pub(crate) fn truncate(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
     }

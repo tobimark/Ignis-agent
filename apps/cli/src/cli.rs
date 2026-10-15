@@ -58,6 +58,16 @@ pub enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// 查看或修改长期记忆
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
+    /// 查看技能目录
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommand,
+    },
     /// 环境自检（home/config/api_key/base_url/workspace/db）
     Doctor,
 }
@@ -92,6 +102,52 @@ pub enum ConfigCommand {
     },
 }
 
+/// `ignis memory` 的子命令。
+#[derive(Debug, Subcommand)]
+pub enum MemoryCommand {
+    /// 列出事实（默认只看 active，新近在前）
+    List {
+        /// 连被取代的历史行一起列出
+        #[arg(long)]
+        all: bool,
+    },
+    /// 按关键词检索事实（列与 list 相同）
+    Search {
+        /// 检索词
+        query: String,
+    },
+    /// 新增一条事实（同 scope/key 的旧值被取代）
+    Add {
+        /// 作用域：user / project / global
+        #[arg(long, value_name = "SCOPE")]
+        scope: String,
+        /// 短标识，如 pkg_manager（同 key 再写一次即取代旧值）
+        #[arg(long, value_name = "KEY")]
+        key: String,
+        /// 事实内容
+        text: String,
+    },
+    /// 改写一条事实的文本
+    Edit {
+        /// 事实 id（memory list 的第一列）
+        id: String,
+        /// 新文本
+        text: String,
+    },
+    /// 删除一条事实
+    Delete {
+        /// 事实 id（memory list 的第一列）
+        id: String,
+    },
+}
+
+/// `ignis skills` 的子命令。
+#[derive(Debug, Subcommand)]
+pub enum SkillsCommand {
+    /// 列出技能（内置 + `~/.ignis/skills`，按名称排序）
+    List,
+}
+
 /// 解析参数后分发：错误一律经 `anyhow::Result` 上抛给 `main`。
 pub async fn dispatch(cli: &Cli) -> Result<ExitCode> {
     ensure_kernel(&cli.kernel)?;
@@ -100,6 +156,8 @@ pub async fn dispatch(cli: &Cli) -> Result<ExitCode> {
         Some(Command::Run { task }) => commands::run::run(cli, task).await,
         Some(Command::Task { command }) => commands::task::run(command),
         Some(Command::Config { command }) => commands::config::run(command),
+        Some(Command::Memory { command }) => commands::memory::run(cli, command),
+        Some(Command::Skills { command }) => commands::skills::run(command),
         Some(Command::Doctor) => commands::doctor::run(),
         // 无子命令 → REPL
         None => repl::run(cli).await,

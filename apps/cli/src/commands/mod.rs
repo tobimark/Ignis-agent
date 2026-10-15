@@ -1,9 +1,11 @@
 //! 命令层：`run` 与 REPL 共用的会话装配（配置/存储/策略/内核/审批）与单次任务执行，
-//! 以及 `task`/`config`/`doctor` 三组辅助命令。
+//! 以及 `task`/`config`/`memory`/`skills`/`doctor` 五组辅助命令。
 
 pub mod config;
 pub mod doctor;
+pub mod memory;
 pub mod run;
+pub mod skills;
 pub mod task;
 
 use std::io::IsTerminal;
@@ -34,6 +36,18 @@ pub struct Session {
     /// 本次任务的工作区（`--workspace`，否则配置里的 `workspace_root`）。
     workspace: PathBuf,
     runner: TaskRunner,
+    /// 与运行器同一份记忆存储与技能目录（`Arc` 克隆）：banner 计数从这里取，
+    /// 不重新开库、也不重新扫描技能目录。
+    memory: Arc<MemoryStore>,
+    skills: Arc<SkillCatalog>,
+}
+
+/// 工作区解析：`--workspace` 优先，否则配置里的 `workspace_root`（`Session::new` 与
+/// `memory add --scope project` 共用同一套口径）。
+pub fn resolve_workspace(cli: &Cli, config: &Config) -> PathBuf {
+    cli.workspace
+        .clone()
+        .unwrap_or_else(|| config.workspace_root.clone())
 }
 
 impl Session {
@@ -48,10 +62,7 @@ impl Session {
         ensure_home(&home)?;
         let mut config: Config = load_config(&home)?;
 
-        let workspace = cli
-            .workspace
-            .clone()
-            .unwrap_or_else(|| config.workspace_root.clone());
+        let workspace = resolve_workspace(cli, &config);
         if !workspace.is_dir() {
             bail!("工作区不存在或不是目录：{}", workspace.display());
         }
@@ -100,16 +111,37 @@ impl Session {
             policy,
             approvals,
             home.join("logs"),
-            memory,
-            skills,
+            Arc::clone(&memory),
+            Arc::clone(&skills),
         );
 
-        Ok(Self { workspace, runner })
+        Ok(Self {
+            workspace,
+            runner,
+            memory,
+            skills,
+        })
     }
 
     /// 本次会话的工作区（REPL banner 用）。
     pub fn workspace(&self) -> &Path {
         &self.workspace
+    }
+
+    /// banner 第 4 行的计数：`(技能数, active 事实数)`。
+    ///
+    /// 事实数读不出来时只打一行警告并退回 0（banner 显示 `Memory: off`）：状态行不该因为
+    /// 记忆库读失败而拦住整个 REPL。
+    pub fn banner_counts(&self) -> (usize, usize) {
+        let skills = self.skills.metas().len();
+        let memory = match self.memory.list(false) {
+            Ok(facts) => facts.len(),
+            Err(error) => {
+                eprintln!("warning: 读取记忆计数失败：{error}");
+                0
+            }
+        };
+        (skills, memory)
     }
 
     /// 跑一次任务：渲染任务消费 sink 边跑边输出，Ctrl-C 监听任务负责中止本次运行。
@@ -161,7 +193,8 @@ impl Session {
                 &outcome.id,
                 outcome.status,
                 started.elapsed(),
-                &outcome.usage
+                &outcome.usage,
+                &outcome.skills_used
             )
         );
         // 非成功终态不能只留一个状态词：原因（内核给出、已过 Redactor）打到 stderr，与

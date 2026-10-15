@@ -78,11 +78,17 @@ fn error_preview(output: &str) -> String {
 }
 
 /// 结束行：`● Finished: success · 1.2s · tokens in=1234 out=567 · task 0192…`；
-/// `estimated` 时 token 数前加 `~`。
+/// `estimated` 时 token 数前加 `~`；本次加载过技能时追加 ` · skills: {a,b}`（按首次加载顺序）。
 ///
 /// 任务 id 是结束行的一部分：失败/触限的运行要能直接从终端复制 id 去 `ignis task show`，
 /// 不必再翻 SQLite 或 JSONL。
-pub fn format_task_end(id: &str, status: RunStatus, elapsed: Duration, usage: &Usage) -> String {
+pub fn format_task_end(
+    id: &str,
+    status: RunStatus,
+    elapsed: Duration,
+    usage: &Usage,
+    skills: &[String],
+) -> String {
     let status = match status {
         RunStatus::Success => "success",
         RunStatus::Failed => "failed",
@@ -94,7 +100,13 @@ pub fn format_task_end(id: &str, status: RunStatus, elapsed: Duration, usage: &U
     let input = format!("{mark}in={}", usage.input_tokens);
     let output = format!("{mark}out={}", usage.output_tokens);
 
-    format!("● Finished: {status} · {elapsed} · tokens {input} {output} · task {id}")
+    let mut line =
+        format!("● Finished: {status} · {elapsed} · tokens {input} {output} · task {id}");
+    // 没加载过技能时整段缺席：多数任务的结束行保持 P1 的样子
+    if !skills.is_empty() {
+        line.push_str(&format!(" · skills: {}", skills.join(",")));
+    }
+    line
 }
 
 #[cfg(test)]
@@ -246,7 +258,8 @@ mod tests {
                 TASK_ID,
                 RunStatus::Success,
                 Duration::from_millis(1234),
-                &exact
+                &exact,
+                &[]
             ),
             "● Finished: success · 1.2s · tokens in=1234 out=567 · task 019a1b2c-3d4e-7f00-8000-000000000001"
         );
@@ -261,6 +274,7 @@ mod tests {
             RunStatus::Success,
             Duration::from_millis(1234),
             &estimated,
+            &[],
         );
         assert!(line.contains("~in=1234"), "{line}");
         assert!(line.contains("~out=567"), "{line}");
@@ -280,10 +294,41 @@ mod tests {
 
         for (status, name) in cases {
             assert_eq!(
-                format_task_end(TASK_ID, status, Duration::from_secs(2), &usage),
+                format_task_end(TASK_ID, status, Duration::from_secs(2), &usage, &[]),
                 format!("● Finished: {name} · 2.0s · tokens in=0 out=0 · task {TASK_ID}"),
                 "{status:?}"
             );
         }
+    }
+
+    #[test]
+    fn task_end_line_appends_used_skills_in_collection_order() {
+        let usage = Usage::default();
+        // 故意不是字典序：追加段必须保留调用方给的顺序
+        let skills = vec!["server-health".to_string(), "report-generator".to_string()];
+
+        assert_eq!(
+            format_task_end(
+                TASK_ID,
+                RunStatus::Success,
+                Duration::from_secs(2),
+                &usage,
+                &skills
+            ),
+            format!(
+                "● Finished: success · 2.0s · tokens in=0 out=0 · task {TASK_ID} \
+                 · skills: server-health,report-generator"
+            )
+        );
+
+        // 没加载过技能时追加段整体缺席（不是空段）
+        let plain = format_task_end(
+            TASK_ID,
+            RunStatus::Success,
+            Duration::from_secs(2),
+            &usage,
+            &[],
+        );
+        assert!(!plain.contains("skills"), "{plain}");
     }
 }

@@ -61,13 +61,28 @@ impl LineReader for StdinReader {
 }
 
 /// REPL banner：固定 4 行（版本号是 P1 的固定文案，不跟 `CARGO_PKG_VERSION` 联动）。
-pub fn banner_lines(workspace: &Path, kernel: &str) -> [String; 4] {
+///
+/// 第 4 行是运行时就绪度：技能目录条数 + active 事实数；一条事实都没有（`memory == 0`，
+/// 也含计数读失败时调用方退回的 0）打 `Memory: off`。
+pub fn banner_lines(workspace: &Path, kernel: &str, skills: usize, memory: usize) -> [String; 4] {
     [
         "IGNIS v0.1".to_string(),
         "● Ready".to_string(),
         format!("Workspace: {}", workspace.display()),
-        format!("Runtime: {kernel}"),
+        format!(
+            "Runtime: {kernel} · Skills: {skills} · {}",
+            memory_segment(memory)
+        ),
     ]
+}
+
+/// banner 的记忆段：有 active 事实给 `Memory: {n} facts`，没有给 `Memory: off`。
+fn memory_segment(facts: usize) -> String {
+    if facts == 0 {
+        "Memory: off".to_string()
+    } else {
+        format!("Memory: {facts} facts")
+    }
 }
 
 /// 分类一行输入：空行跳过，两个斜杠命令之外都当作任务内容（去掉行尾换行与首尾空白）。
@@ -87,7 +102,9 @@ pub async fn run(cli: &Cli) -> Result<ExitCode> {
     }
 
     let session = Session::new(cli)?;
-    for line in banner_lines(session.workspace(), &cli.kernel) {
+    // 计数来自会话里那份存储/技能目录（与运行器同一份），读库失败只退回 `Memory: off`
+    let (skills, memory) = session.banner_counts();
+    for line in banner_lines(session.workspace(), &cli.kernel, skills, memory) {
         println!("{line}");
     }
 
@@ -155,7 +172,7 @@ mod tests {
 
     #[test]
     fn banner_is_the_four_locked_lines() {
-        let lines = banner_lines(Path::new("/tmp/ws"), "native");
+        let lines = banner_lines(Path::new("/tmp/ws"), "native", 3, 2);
 
         assert_eq!(
             lines,
@@ -163,11 +180,19 @@ mod tests {
                 "IGNIS v0.1".to_string(),
                 "● Ready".to_string(),
                 "Workspace: /tmp/ws".to_string(),
-                "Runtime: native".to_string(),
+                "Runtime: native · Skills: 3 · Memory: 2 facts".to_string(),
             ]
         );
         assert!(lines.contains(&"IGNIS v0.1".to_string()), "{lines:?}");
         assert!(lines.contains(&"● Ready".to_string()), "{lines:?}");
+    }
+
+    #[test]
+    fn banner_marks_memory_off_when_there_are_no_facts() {
+        let lines = banner_lines(Path::new("/tmp/ws"), "native", 5, 0);
+
+        assert_eq!(lines[3], "Runtime: native · Skills: 5 · Memory: off");
+        assert!(!lines[3].contains("0 facts"), "{lines:?}");
     }
 
     #[test]
