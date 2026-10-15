@@ -42,12 +42,20 @@ pub struct Session {
     skills: Arc<SkillCatalog>,
 }
 
-/// 工作区解析：`--workspace` 优先，否则配置里的 `workspace_root`（`Session::new` 与
-/// `memory add --scope project` 共用同一套口径）。
-pub fn resolve_workspace(cli: &Cli, config: &Config) -> PathBuf {
-    cli.workspace
+/// 工作区解析与校验：`--workspace` 优先，否则配置里的 `workspace_root`；解析出的路径必须是已存在
+/// 的目录（`Session::new` 与 `memory add --scope project` 共用同一套口径与守卫）。
+///
+/// 守卫只在这一处：拼错的 `--workspace /nope` 在碰记忆库之前就报错，不会落一条指不到目录的
+/// project 事实。
+pub fn resolve_workspace(cli: &Cli, config: &Config) -> Result<PathBuf> {
+    let workspace = cli
+        .workspace
         .clone()
-        .unwrap_or_else(|| config.workspace_root.clone())
+        .unwrap_or_else(|| config.workspace_root.clone());
+    if !workspace.is_dir() {
+        bail!("工作区不存在或不是目录：{}", workspace.display());
+    }
+    Ok(workspace)
 }
 
 impl Session {
@@ -62,10 +70,7 @@ impl Session {
         ensure_home(&home)?;
         let mut config: Config = load_config(&home)?;
 
-        let workspace = resolve_workspace(cli, &config);
-        if !workspace.is_dir() {
-            bail!("工作区不存在或不是目录：{}", workspace.display());
-        }
+        let workspace = resolve_workspace(cli, &config)?;
 
         // stdin 是否为 tty 只有命令层知道，策略规则本身在 `resolve_mode` 里
         let mode = resolve_mode(cli.yes, cli.unsafe_ops, std::io::stdin().is_terminal());

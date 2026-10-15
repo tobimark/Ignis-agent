@@ -18,6 +18,24 @@ pub use store::MemoryStore;
 use ignis_storage::StorageError;
 use serde::{Deserialize, Serialize};
 
+/// 「已记住」回执：`已记住（{scope}/{key}）：{text}`；这次写入取代了旧值时追加 `（旧值已失效）`。
+///
+/// 元工具 `remember` 与 CLI `ignis memory add` **共用这一份实现**：回执逐字节一致，改文案只改
+/// 这里（过去 CLI 复制过同一段格式化代码，core 改字就会悄悄劈成两种输出）。
+/// `key`/`text` 与写入路径同口径裁掉首尾空白——回执里出现的是真正入库的那份文本。
+pub fn remembered_notice(scope: FactScope, key: &str, text: &str, superseded: bool) -> String {
+    let mut notice = format!(
+        "已记住（{}/{}）：{}",
+        scope.as_str(),
+        key.trim(),
+        text.trim()
+    );
+    if superseded {
+        notice.push_str("（旧值已失效）");
+    }
+    notice
+}
+
 /// 事实的作用域，取值与 `facts.scope` 一一对应（serde 用小写，供元工具参数解析）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -93,7 +111,30 @@ impl From<StorageError> for MemoryError {
 
 #[cfg(test)]
 mod tests {
-    use super::FactScope;
+    use super::{FactScope, remembered_notice};
+
+    #[test]
+    fn remembered_notice_is_the_one_receipt_shared_with_the_cli() {
+        // 逐字钉死：元工具与 CLI 都走这一份实现（CLI 只额外补一个换行）
+        assert_eq!(
+            remembered_notice(
+                FactScope::User,
+                "pkg_manager",
+                "使用 uv 管理 Python 依赖",
+                false
+            ),
+            "已记住（user/pkg_manager）：使用 uv 管理 Python 依赖"
+        );
+        assert_eq!(
+            remembered_notice(FactScope::Global, "editor", "偏好 Neovim", true),
+            "已记住（global/editor）：偏好 Neovim（旧值已失效）"
+        );
+        // 与写入路径同口径裁掉首尾空白：回执里是真正入库的那份文本
+        assert_eq!(
+            remembered_notice(FactScope::Project, "  editor  ", "  偏好 Neovim  ", false),
+            "已记住（project/editor）：偏好 Neovim"
+        );
+    }
 
     #[test]
     fn fact_scope_round_trips_as_lowercase_json() {

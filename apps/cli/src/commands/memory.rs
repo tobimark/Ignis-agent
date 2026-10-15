@@ -3,13 +3,13 @@
 //! 这一组命令**不装配会话**（不构造模型客户端，因此不需要 API key）：只落地数据目录、打开
 //! 任务库，其余读写全部交给 `MemoryStore`——与 agent 用的是同一套语义（supersede、镜像刷新）。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use ignis_core::config::{ensure_home, ignis_home, load_config};
-use ignis_core::memory::{FactScope, MemoryStore};
+use ignis_core::memory::{FactScope, MemoryStore, remembered_notice};
 use ignis_storage::{Db, FactRecord};
 
 use super::resolve_workspace;
@@ -29,9 +29,10 @@ pub fn run(cli: &Cli, command: &MemoryCommand) -> Result<ExitCode> {
         MemoryCommand::Search { query } => search_at(&home, query)?,
         MemoryCommand::Add { scope, key, text } => {
             let scope = parse_scope(scope)?;
-            // project 事实绑定工作区：`--workspace` 优先，否则配置里的 `workspace_root`
+            // project 事实绑定工作区：`--workspace` 优先，否则配置里的 `workspace_root`；
+            // 目录不存在时与 `Session::new` 一样在碰库之前报错
             let workspace = match scope {
-                FactScope::Project => Some(resolve_workspace(cli, &load_config(&home)?)),
+                FactScope::Project => Some(project_workspace(cli, &home)?),
                 FactScope::User | FactScope::Global => None,
             };
             add_at(&home, scope, workspace.as_deref(), key, text)?
@@ -58,13 +59,29 @@ fn list_at(home: &Path, all: bool) -> Result<String> {
 }
 
 /// 按关键词检索；列与 `list` 完全一致。
+///
+/// 空白检索词在碰库之前报错：空串会落进 storage 的 `LIKE` 分支（`LIKE '%%'`）并匹配**全部**
+/// active 行，看起来像一次「什么都没输入」的全量转储。首尾空白按记忆写入路径的一贯口径裁掉。
 fn search_at(home: &Path, query: &str) -> Result<String> {
+    let query = query.trim();
+    if query.is_empty() {
+        bail!("检索词不能为空");
+    }
     Ok(render_facts(&store_at(home)?.search(query, SEARCH_LIMIT)?))
+}
+
+/// `--scope project` 要绑定的工作区：`--workspace` 优先，否则配置里的 `workspace_root`。
+///
+/// 与 `Session::new` 共用 [`resolve_workspace`] 的目录守卫：`--workspace /nope` 这种拼错的路径
+/// 直接报错，不会存下一条指不到目录的 project 事实。
+fn project_workspace(cli: &Cli, home: &Path) -> Result<PathBuf> {
+    resolve_workspace(cli, &load_config(home)?)
 }
 
 /// 新增一条事实：与元工具 `remember` 同一套语义（同 `(scope, workspace, key)` 的旧值被取代）。
 ///
-/// 回显文案也与该工具一致（改文案要两处一起改）；`project` 的工作区由调用方解析后传入。
+/// 回执也走元工具那份 [`remembered_notice`]（core 里的唯一实现，两边逐字节一致）；
+/// `project` 的工作区由调用方解析后传入。
 fn add_at(
     home: &Path,
     scope: FactScope,
@@ -77,18 +94,11 @@ fn add_at(
     let previous = store.recall_by_key(scope, workspace, key)?;
     let record = store.remember(scope, workspace, key, text, None)?;
 
-    // 回显的是真正入库的那份文本（`MemoryStore` 存储前裁掉首尾空白）
-    let mut out = format!(
-        "已记住（{}/{}）：{}",
-        scope.as_str(),
-        key.trim(),
-        text.trim()
-    );
-    if previous.is_some_and(|old| old.id != record.id) {
-        out.push_str("（旧值已失效）");
-    }
-    out.push('\n');
-    Ok(out)
+    let superseded = previous.is_some_and(|old| old.id != record.id);
+    Ok(format!(
+        "{}\n",
+        remembered_notice(scope, key, text, superseded)
+    ))
 }
 
 /// 改写一条事实的文本（镜像随之刷新）；id 不存在时上抛 `memory not found: {id}`。
@@ -188,6 +198,17 @@ mod tests {
             .map(str::trim)
             .filter(|cell| !cell.is_empty())
             .collect()
+    }
+
+    /// 只有 `--workspace` 一项不同的最小 `Cli`（其余取默认值，命令自身不参与解析）。
+    fn cli_at(workspace: Option<&Path>) -> Cli {
+        Cli {
+            kernel: "native".into(),
+            workspace: workspace.map(Path::to_path_buf),
+            yes: false,
+            unsafe_ops: false,
+            command: None,
+        }
     }
 
     fn fact(
@@ -321,6 +342,32 @@ mod tests {
     }
 
     #[test]
+    fn search_rejects_a_blank_query_before_touching_the_store() {
+        let home = TempHome::new("blank-query");
+        add_at(
+            home.path(),
+            FactScope::User,
+            None,
+            "pkg_manager",
+            "使用 uv 管理依赖",
+        )
+        .unwrap();
+
+        // 空串会落进 storage 的 LIKE 分支（`LIKE '%%'`）匹配全部 active 行，必须在命令层挡掉：
+        // 三种空白形态都报同一句话（`main` 打成 `error: 检索词不能为空`，退出 1）
+        for query in ["", "   ", "\t\n"] {
+            assert_eq!(
+                search_at(home.path(), query).unwrap_err().to_string(),
+                "检索词不能为空",
+                "{query:?}"
+            );
+        }
+
+        // 首尾空白裁掉后仍有内容：照常检索（表头 + 一条命中）
+        assert_eq!(search_at(home.path(), "  uv  ").unwrap().lines().count(), 2);
+    }
+
+    #[test]
     fn edit_and_delete_go_through_the_store() {
         let home = TempHome::new("edit-delete");
         add_at(
@@ -381,6 +428,32 @@ mod tests {
         assert_eq!(
             error,
             "--scope 只能是 user、project 或 global，收到「Project」"
+        );
+    }
+
+    #[test]
+    fn project_scope_rejects_a_workspace_that_is_not_a_directory() {
+        let dir = TempHome::new("workspace-guard");
+        let typo = dir.path().join("nope");
+
+        // 拼错的 `--workspace`：与 `Session::new` 逐字同一句报错（`main` 打成
+        // `error: 工作区不存在或不是目录：…`，退出 1），不会存下一条指不到目录的 project 事实
+        let error = project_workspace(&cli_at(Some(&typo)), dir.path())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, format!("工作区不存在或不是目录：{}", typo.display()));
+
+        // 文件也不算工作区（与 `is_dir` 守卫同口径）
+        let file = dir.path().join("file");
+        fs::write(&file, "占位").unwrap();
+        assert!(project_workspace(&cli_at(Some(&file)), dir.path()).is_err());
+
+        // 真实目录照常解析
+        let workspace = dir.path().join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        assert_eq!(
+            project_workspace(&cli_at(Some(&workspace)), dir.path()).unwrap(),
+            workspace
         );
     }
 }

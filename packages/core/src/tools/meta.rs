@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use super::util::{required_str, truncate_output};
 use super::{Tool, ToolCtx, ToolError};
-use crate::memory::{FactScope, MemoryError, MemoryStore};
+use crate::memory::{FactScope, MemoryError, MemoryStore, remembered_notice};
 use crate::skills::SkillCatalog;
 
 /// v0.1 元工具：`remember` 与 `load_skill`；返回顺序即注册顺序，也就是模型看到的工具表顺序。
@@ -74,17 +74,10 @@ impl Tool for Remember {
             .remember(scope, workspace, key, text, None)
             .map_err(memory_failure)?;
 
-        // 回显的是真正入库的那份文本（`MemoryStore` 存储前裁掉首尾空白）
-        let mut output = format!(
-            "已记住（{}/{}）：{}",
-            scope.as_str(),
-            key.trim(),
-            text.trim()
-        );
-        if previous.is_some_and(|old| old.id != record.id) {
-            output.push_str("（旧值已失效）");
-        }
-        Ok(output)
+        // 回显的是真正入库的那份文本（`MemoryStore` 存储前裁掉首尾空白）；文案与 CLI
+        // `ignis memory add` 共用 `remembered_notice`，两边逐字节一致
+        let superseded = previous.is_some_and(|old| old.id != record.id);
+        Ok(remembered_notice(scope, key, text, superseded))
     }
 }
 
