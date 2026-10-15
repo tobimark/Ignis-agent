@@ -696,6 +696,7 @@ dependencies = [
  "ignis-core",
  "ignis-runtime",
  "ignis-storage",
+ "rusqlite",
  "serde_json",
  "tokio",
  "tokio-util",

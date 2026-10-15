@@ -18,3 +18,9 @@ clap = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+
+[dev-dependencies]
+# e2e 用例要用假模型（`test-support`）与直读库表断言；本机离线，缓存里没有
+# assert_cmd / tempfile，故进程与临时目录都用 std 自己管。
+ignis-runtime = { workspace = true, features = ["test-support"] }
+rusqlite = { workspace = true }
