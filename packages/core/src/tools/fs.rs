@@ -354,6 +354,8 @@ mod tests {
                 workspace: self.ws.path(),
                 cancel: CancellationToken::new(),
                 limits: &self.limits,
+                task_id: None,
+                job_id: None,
             }
         }
 

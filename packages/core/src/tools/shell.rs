@@ -270,6 +270,8 @@ mod tests {
                 workspace: self.ws.path(),
                 cancel,
                 limits: &self.limits,
+                task_id: None,
+                job_id: None,
             };
             ShellRun.run(&args, &ctx).await
         }

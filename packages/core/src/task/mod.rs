@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
+use crate::alerts::{AlertSink, MultiNotifier};
 use crate::config::Config;
 use crate::memory::MemoryStore;
 use crate::security::{Policy, Redactor};
@@ -227,10 +228,16 @@ impl TaskRunner {
             }
         };
 
-        // 注册表 = 内置工具 + 元工具（remember 写记忆、load_skill 取技能正文）；顺序即模型看到的
-        // 工具表顺序，元工具排在末尾
+        // 注册表 = 内置工具 + 元工具（remember 写记忆、load_skill 取技能正文、notify_user 升告警）；
+        // 顺序即模型看到的工具表顺序，元工具排在末尾
         let mut registry = default_registry();
-        for tool in meta_tools(Arc::clone(&self.memory), Arc::clone(&self.skills)) {
+        // 告警出口：告警行落库（CLI 未读收件箱即渠道①），推送渠道由 T5 的 gateway 注入——
+        // 交互运行这一侧先留空组合（落库与去重照样生效）
+        let alerts = Arc::new(AlertSink::new(
+            Arc::clone(&self.db),
+            Arc::new(MultiNotifier::new(Vec::new())),
+        ));
+        for tool in meta_tools(Arc::clone(&self.memory), Arc::clone(&self.skills), alerts) {
             registry.register(tool);
         }
         let executor = Arc::new(ToolRuntime::new(
@@ -242,6 +249,8 @@ impl TaskRunner {
             workspace.clone(),
             self.config.limits,
             Redactor::new(self.config.api_key.iter().cloned().collect()),
+            // 来源 job id 由 T5 的调度循环经 `TaskRequest` 透传；交互运行没有 job
+            None,
         ));
         let request = RunRequest {
             messages: messages.clone(),

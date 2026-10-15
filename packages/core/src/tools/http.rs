@@ -378,6 +378,8 @@ mod tests {
             workspace: Path::new("."),
             cancel: CancellationToken::new(),
             limits,
+            task_id: None,
+            job_id: None,
         };
         tool.run(&args, &ctx).await
     }

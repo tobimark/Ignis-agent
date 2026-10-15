@@ -6,6 +6,7 @@
 mod fs;
 mod http;
 mod meta;
+mod notify;
 mod runtime;
 mod shell;
 pub mod util;
@@ -31,11 +32,17 @@ impl ToolError {
     }
 }
 
-/// 一次工具调用的上下文：工作区根、取消信号与运行上限。
+/// 一次工具调用的上下文：工作区根、取消信号、运行上限与来源身份。
+///
+/// `task_id` / `job_id` 是工具可见的 provenance：[`ToolRuntime`] 填上本次任务的 id，调度运行
+/// 还会透传来源 job id（`ignis run` / REPL 的交互运行没有 job，为 `None`）。`notify_user` 用
+/// 它们填 `alerts.source_task_id` / `source_job_id`，模型无需自己传这两个 id。
 pub struct ToolCtx<'a> {
     pub workspace: &'a Path,
     pub cancel: CancellationToken,
     pub limits: &'a Limits,
+    pub task_id: Option<String>,
+    pub job_id: Option<String>,
 }
 
 /// 工具契约：`spec` 是暴露给模型的描述，`run` 执行并返回文本输出。

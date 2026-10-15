@@ -58,10 +58,11 @@ fn row_to_alert(row: &Row<'_>) -> rusqlite::Result<AlertRecord> {
 }
 
 impl Db {
-    /// 追加一条未读告警。
-    pub fn insert_alert(&self, a: &NewAlert) -> Result<()> {
+    /// 追加一条未读告警，回传落库的那一行（`id` 与 `created_at` 由 DAO 自己取，
+    /// 调用方不必为拿这两个值再查一次，也不会有时钟竞态）。
+    pub fn insert_alert(&self, a: &NewAlert) -> Result<AlertRecord> {
         let now = now_millis();
-        self.with_conn(|c| {
+        let id = self.with_conn(|c| {
             c.prepare_cached(
                 "INSERT INTO alerts (severity, title, body, source_job_id, source_task_id,
                  dedup_key, created_at)
@@ -76,7 +77,18 @@ impl Db {
                 a.dedup_key,
                 now
             ])?;
-            Ok(())
+            Ok(c.last_insert_rowid())
+        })?;
+        Ok(AlertRecord {
+            id,
+            severity: a.severity.clone(),
+            title: a.title.clone(),
+            body: a.body.clone(),
+            source_job_id: a.source_job_id.clone(),
+            source_task_id: a.source_task_id.clone(),
+            dedup_key: a.dedup_key.clone(),
+            created_at: now,
+            read_at: None,
         })
     }
 
@@ -165,18 +177,21 @@ mod tests {
     fn insert_alert_roundtrips_as_an_unread_row() {
         let db = Db::open_in_memory().unwrap();
         let before = now_millis();
-        db.insert_alert(&NewAlert {
-            severity: "critical".into(),
-            title: "磁盘快满了".into(),
-            body: Some("根分区 92%".into()),
-            source_job_id: Some("job-1".into()),
-            source_task_id: Some("task-9".into()),
-            dedup_key: "job-1|磁盘快满了".into(),
-        })
-        .unwrap();
+        let inserted = db
+            .insert_alert(&NewAlert {
+                severity: "critical".into(),
+                title: "磁盘快满了".into(),
+                body: Some("根分区 92%".into()),
+                source_job_id: Some("job-1".into()),
+                source_task_id: Some("task-9".into()),
+                dedup_key: "job-1|磁盘快满了".into(),
+            })
+            .unwrap();
         let after = now_millis();
 
         let rec = &db.list_alerts(true, 10).unwrap()[0];
+        // 回传的行就是刚落库的那一行：id 与 created_at 由 DAO 自己取，调用方不必再查一次
+        assert_eq!(inserted, *rec);
         assert_eq!(rec.id, 1);
         assert_eq!(rec.severity, "critical");
         assert_eq!(rec.title, "磁盘快满了");
@@ -191,22 +206,24 @@ mod tests {
         );
         assert_eq!(rec.read_at, None);
 
-        // 可选字段为空的行也照常落库
+        // 可选字段为空的行也照常落库，回传的行同样带着新 id
         let mut sparse = new_alert("提示", "k2");
         sparse.severity = "info".into();
         sparse.body = None;
         sparse.source_job_id = None;
-        db.insert_alert(&sparse).unwrap();
+        let sparse_row = db.insert_alert(&sparse).unwrap();
+        assert_eq!(sparse_row.id, 2);
+        assert_eq!(sparse_row.body, None);
+        assert_eq!(sparse_row.source_job_id, None);
+        assert_eq!(sparse_row.source_task_id, None);
+        assert_eq!(sparse_row.read_at, None);
         let rec = db
             .list_alerts(true, 10)
             .unwrap()
             .into_iter()
             .find(|a| a.dedup_key == "k2")
             .unwrap();
-        assert_eq!(rec.id, 2);
-        assert_eq!(rec.body, None);
-        assert_eq!(rec.source_job_id, None);
-        assert_eq!(rec.source_task_id, None);
+        assert_eq!(rec, sparse_row);
     }
 
     #[test]

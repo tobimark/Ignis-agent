@@ -1,8 +1,9 @@
-//! 元工具：`remember`（写入一条长期记忆）与 `load_skill`（读取一个技能的 SKILL.md 全文）。
+//! 元工具：`remember`（写入一条长期记忆）、`load_skill`（读取一个技能的 SKILL.md 全文）与
+//! `notify_user`（升一条告警，见 [`crate::alerts`]）。
 //!
-//! 两者都只写 agent 自有状态（记忆事实、技能目录，用户可经 CLI 改删），因此
+//! 三者都只写 agent 自有状态（记忆事实、技能目录、告警收件箱，用户可经 CLI 改删），因此
 //! [`crate::tools::ToolRuntime`] 一律按 `Safe` 分类：不弹审批、不落审批行。参数一律先解析成
-//! 中文可读的错误再回填给模型（缺参、非法 scope、空 key/text、未知技能）。
+//! 中文可读的错误再回填给模型（缺参、非法 scope、空 key/text、未知技能、非法告警级别）。
 
 use std::sync::Arc;
 
@@ -10,16 +11,24 @@ use async_trait::async_trait;
 use ignis_runtime::ToolSpec;
 use serde_json::{Value, json};
 
+use super::notify::NotifyUser;
 use super::util::{required_str, truncate_output};
 use super::{Tool, ToolCtx, ToolError};
+use crate::alerts::AlertSink;
 use crate::memory::{FactScope, MemoryError, MemoryStore, remembered_notice};
 use crate::skills::SkillCatalog;
 
-/// v0.1 元工具：`remember` 与 `load_skill`；返回顺序即注册顺序，也就是模型看到的工具表顺序。
-pub fn meta_tools(memory: Arc<MemoryStore>, skills: Arc<SkillCatalog>) -> Vec<Box<dyn Tool>> {
+/// v0.1 元工具：`remember`、`load_skill` 与 `notify_user`；返回顺序即注册顺序，也就是模型看到的
+/// 工具表顺序。
+pub fn meta_tools(
+    memory: Arc<MemoryStore>,
+    skills: Arc<SkillCatalog>,
+    alerts: Arc<AlertSink>,
+) -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(Remember { memory }),
         Box::new(LoadSkill { skills }),
+        Box::new(NotifyUser::new(alerts)),
     ]
 }
 
@@ -164,11 +173,13 @@ mod tests {
 
     use ignis_runtime::test_support::ScriptedApproval;
     use ignis_runtime::{ApprovalHandler, Limits, ToolCall, ToolExecutor, ToolResult};
-    use ignis_storage::{ApprovalRecord, Db, FactRecord};
+    use ignis_storage::{AlertRecord, ApprovalRecord, Db, FactRecord};
     use serde_json::{Value, json};
     use tokio_util::sync::CancellationToken;
 
     use super::meta_tools;
+    use crate::alerts::test_support::RecordingNotifier;
+    use crate::alerts::{AlertSink, Notifier};
     use crate::memory::{MAX_FACT_TEXT_CHARS, MemoryStore};
     use crate::security::{ApprovalMode, Policy, Redactor};
     use crate::skills::SkillCatalog;
@@ -216,12 +227,13 @@ mod tests {
     ///
     /// 注册表 = 内置工具 + `meta_tools`（生产装配在 Task 5 的 `TaskRunner`，这里手工组装）；
     /// 审批方是空决策队列的 `ScriptedApproval`（耗尽即拒绝）——元工具一旦被判成非 `Safe`，
-    /// 调用就会被拒并留下审批行，相关断言立刻失败。
+    /// 调用就会被拒并留下审批行，相关断言立刻失败。告警出口用记录型渠道，落库仍是真表。
     struct Env {
         dir: TempDir,
         db: Arc<Db>,
         approval: Arc<ScriptedApproval>,
         runtime: ToolRuntime,
+        notifier: Arc<RecordingNotifier>,
     }
 
     impl Env {
@@ -230,6 +242,15 @@ mod tests {
         }
 
         fn with_limits(limits: Limits) -> Env {
+            Self::build(None, limits)
+        }
+
+        /// 带来源 job id 的环境：`notify_user` 的 provenance 透传靠它。
+        fn with_job_id(job_id: &str) -> Env {
+            Self::build(Some(job_id.to_string()), Limits::default())
+        }
+
+        fn build(job_id: Option<String>, limits: Limits) -> Env {
             let dir = TempDir::new();
             let skills_dir = dir.path().join("skills");
             for (name, body) in [
@@ -244,8 +265,11 @@ mod tests {
             let db = Arc::new(Db::open_in_memory().unwrap());
             let memory = MemoryStore::new(Arc::clone(&db), dir.path().join("memory"));
             let skills = SkillCatalog::load(&skills_dir);
+            let notifier = Arc::new(RecordingNotifier::new());
+            let channel: Arc<dyn Notifier> = notifier.clone();
+            let alerts = Arc::new(AlertSink::new(Arc::clone(&db), channel));
             let mut registry = default_registry();
-            for tool in meta_tools(memory, skills) {
+            for tool in meta_tools(memory, skills, alerts) {
                 registry.register(tool);
             }
             let approval = ScriptedApproval::new(Vec::new());
@@ -258,12 +282,14 @@ mod tests {
                 dir.path().to_path_buf(),
                 limits,
                 Redactor::new(Vec::new()),
+                job_id,
             );
             Env {
                 dir,
                 db,
                 approval,
                 runtime,
+                notifier,
             }
         }
 
@@ -279,6 +305,11 @@ mod tests {
         /// 审批记录（按决定先后）。
         fn approvals(&self) -> Vec<ApprovalRecord> {
             self.db.list_approvals(TASK_ID).unwrap()
+        }
+
+        /// `alerts` 表里的告警行（含已读）。
+        fn alerts(&self) -> Vec<AlertRecord> {
+            self.db.list_alerts(true, 10).unwrap()
         }
 
         /// 某个位置的 `active` 事实行。
@@ -578,5 +609,61 @@ mod tests {
             output.ends_with("… [truncated: output exceeded 32 bytes]"),
             "{output}"
         );
+    }
+
+    /// `notify_user` 走完整运行时：Safe（不弹审批、不留审批行），告警落库并带上 ctx 的 task 来源。
+    #[tokio::test]
+    async fn notify_user_is_safe_and_carries_the_task_provenance() {
+        let env = Env::new();
+
+        let result = env
+            .call(
+                "notify_user",
+                json!({"severity": "warning", "title": "磁盘 92%", "body": "根分区 92%（阈值 85%）"}),
+            )
+            .await;
+
+        assert!(result.ok, "{:?}", result.output);
+        assert_eq!(
+            result.output.as_deref(),
+            Some("已发送告警（warning）：磁盘 92%")
+        );
+        // Safe：既不弹审批，也不留审批行
+        assert!(env.approval.seen().is_empty());
+        assert!(env.approvals().is_empty());
+
+        let rows = env.alerts();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].severity, "warning");
+        assert_eq!(rows[0].body.as_deref(), Some("根分区 92%（阈值 85%）"));
+        assert_eq!(rows[0].source_task_id.as_deref(), Some(TASK_ID));
+        assert_eq!(rows[0].source_job_id, None);
+        assert_eq!(env.notifier.calls(), 1);
+    }
+
+    /// 调度运行的来源 job id 由 `ToolRuntime` 透传：落库的来源列与去重键都以 job 为准。
+    #[tokio::test]
+    async fn notify_user_carries_the_job_id_from_the_runtime() {
+        let env = Env::with_job_id("job-7");
+
+        let result = env
+            .call(
+                "notify_user",
+                json!({"severity": "critical", "title": "磁盘满了"}),
+            )
+            .await;
+
+        assert!(result.ok, "{:?}", result.output);
+        assert_eq!(
+            result.output.as_deref(),
+            Some("已发送告警（critical）：磁盘满了")
+        );
+        assert!(env.approvals().is_empty());
+
+        let rows = env.alerts();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source_job_id.as_deref(), Some("job-7"));
+        assert_eq!(rows[0].source_task_id.as_deref(), Some(TASK_ID));
+        assert_eq!(rows[0].dedup_key, "job-7:磁盘满了");
     }
 }

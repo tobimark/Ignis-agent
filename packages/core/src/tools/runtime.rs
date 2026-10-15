@@ -36,6 +36,8 @@ pub struct ToolRuntime {
     approvals: Arc<dyn ApprovalHandler>,
     db: Arc<Db>,
     task_id: String,
+    /// 来源调度任务 id（`TaskRequest.job_id` 透传）；交互运行没有它。
+    job_id: Option<String>,
     workspace: PathBuf,
     limits: Limits,
     redactor: Redactor,
@@ -54,6 +56,7 @@ impl ToolRuntime {
         workspace: PathBuf,
         limits: Limits,
         redactor: Redactor,
+        job_id: Option<String>,
     ) -> Self {
         Self {
             registry,
@@ -61,6 +64,7 @@ impl ToolRuntime {
             approvals,
             db,
             task_id,
+            job_id,
             workspace,
             limits,
             redactor,
@@ -183,6 +187,8 @@ impl ToolExecutor for ToolRuntime {
             workspace: &self.workspace,
             cancel,
             limits: &self.limits,
+            task_id: Some(self.task_id.clone()),
+            job_id: self.job_id.clone(),
         };
         match tool.run(&call.args, &ctx).await {
             Ok(output) => self.result(true, output),
@@ -193,9 +199,12 @@ impl ToolExecutor for ToolRuntime {
 
 /// 风险分类：元工具恒定 `Safe`，敏感路径优先于工具本身，命令再看危险命令库。
 fn classify(call: &ToolCall, workspace: &Path) -> RiskLevel {
-    // 元工具只写 agent 自有状态（记忆事实、技能目录，用户可经 CLI 改删），也不解析任何路径：
-    // 恒定 Safe，且判定放在最前面——参数里混进 `path` 之类也不该改分类。
-    if matches!(call.name.as_str(), "remember" | "load_skill") {
+    // 元工具只写 agent 自有状态（记忆事实、技能目录、告警收件箱，用户可经 CLI 改删），也不
+    // 解析任何路径：恒定 Safe，且判定放在最前面——参数里混进 `path` 之类也不该改分类。
+    if matches!(
+        call.name.as_str(),
+        "remember" | "load_skill" | "notify_user"
+    ) {
         return RiskLevel::Safe;
     }
     // 任意工具的路径参数指向敏感文件 → 危险：读 `.env`、写 `id_rsa` 都要显式授权
@@ -360,6 +369,8 @@ mod tests {
                 ws.path().to_path_buf(),
                 Limits::default(),
                 redactor,
+                // 交互运行没有来源 job；job_id 的透传链路由 `tools::meta` 的用例覆盖
+                None,
             );
             Self {
                 ws,
@@ -755,8 +766,9 @@ mod tests {
         };
         let workspace = Path::new("/home/dev/app");
 
-        // remember/load_skill 只写 agent 自有状态（记忆事实与技能目录，CLI 可改可删）→ 恒 Safe；
-        // 判定放在敏感路径与回退臂之前：参数里混进 `path` 也不改分类（元工具不解析路径）
+        // remember/load_skill/notify_user 只写 agent 自有状态（记忆事实、技能目录与告警收件箱，
+        // CLI 可改可删）→ 恒 Safe；判定放在敏感路径与回退臂之前：参数里混进 `path` 也不改分类
+        //（元工具不解析路径）
         for (name, args) in [
             (
                 "remember",
@@ -770,6 +782,14 @@ mod tests {
             (
                 "load_skill",
                 json!({"name": "server-health", "path": "id_rsa"}),
+            ),
+            (
+                "notify_user",
+                json!({"severity": "warning", "title": "磁盘 92%"}),
+            ),
+            (
+                "notify_user",
+                json!({"severity": "critical", "title": "磁盘满了", "path": ".env"}),
             ),
         ] {
             assert_eq!(
