@@ -1,13 +1,14 @@
 //! 跨会话事实（memory）DAO：`facts` 表 + FTS5(trigram) 检索。
 //!
-//! 事实用 `(scope, workspace, key)` 定位，同一位置只留一行 `active`；写新值时旧行由
-//! [`Db::supersede_fact`] 标成 `superseded` 并记下取代者，检索/列举默认只回 `active`。
+//! 事实用 `(scope, workspace, key)` 定位，同一位置只留一行 `active`；写新值的推荐入口是
+//! [`Db::insert_fact_superseding`]（插新 + 标旧在同一事务里），行级操作另有 [`Db::insert_fact`]
+//! 与 [`Db::supersede_fact`]；检索/列举默认只回 `active`。
 //! 全文索引 `facts_fts` 是 external content 表，正文靠迁移 002 的三个触发器同步，DAO 不直接
 //! 写它。
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::db::{Db, Result, StorageError};
 
@@ -58,6 +59,10 @@ const FACT_COLUMNS_FROM_FTS: &str = "facts.id, facts.scope, facts.workspace, fac
 const FTS_MIN_CHARS: usize = 3;
 /// `LIKE` 回退的转义符；SQLite 的 `LIKE` 默认没有转义符，必须显式 `ESCAPE` 声明。
 const LIKE_ESCAPE: char = '\\';
+/// 插入一条 `active` 行（`created_at`/`updated_at` 取调用时刻，`superseded_by` 为空）。
+const INSERT_ACTIVE_FACT_SQL: &str = "INSERT INTO facts (scope, workspace, key, text, status, \
+                                     superseded_by, source_task_id, created_at, updated_at) \
+                                     VALUES (?1, ?2, ?3, ?4, 'active', NULL, ?5, ?6, ?6)";
 
 fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<FactRecord> {
     Ok(FactRecord {
@@ -103,25 +108,55 @@ fn like_pattern(query: &str) -> String {
     pattern
 }
 
+/// 在给定连接上插入一条 `active` 事实行，返回新行 id；不碰同 key 的其它行。
+fn insert_active_row(conn: &Connection, fact: &NewFact, now: i64) -> rusqlite::Result<i64> {
+    conn.prepare_cached(INSERT_ACTIVE_FACT_SQL)?
+        .execute(params![
+            fact.scope,
+            fact.workspace,
+            fact.key,
+            fact.text,
+            fact.source_task_id,
+            now
+        ])?;
+    Ok(conn.last_insert_rowid())
+}
+
 impl Db {
     /// 插入一条 `active` 事实，返回新行 id。
+    ///
+    /// 这是纯行级操作：同 `(scope, workspace, key)` 的旧行仍留着 `active`。要「新值取代旧值」，
+    /// 用 [`Db::insert_fact_superseding`]。
     pub fn insert_fact(&self, fact: &NewFact) -> Result<i64> {
         let now = now_millis();
+        self.with_conn(|c| insert_active_row(c, fact, now))
+    }
+
+    /// 插入一条 `active` 事实，并在**同一个事务**里把同 `(scope, workspace, key)` 的其它
+    /// `active` 行全部标成 `superseded`（`superseded_by = 新行 id`）；返回新行 id。
+    ///
+    /// 「插新 + 标旧」必须一次提交：分两条自动提交的语句做，中途失败（崩溃、`SQLITE_BUSY`、
+    /// 磁盘满）会留下两行同名 `active`，读路径同时看到新旧值，而且不会自愈。任一步出错整个事务
+    /// 回滚，库里仍是调用前的样子。
+    ///
+    /// sweep **不带 `LIMIT`**：凡是同 key 的 active 行一律收敛，历史上被上述故障留下的重复行
+    /// 也会被下一次写入顺带治好。
+    ///
+    /// `workspace` 与 `active_fact_by_key` 同口径用 `IS` 比较：`None` 与具体字符串都按「相等」，
+    /// 同 key 的不同工作区互不影响。
+    pub fn insert_fact_superseding(&self, fact: &NewFact) -> Result<i64> {
+        let now = now_millis();
         self.with_conn(|c| {
-            c.prepare_cached(
-                "INSERT INTO facts (scope, workspace, key, text, status, superseded_by,
-                 source_task_id, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 'active', NULL, ?5, ?6, ?6)",
+            // `unchecked_transaction` 直接用 `&Connection`（迁移也是这么做的），出错即回滚
+            let tx = c.unchecked_transaction()?;
+            let id = insert_active_row(&tx, fact, now)?;
+            tx.prepare_cached(
+                "UPDATE facts SET status = 'superseded', superseded_by = ?1
+                 WHERE scope = ?2 AND workspace IS ?3 AND key = ?4 AND status = 'active' AND id != ?1",
             )?
-            .execute(params![
-                fact.scope,
-                fact.workspace,
-                fact.key,
-                fact.text,
-                fact.source_task_id,
-                now
-            ])?;
-            Ok(c.last_insert_rowid())
+            .execute(params![id, fact.scope, fact.workspace, fact.key])?;
+            tx.commit()?;
+            Ok(id)
         })
     }
 
@@ -282,6 +317,29 @@ mod tests {
 
     fn ids(records: &[super::FactRecord]) -> Vec<i64> {
         records.iter().map(|rec| rec.id).collect()
+    }
+
+    /// 某 `(scope, workspace, key)` 的 `active` 行数：直接数库里的行，不经过读路径。
+    fn active_row_count(db: &Db, scope: &str, workspace: Option<&str>, key: &str) -> i64 {
+        db.with_conn(|c| {
+            c.query_row(
+                "SELECT count(*) FROM facts
+                 WHERE scope = ?1 AND workspace IS ?2 AND key = ?3 AND status = 'active'",
+                (scope, workspace, key),
+                |row| row.get(0),
+            )
+        })
+        .unwrap()
+    }
+
+    /// 某 key 的全部行数（含 `superseded`）：断言失败时库里没有多出任何行。
+    fn total_row_count(db: &Db, key: &str) -> i64 {
+        db.with_conn(|c| {
+            c.query_row("SELECT count(*) FROM facts WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+        })
+        .unwrap()
     }
 
     #[test]
@@ -447,6 +505,168 @@ mod tests {
         // 新行不受影响
         let rec = db.get_fact(new).unwrap().unwrap();
         assert_eq!((rec.status.as_str(), rec.superseded_by), ("active", None));
+    }
+
+    #[test]
+    fn insert_fact_superseding_keeps_exactly_one_active_row() {
+        let db = Db::open_in_memory().unwrap();
+        let old = db
+            .insert_fact(&fact("project", Some("/w/a"), "k", "旧值"))
+            .unwrap();
+        let other = db
+            .insert_fact(&fact("project", Some("/w/b"), "k", "别的工作区"))
+            .unwrap();
+
+        let new = db
+            .insert_fact_superseding(&fact("project", Some("/w/a"), "k", "新值"))
+            .unwrap();
+
+        // 同 (scope, workspace, key) 只剩一行 active；旧行被标注，文本原样留痕
+        assert_eq!(active_row_count(&db, "project", Some("/w/a"), "k"), 1);
+        let stored = db.get_fact(old).unwrap().unwrap();
+        assert_eq!(
+            (
+                stored.status.as_str(),
+                stored.superseded_by,
+                stored.text.as_str()
+            ),
+            ("superseded", Some(new), "旧值")
+        );
+        // 工作区用 IS 比较：别的工作区同 key 的行不受影响
+        assert_eq!(db.get_fact(other).unwrap().unwrap().status, "active");
+        assert_eq!(active_row_count(&db, "project", Some("/w/b"), "k"), 1);
+
+        // 再写一次：只留最新一行，链条指向前一条的后继
+        let newest = db
+            .insert_fact_superseding(&fact("project", Some("/w/a"), "k", "更新值"))
+            .unwrap();
+        assert_eq!(active_row_count(&db, "project", Some("/w/a"), "k"), 1);
+        assert_eq!(
+            db.get_fact(new).unwrap().unwrap().superseded_by,
+            Some(newest)
+        );
+        assert_eq!(
+            db.active_fact_by_key("project", Some("/w/a"), "k")
+                .unwrap()
+                .unwrap()
+                .id,
+            newest
+        );
+    }
+
+    #[test]
+    fn insert_fact_superseding_heals_stranded_duplicate_active_rows() {
+        let db = Db::open_in_memory().unwrap();
+        // 旧实现「插新 → 标旧」两步之间失败留下的现场：同 key 两行 active
+        let older = db.insert_fact(&fact("user", None, "k", "旧值")).unwrap();
+        let stranded = db.insert_fact(&fact("user", None, "k", "中间值")).unwrap();
+        assert_eq!(active_row_count(&db, "user", None, "k"), 2);
+
+        let new = db
+            .insert_fact_superseding(&fact("user", None, "k", "新值"))
+            .unwrap();
+
+        // sweep 覆盖所有同 key 的 active 行：滞留行一并收敛，只留最新那一行
+        assert_eq!(active_row_count(&db, "user", None, "k"), 1);
+        for id in [older, stranded] {
+            let row = db.get_fact(id).unwrap().unwrap();
+            assert_eq!(
+                (row.status.as_str(), row.superseded_by),
+                ("superseded", Some(new)),
+                "id={id}"
+            );
+        }
+        assert_eq!(
+            db.active_fact_by_key("user", None, "k")
+                .unwrap()
+                .unwrap()
+                .id,
+            new
+        );
+        // 检索也只看得到新值
+        assert_eq!(ids(&db.search_facts("新值", 10).unwrap()), vec![new]);
+    }
+
+    #[test]
+    fn insert_fact_superseding_is_all_or_nothing_on_a_read_only_connection() {
+        let db = Db::open_in_memory().unwrap();
+        let old = db.insert_fact(&fact("user", None, "k", "旧值")).unwrap();
+
+        // 连接改成只读：整个复合写入必须失败，不能留下半条
+        db.with_conn(|c| c.execute_batch("PRAGMA query_only = ON"))
+            .unwrap();
+        let err = db
+            .insert_fact_superseding(&fact("user", None, "k", "新值"))
+            .unwrap_err();
+        db.with_conn(|c| c.execute_batch("PRAGMA query_only = OFF"))
+            .unwrap();
+
+        // 没有新行，旧行没被标成 superseded，文本也没变
+        assert!(matches!(err, StorageError::Sqlite(_)), "{err}");
+        assert_eq!(total_row_count(&db, "k"), 1);
+        let stored = db.get_fact(old).unwrap().unwrap();
+        assert_eq!(
+            (
+                stored.status.as_str(),
+                stored.superseded_by,
+                stored.text.as_str()
+            ),
+            ("active", None, "旧值")
+        );
+
+        // 只读解除后写入照常
+        let new = db
+            .insert_fact_superseding(&fact("user", None, "k", "新值"))
+            .unwrap();
+        assert_eq!(active_row_count(&db, "user", None, "k"), 1);
+        assert_eq!(db.get_fact(old).unwrap().unwrap().superseded_by, Some(new));
+    }
+
+    #[test]
+    fn insert_fact_superseding_is_all_or_nothing_when_the_sweep_fails() {
+        let db = Db::open_in_memory().unwrap();
+        let old = db.insert_fact(&fact("user", None, "k", "旧值")).unwrap();
+
+        // 故障注入：让「标旧」那一步的 UPDATE 必失败（等价于 SQLITE_BUSY / 磁盘满 / 中途崩溃）
+        db.with_conn(|c| {
+            c.execute_batch(
+                "CREATE TRIGGER fault_on_fact_update BEFORE UPDATE ON facts
+                 BEGIN SELECT RAISE(ABORT, '注入的故障'); END;",
+            )
+        })
+        .unwrap();
+        let err = db
+            .insert_fact_superseding(&fact("user", None, "k", "新值"))
+            .unwrap_err();
+        db.with_conn(|c| c.execute_batch("DROP TRIGGER fault_on_fact_update"))
+            .unwrap();
+
+        // 事务整体回滚：新行不存在（不是「插进去又标旧失败」留下两行 active），旧行原样
+        assert!(matches!(err, StorageError::Sqlite(_)), "{err}");
+        assert_eq!(total_row_count(&db, "k"), 1);
+        let stored = db.get_fact(old).unwrap().unwrap();
+        assert_eq!(
+            (
+                stored.status.as_str(),
+                stored.superseded_by,
+                stored.text.as_str()
+            ),
+            ("active", None, "旧值")
+        );
+        // 全表里都找不到那一行的影子
+        assert!(
+            !db.list_facts(true)
+                .unwrap()
+                .iter()
+                .any(|row| row.text == "新值")
+        );
+
+        // 故障排除后写入照常，旧行才被标成 superseded
+        let new = db
+            .insert_fact_superseding(&fact("user", None, "k", "新值"))
+            .unwrap();
+        assert_eq!(active_row_count(&db, "user", None, "k"), 1);
+        assert_eq!(db.get_fact(old).unwrap().unwrap().superseded_by, Some(new));
     }
 
     #[test]

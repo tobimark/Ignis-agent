@@ -34,8 +34,9 @@ impl MemoryStore {
 
     /// 记住一条事实：同一 `(scope, workspace, key)` 的旧值被新值取代（supersede）。
     ///
-    /// 写入顺序是「插新行 → 标旧行」：storage 的 DAO 各自开语句，两步不在同一事务里，中途崩溃
-    /// 最坏留下两行 `active`；读路径 `active_fact_by_key` 取 id 最新的一行，语义不歧义。
+    /// 「插新行 + 标旧行」由 storage 的 [`Db::insert_fact_superseding`] 在**一个事务**里完成：
+    /// 中途失败（崩溃、`SQLITE_BUSY`、磁盘满）整个事务回滚，不会留下两行同名 `active`；sweep 覆盖
+    /// 同 key 的所有 active 行，历史遗留的重复行也会被顺带收敛。
     ///
     /// `scope = Project` 必须带工作区（调用方传 `ToolCtx.workspace`），`User`/`Global` 必须不带；
     /// `key`/`text` 为空或只有空白时拒绝。成功后尽力重写受影响作用域的镜像。
@@ -58,19 +59,13 @@ impl MemoryStore {
         // 工作区先校验：参数不对就既不落库也不动镜像
         let workspace = workspace_string(scope, workspace)?;
 
-        let superseded = self
-            .db
-            .active_fact_by_key(scope.as_str(), workspace.as_deref(), key)?;
-        let id = self.db.insert_fact(&NewFact {
+        let id = self.db.insert_fact_superseding(&NewFact {
             scope: scope.as_str().to_owned(),
             workspace: workspace.clone(),
             key: key.to_owned(),
             text: text.to_owned(),
             source_task_id: source_task_id.map(str::to_owned),
         })?;
-        if let Some(old) = superseded {
-            self.db.supersede_fact(old.id, id)?;
-        }
 
         let record = self.db.get_fact(id)?.ok_or(MemoryError::NotFound { id })?;
         self.refresh_mirror(scope, workspace.as_deref());
@@ -211,12 +206,22 @@ impl MemoryStore {
     }
 
     /// best-effort 刷新：任何失败只打一行警告，已经落地的事实不受影响（fail-soft）。
+    ///
+    /// 警告按失败来源分档：库读不出来（[`MemoryError::Storage`]）意味着镜像不仅没刷新，连「库里
+    /// 现在有什么」都不知道，值得单独提示；文件写不进去只是派生物落后一拍。
     fn refresh_mirror(&self, scope: FactScope, workspace: Option<&str>) {
-        if let Err(err) = self.rewrite_mirror_file(scope, workspace) {
-            eprintln!(
-                "warning: 记忆镜像刷新失败（scope={}，workspace={workspace:?}）：{err}",
-                scope.as_str()
-            );
+        let Err(err) = self.rewrite_mirror_file(scope, workspace) else {
+            return;
+        };
+        let scope = scope.as_str();
+        match &err {
+            MemoryError::Storage(source) => eprintln!(
+                "warning: 记忆镜像刷新失败（scope={scope}，workspace={workspace:?}）：\
+                 读取事实失败，镜像已与数据库不一致，请检查数据库：{source}"
+            ),
+            other => eprintln!(
+                "warning: 记忆镜像刷新失败（scope={scope}，workspace={workspace:?}）：{other}"
+            ),
         }
     }
 
@@ -267,7 +272,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use ignis_storage::{Db, FactRecord};
+    use ignis_storage::{Db, FactRecord, NewFact};
 
     use super::retrieval_terms;
     use crate::memory::{FactScope, MemoryError, MemoryStore};
@@ -324,6 +329,33 @@ mod tests {
         facts.iter().map(|fact| fact.id).collect()
     }
 
+    /// 某 `(scope, workspace, key)` 的 `active` 行数：直接数库里的行，不经过读路径的口径。
+    fn active_row_count(env: &Env, scope: &str, workspace: Option<&str>, key: &str) -> i64 {
+        env.db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT count(*) FROM facts
+                     WHERE scope = ?1 AND workspace IS ?2 AND key = ?3 AND status = 'active'",
+                    (scope, workspace, key),
+                    |row| row.get(0),
+                )
+            })
+            .unwrap()
+    }
+
+    /// 模拟旧实现「插新行 → 标旧行」两步中途失败后的库状态：同 key 落两行 `active`。
+    fn stranded_active_row(env: &Env, scope: &str, key: &str, text: &str) -> i64 {
+        env.db
+            .insert_fact(&NewFact {
+                scope: scope.into(),
+                workspace: None,
+                key: key.into(),
+                text: text.into(),
+                source_task_id: None,
+            })
+            .unwrap()
+    }
+
     #[cfg(unix)]
     fn mode(path: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
@@ -377,6 +409,79 @@ mod tests {
             .prompt_facts(Path::new("/w/a"), "记住：现在改用 uv 装依赖")
             .unwrap();
         assert_eq!(ids(&injected), vec![third.id]);
+    }
+
+    #[test]
+    fn remember_supersedes_into_exactly_one_active_row() {
+        let env = Env::new("one-active-row");
+        let old = env
+            .store
+            .remember(
+                FactScope::Project,
+                Some(Path::new("/w/a")),
+                "pkg_manager",
+                "使用 pip",
+                None,
+            )
+            .unwrap();
+        let new = env
+            .store
+            .remember(
+                FactScope::Project,
+                Some(Path::new("/w/a")),
+                "pkg_manager",
+                "使用 uv",
+                None,
+            )
+            .unwrap();
+
+        // 库里数出来只有一行 active（不是「读路径看起来只有一行」）
+        assert_eq!(
+            active_row_count(&env, "project", Some("/w/a"), "pkg_manager"),
+            1
+        );
+        let stored = env.db.get_fact(old.id).unwrap().unwrap();
+        assert_eq!(
+            (
+                stored.status.as_str(),
+                stored.superseded_by,
+                stored.text.as_str()
+            ),
+            ("superseded", Some(new.id), "使用 pip")
+        );
+        // 别的 key 不凭空多出 active 行
+        assert_eq!(active_row_count(&env, "project", Some("/w/a"), "editor"), 0);
+    }
+
+    #[test]
+    fn remember_heals_a_stranded_duplicate_active_row() {
+        let env = Env::new("stranded-duplicate");
+        // 旧实现「插新行 → 标旧行」两步之间失败留下的现场：同 key 两行 active
+        let older = stranded_active_row(&env, "user", "pkg_manager", "使用 pip");
+        let newer = stranded_active_row(&env, "user", "pkg_manager", "使用 poetry");
+        assert_eq!(active_row_count(&env, "user", None, "pkg_manager"), 2);
+
+        let latest = env
+            .store
+            .remember(FactScope::User, None, "pkg_manager", "使用 uv", None)
+            .unwrap();
+
+        // 写入一次就把所有滞留行收敛：只留最新一行 active，两行旧行都指向它
+        assert_eq!(active_row_count(&env, "user", None, "pkg_manager"), 1);
+        assert_eq!(env.store.list(false).unwrap().len(), 1);
+        for id in [older, newer] {
+            let row = env.db.get_fact(id).unwrap().unwrap();
+            assert_eq!(
+                (row.status.as_str(), row.superseded_by),
+                ("superseded", Some(latest.id)),
+                "id={id}"
+            );
+        }
+        // 读路径（检索与注入）也只回最新值
+        assert_eq!(
+            ids(&env.store.search("使用 uv", 10).unwrap()),
+            vec![latest.id]
+        );
     }
 
     #[test]
@@ -786,31 +891,22 @@ mod tests {
         assert_eq!(mode(&env.mirror_path("user.md")), 0o600);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn read_only_mirror_dir_keeps_remember_ok() {
-        use std::os::unix::fs::PermissionsExt;
+    fn unwritable_mirror_path_keeps_remember_ok() {
+        let env = Env::new("unwritable-mirror");
+        // 镜像目录的位置先被一个普通文件占住：`create_dir_all` 对「已存在的非目录」一定失败，
+        // root 也一样（不受 CAP_DAC_OVERRIDE 影响），不像只读目录那样会被特权绕过。
+        let blocked = env.dir.path().join("memory");
+        fs::write(&blocked, "占位文件").unwrap();
 
-        // root 无视权限位（CAP_DAC_OVERRIDE），0500 的目录照写：本用例的前提不成立，跳过
-        // SAFETY: `geteuid` 只读进程的有效 uid，不触碰内存、无副作用。
-        if unsafe { libc::geteuid() } == 0 {
-            eprintln!("跳过 read_only_mirror_dir_keeps_remember_ok：root 不受目录权限位约束");
-            return;
-        }
-
-        let env = Env::new("readonly-mirror");
-        let mirror_dir = env.dir.path().join("memory");
-        fs::create_dir_all(&mirror_dir).unwrap();
-        fs::set_permissions(&mirror_dir, fs::Permissions::from_mode(0o500)).unwrap();
-
-        let result = env
+        let record = env
             .store
-            .remember(FactScope::User, None, "pkg_manager", "使用 uv", None);
-        // 先恢复权限位，TempDir 析构才能清掉目录（断言失败时也一样）
-        fs::set_permissions(&mirror_dir, fs::Permissions::from_mode(0o700)).unwrap();
+            .remember(FactScope::User, None, "pkg_manager", "使用 uv", None)
+            .expect("镜像写不进去不该让 remember 失败");
 
-        let record = result.expect("镜像写不进去不该让 remember 失败");
+        // 事实已入库，镜像没写出来、占位文件也没被动过
         assert_eq!(env.db.get_fact(record.id).unwrap().unwrap().text, "使用 uv");
+        assert_eq!(fs::read_to_string(&blocked).unwrap(), "占位文件");
         assert!(!env.mirror_path("user.md").exists());
     }
 
