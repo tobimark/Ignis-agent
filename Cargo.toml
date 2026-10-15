@@ -8,6 +8,8 @@ edition = "2024"
 rust-version = "1.98"
 
 [workspace.dependencies]
+# 内部 crate 用 path 依赖，成员 crate 以 `{ workspace = true }` 引入
+ignis-runtime = { path = "packages/runtime" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "time", "sync", "io-util", "fs"] }
 tokio-util = "0.7"
 futures = "0.3"
@@ -19,5 +21,5 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 rusqlite = { version = "0.40", features = ["bundled"] }
 uuid = { version = "1", features = ["v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-dirs = "6"
+dirs = "5"
 regex = "1"
