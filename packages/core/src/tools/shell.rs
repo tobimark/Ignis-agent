@@ -28,6 +28,13 @@ static SECRET_ENV_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(_KEY|_TOKEN|_SECRET|_PASSWORD)$").expect("密钥环境变量正则必须可编译")
 });
 
+/// 超时/取消后等待收尸的上限。直接子进程那一刻已经被 SIGKILL，唯一还可能被等待的
+/// 只是持有 stdout/stderr 管道写端的逃逸进程（如 `setsid sleep 600 &` 挪到新会话、
+/// 进程组信号打不到的孙进程）：`wait_with_output` 必须等管道写端全部关闭才完成，
+/// 无上限地等它会把整个工具调用拖到逃逸进程退出为止。超过这个宽限期就放弃收尸，
+/// 照常返回 timeout/cancelled 的 Err——残留的 fd 持有者自己退出即可。
+const REAP_GRACE: Duration = Duration::from_secs(5);
+
 /// 在工作区内执行一条 shell 命令。
 pub(super) struct ShellRun;
 
@@ -90,7 +97,9 @@ impl Tool for ShellRun {
             output = &mut wait => output,
             _ = tokio::time::sleep(Duration::from_secs(ctx.limits.shell_timeout_secs)) => {
                 kill_process_group(pid);
-                let _ = wait.await;
+                // 至多收尸 REAP_GRACE：管道写端可能还攥在逃出进程组的孙进程手里，
+                // 无上限地收尸会让工具调用一直等它，超时形同虚设。收尸超时也照常返回 Err。
+                let _ = tokio::time::timeout(REAP_GRACE, &mut wait).await;
                 return Err(ToolError::message(format!(
                     "命令超时（timeout {} 秒），已终止整个进程组：{command}",
                     ctx.limits.shell_timeout_secs
@@ -98,7 +107,8 @@ impl Tool for ShellRun {
             }
             _ = ctx.cancel.cancelled() => {
                 kill_process_group(pid);
-                let _ = wait.await;
+                // 同超时分支：取消必须能及时返回，不能被 fd 持有者拖住。
+                let _ = tokio::time::timeout(REAP_GRACE, &mut wait).await;
                 return Err(ToolError::message(format!(
                     "命令已取消（cancelled），已终止整个进程组：{command}"
                 )));
@@ -327,6 +337,47 @@ mod tests {
         // 后台任务与前台任务同属一个进程组：SIGKILL 打到组上，两个 sleep 都必须消失
         assert_eq!(pgrep("12345"), "", "后台任务逃出了进程组");
         assert_eq!(pgrep("12346"), "", "前台任务未被终止");
+    }
+
+    /// 收尸必须有上限：`setsid` 把孙进程挪进新会话，进程组信号碰不到它，但它继承了
+    /// stdout/stderr 的管道写端——没有上限时 `wait_with_output` 要等这个 fd 持有者退出，
+    /// 工具调用就被它拖住（finding 的复现命令 `setsid sleep 600 &` 会挂约 600 秒）。
+    #[tokio::test]
+    async fn bounds_the_reap_when_a_daemonized_command_holds_the_pipes() {
+        let env = Env::with_timeout(1);
+        // 允许的返回上限：1 秒超时 + REAP_GRACE 收尸 + 2 秒调度余量（= 8 秒）。
+        let budget = Duration::from_secs(env.limits.shell_timeout_secs)
+            + REAP_GRACE
+            + Duration::from_secs(2);
+
+        // 1 秒超时 + `setsid sleep 5 &`：必须在 8 秒内带着 timeout 错误返回。
+        let started = Instant::now();
+        let err = env
+            .run(json!({"command": "setsid sleep 5 &"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timeout"), "{err}");
+        assert!(
+            started.elapsed() < budget,
+            "超时收尸不得突破 REAP_GRACE，实际 {:?}",
+            started.elapsed()
+        );
+
+        // `sleep 5` 会在 5 秒宽限期内自然退出，区分不出「有没有上限」；换一个活过宽限期的
+        // 逃逸进程才真的证明上限生效——无上限时这里要等它 30 秒，有上限时超时 + REAP_GRACE
+        // 后必然返回。逃逸进程留在后台自生自灭，这个残留是 POSIX 固有的（它已换会话，
+        // 谁都杀不到，「等它自己退出」正是被修复的病灶）。
+        let started = Instant::now();
+        let err = env
+            .run(json!({"command": "setsid sleep 30 &"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timeout"), "{err}");
+        assert!(
+            started.elapsed() < budget,
+            "收尸没有上限：无上限时这里要等逃逸进程 30 秒，实际 {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
