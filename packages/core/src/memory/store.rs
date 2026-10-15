@@ -7,7 +7,10 @@ use std::sync::Arc;
 use ignis_storage::{Db, FactRecord, NewFact};
 
 use super::mirror;
-use super::{FactScope, MemoryError};
+use super::{
+    FactScope, MAX_FACT_KEY_CHARS, MAX_FACT_TEXT_CHARS, MemoryError, normalize_fact_text,
+    truncate_fact_field,
+};
 
 /// FTS5(trigram) 能查到的最短检索项长度：凑不满一个三元组就没法 MATCH（与 storage 同口径）。
 const FTS_MIN_CHARS: usize = 3;
@@ -39,7 +42,9 @@ impl MemoryStore {
     /// 同 key 的所有 active 行，历史遗留的重复行也会被顺带收敛。
     ///
     /// `scope = Project` 必须带工作区（调用方传 `ToolCtx.workspace`），`User`/`Global` 必须不带；
-    /// `key`/`text` 为空或只有空白时拒绝。成功后尽力重写受影响作用域的镜像。
+    /// `key`/`text` 先在 [`fact_field`] 里归一化（空白折叠、控制字符剔除）并按
+    /// [`MAX_FACT_KEY_CHARS`]/[`MAX_FACT_TEXT_CHARS`] 截断，归一化后为空才拒绝。成功后尽力重写
+    /// 受影响作用域的镜像。
     pub fn remember(
         &self,
         scope: FactScope,
@@ -48,22 +53,16 @@ impl MemoryStore {
         text: &str,
         source_task_id: Option<&str>,
     ) -> Result<FactRecord, MemoryError> {
-        let key = key.trim();
-        let text = text.trim();
-        if key.is_empty() {
-            return Err(MemoryError::EmptyKey);
-        }
-        if text.is_empty() {
-            return Err(MemoryError::EmptyText);
-        }
+        let key = fact_field(key, MAX_FACT_KEY_CHARS, MemoryError::EmptyKey)?;
+        let text = fact_field(text, MAX_FACT_TEXT_CHARS, MemoryError::EmptyText)?;
         // 工作区先校验：参数不对就既不落库也不动镜像
         let workspace = workspace_string(scope, workspace)?;
 
         let id = self.db.insert_fact_superseding(&NewFact {
             scope: scope.as_str().to_owned(),
             workspace: workspace.clone(),
-            key: key.to_owned(),
-            text: text.to_owned(),
+            key,
+            text,
             source_task_id: source_task_id.map(str::to_owned),
         })?;
 
@@ -75,8 +74,9 @@ impl MemoryStore {
     /// 查某个 `(scope, workspace, key)` 位置上的 `active` 事实；没有就回 `None`。
     ///
     /// 给元工具 `remember` 用：写入前先看这个位置有没有旧值，写完对比 id 就知道这次是不是真的
-    /// supersede 了一条旧事实。`key` 与 [`MemoryStore::remember`] 同口径裁掉首尾空白，工作区校验
-    /// 也同一套（`project` 必须带、其它范围必须不带）。
+    /// supersede 了一条旧事实。`key` 与 [`MemoryStore::remember`] 同口径（[`fact_field`] 的归一化
+    /// 与截断），否则带空白的 key 会查不到自己刚写下的那行、把 supersede 误报成首次写入；工作区
+    /// 校验也同一套（`project` 必须带、其它范围必须不带）。归一化后为空时照旧查不到（回 `None`）。
     pub fn recall_by_key(
         &self,
         scope: FactScope,
@@ -84,9 +84,10 @@ impl MemoryStore {
         key: &str,
     ) -> Result<Option<FactRecord>, MemoryError> {
         let workspace = workspace_string(scope, workspace)?;
+        let key = truncate_fact_field(&normalize_fact_text(key), MAX_FACT_KEY_CHARS);
         Ok(self
             .db
-            .active_fact_by_key(scope.as_str(), workspace.as_deref(), key.trim())?)
+            .active_fact_by_key(scope.as_str(), workspace.as_deref(), &key)?)
     }
 
     /// 任务上下文要注入的事实：本工作区的 active `project` 事实（无条件、新近在前）+ 按 prompt
@@ -138,14 +139,11 @@ impl MemoryStore {
     /// 改写一条事实的文本（`updated_at` 随之推进）；行不存在时报 [`MemoryError::NotFound`]。
     ///
     /// `superseded` 行也允许改写（库里留痕的历史由调用方自己决定怎么修）；它不出现在镜像里，
-    /// 刷新只是让文件与库保持一致。
+    /// 刷新只是让文件与库保持一致。文本与 [`MemoryStore::remember`] 走同一条口径（归一化 + 截断）。
     pub fn edit(&self, id: i64, text: &str) -> Result<FactRecord, MemoryError> {
-        let text = text.trim();
-        if text.is_empty() {
-            return Err(MemoryError::EmptyText);
-        }
+        let text = fact_field(text, MAX_FACT_TEXT_CHARS, MemoryError::EmptyText)?;
         let existing = self.db.get_fact(id)?.ok_or(MemoryError::NotFound { id })?;
-        self.db.update_fact_text(id, text)?;
+        self.db.update_fact_text(id, &text)?;
         let record = self.db.get_fact(id)?.ok_or(MemoryError::NotFound { id })?;
         self.refresh_mirror_for(&existing);
         Ok(record)
@@ -251,6 +249,16 @@ impl MemoryStore {
     }
 }
 
+/// 写入路径的字段口径：归一化（[`normalize_fact_text`]）→ 归一化后为空则按 `empty` 报错 →
+/// 截到 `max_chars` 个字符（[`truncate_fact_field`]）。库、镜像与后续系统提示拿到的永远是这一份。
+fn fact_field(value: &str, max_chars: usize, empty: MemoryError) -> Result<String, MemoryError> {
+    let normalized = normalize_fact_text(value);
+    if normalized.is_empty() {
+        return Err(empty);
+    }
+    Ok(truncate_fact_field(&normalized, max_chars))
+}
+
 /// 校验并归一化工作区：`project` 必须带、其它范围必须不带，路径转成库里用的字符串。
 fn workspace_string(
     scope: FactScope,
@@ -264,22 +272,66 @@ fn workspace_string(
     }
 }
 
-/// 从 prompt 里拆出 FTS 检索项：按非字母数字字符（空白与标点）切段，丢掉不足 3 字符的段
-/// （trigram 查不出两字以下的词）、按出现顺序去重，最多 8 个。
+/// 从 prompt 里拆出 FTS 检索项，按出现顺序去重，最多 [`RETRIEVAL_TERM_LIMIT`] 个。
 ///
-/// 不把整段 prompt 当查询：FTS 短语要求整段字面出现，长 prompt 几乎必然零命中。
+/// 不把检索项直接当整段 prompt 查：FTS 查询是「要求这串字原样出现」的短语，长 prompt 几乎必然
+/// 零命中。两套切法：
+/// - **ASCII 之类的词**：按非字母数字字符（空白与标点）切段，丢掉不足 3 字符的段（trigram 查不出
+///   两字以下的词）；
+/// - **中日韩（Han）字符段**：汉字是字母数字，一整句中文会被切成一个「词」，而整句当短语查必然
+///   零命中——检索对主语言失效。所以超过 3 个字的汉字段改发**滑动 3 字窗口**
+///   （`这个项目使用` → `这个项`、`个项目`、`项目使`、`目使用`），每个窗口恰好一个三元组。
 fn retrieval_terms(prompt: &str) -> Vec<String> {
     let mut terms: Vec<String> = Vec::new();
-    for token in prompt.split(|ch: char| !ch.is_alphanumeric()) {
-        if token.chars().count() < FTS_MIN_CHARS || terms.iter().any(|seen| seen == token) {
-            continue;
+    let mut run: Option<(usize, bool)> = None; // (起点字节偏移, 是否汉字段)
+    for (index, ch) in prompt.char_indices() {
+        let han = is_han(ch);
+        if ch.is_alphanumeric() && run.is_some_and(|(_, run_han)| run_han == han) {
+            continue; // 同一段继续
         }
-        terms.push(token.to_owned());
-        if terms.len() == RETRIEVAL_TERM_LIMIT {
-            break;
+        // 段在这里结束：先冲掉上一段，再看当前字符能不能开新段（标点与空白两件事都不做）
+        if let Some((start, run_han)) = run.take() {
+            push_run_terms(&mut terms, &prompt[start..index], run_han);
+        }
+        if ch.is_alphanumeric() {
+            run = Some((index, han));
         }
     }
+    if let Some((start, run_han)) = run {
+        push_run_terms(&mut terms, &prompt[start..], run_han);
+    }
+    terms.truncate(RETRIEVAL_TERM_LIMIT);
     terms
+}
+
+/// 把一段连续的字母数字字符变成检索项：汉字段超过 3 个字就发滑动 3 字窗口，其余段整段发。
+fn push_run_terms(terms: &mut Vec<String>, run: &str, han: bool) {
+    if !han || run.chars().nth(FTS_MIN_CHARS).is_none() {
+        // 非汉字段整段发；汉字段只有 3 个字时整段就是一个窗口，也走这里
+        push_term(terms, run);
+        return;
+    }
+    let chars: Vec<char> = run.chars().collect();
+    for window in chars.windows(FTS_MIN_CHARS) {
+        push_term(terms, &window.iter().collect::<String>());
+    }
+}
+
+/// 追加一个检索项：不足 [`FTS_MIN_CHARS`] 字符的丢掉（凑不满一个三元组），已出现过的跳过。
+fn push_term(terms: &mut Vec<String>, term: &str) {
+    if term.chars().count() < FTS_MIN_CHARS || terms.iter().any(|seen| seen == term) {
+        return;
+    }
+    terms.push(term.to_owned());
+}
+
+/// 是否是「中日韩统一表意文字」（Han）的码位：这类字符对 FTS5(trigram) 是按字切三元组的，
+/// 一整句当短语查必然零命中（见 [`retrieval_terms`]）。含扩展 A/B 与兼容表意区。
+fn is_han(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x2_0000..=0x2_FA1F
+    )
 }
 
 #[cfg(test)]
@@ -291,8 +343,11 @@ mod tests {
 
     use ignis_storage::{Db, FactRecord, NewFact};
 
-    use super::retrieval_terms;
-    use crate::memory::{FactScope, MemoryError, MemoryStore};
+    use super::{RETRIEVAL_TERM_LIMIT, retrieval_terms};
+    use crate::memory::{
+        FactScope, MAX_FACT_KEY_CHARS, MAX_FACT_TEXT_CHARS, MemoryError, MemoryStore,
+    };
+    use crate::task::prompts::build_system_prompt;
 
     /// 唯一临时目录：测试并发跑，目录名带进程号与进程内自增序号。
     struct TempDir(PathBuf);
@@ -681,9 +736,117 @@ mod tests {
         assert!(matches!(err, MemoryError::EmptyText), "{err}");
         assert_eq!(err.to_string(), "记忆的 text 不能为空");
 
+        // 控制字符剔除后为空：同样按空值拒绝（`\u{7}` 之类的「看不见的输入」不算内容）
+        let err = env
+            .store
+            .remember(FactScope::User, None, "\u{7}\u{8}", "值", None)
+            .unwrap_err();
+        assert!(matches!(err, MemoryError::EmptyKey), "{err}");
+        let err = env
+            .store
+            .remember(FactScope::User, None, "k", "\n\t\u{7}", None)
+            .unwrap_err();
+        assert!(matches!(err, MemoryError::EmptyText), "{err}");
+        assert!(matches!(
+            env.store.edit(0, " \u{1b} "),
+            Err(MemoryError::EmptyText)
+        ));
+
         // 校验失败不留任何行（内存库与镜像都干净）
         assert!(env.store.list(true).unwrap().is_empty());
         assert!(!env.mirror_path("user.md").exists());
+    }
+
+    /// 一条事实会逐字进系统提示与 Markdown 镜像：`\n` 能凭一条事实撑出好几行（伪装成另一条
+    /// 指令 / 另一个 bullet），所以写入前就把空白折叠成单个空格、控制字符剔除。
+    #[test]
+    fn remember_collapses_multiline_facts_into_a_single_line() {
+        let env = Env::new("single-line-fact");
+        let record = env
+            .store
+            .remember(
+                FactScope::User,
+                None,
+                "note\nkey\u{7}",
+                "第一行\n第二行\t第三行\u{7}\u{1b}结束",
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(record.key, "note key");
+        assert_eq!(record.text, "第一行 第二行 第三行结束");
+
+        // 库里就是归一化后的那一份（直读表，不经过 DAO 的口径）
+        let stored: (String, String) = env
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT key, text FROM facts WHERE id = ?1",
+                    [record.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            stored,
+            ("note key".to_owned(), "第一行 第二行 第三行结束".to_owned())
+        );
+
+        // 镜像：一条事实一个 bullet，换行撑不出额外行
+        let mirror = env.mirror("user.md");
+        assert_eq!(mirror.lines().count(), 1, "{mirror}");
+        assert!(
+            mirror.contains("- [user/note key] 第一行 第二行 第三行结束（更新："),
+            "{mirror}"
+        );
+
+        // 后续任务的系统提示：这条事实同样只占一行
+        let prompt = build_system_prompt(Path::new("/w/a"), &[], &[record], &[]);
+        let injected: Vec<&str> = prompt
+            .lines()
+            .filter(|line| line.starts_with("- [user/"))
+            .collect();
+        assert_eq!(
+            injected,
+            vec!["- [user/note key] 第一行 第二行 第三行结束"],
+            "{prompt}"
+        );
+    }
+
+    /// 文本与 key 都在写入前截到上限（末尾补 `…`）：库、镜像与提示不会再持有更长的文本。
+    #[test]
+    fn remember_caps_the_text_and_key_at_the_stored_limit() {
+        let env = Env::new("cap-fields");
+        let long_text = "好".repeat(MAX_FACT_TEXT_CHARS + 200);
+        let long_key = "k".repeat(MAX_FACT_KEY_CHARS + 40);
+        let record = env
+            .store
+            .remember(FactScope::Global, None, &long_key, &long_text, None)
+            .unwrap();
+
+        let expected_text = format!("{}…", "好".repeat(MAX_FACT_TEXT_CHARS));
+        let expected_key = format!("{}…", "k".repeat(MAX_FACT_KEY_CHARS));
+        assert_eq!(record.text, expected_text);
+        assert_eq!(record.key, expected_key);
+        assert_eq!(record.text.chars().count(), MAX_FACT_TEXT_CHARS + 1);
+        assert_eq!(record.key.chars().count(), MAX_FACT_KEY_CHARS + 1);
+
+        // 库里与镜像里都是截断后的那一份，而且只占一行
+        assert_eq!(
+            env.db.get_fact(record.id).unwrap().unwrap().text,
+            expected_text
+        );
+        let mirror = env.mirror("global.md");
+        assert_eq!(mirror.lines().count(), 1, "{}", mirror.len());
+        assert!(mirror.contains(&expected_text), "{}", mirror.len());
+
+        // `edit` 走同一条写入口径
+        let edited = env.store.edit(record.id, &long_text).unwrap();
+        assert_eq!(edited.text, expected_text);
+        assert_eq!(
+            env.db.get_fact(record.id).unwrap().unwrap().text,
+            expected_text
+        );
     }
 
     #[test]
@@ -831,10 +994,14 @@ mod tests {
     #[test]
     fn retrieval_terms_split_on_punctuation_and_cap_at_eight() {
         assert_eq!(retrieval_terms("a bb ccc ddd ccc"), vec!["ccc", "ddd"]);
+        // 中文长段改发 3 字滑窗（整段当短语查在 trigram FTS 里要求逐字相连，长句几乎必然零命中）
         assert_eq!(
             retrieval_terms("这个项目使用 uv 管理 Python 环境"),
-            vec!["这个项目使用", "Python"]
+            vec!["这个项", "个项目", "项目使", "目使用", "Python"]
         );
+        // 4 个汉字给两条滑窗；2 个汉字依旧凑不满一个三元组，整段丢掉
+        assert_eq!(retrieval_terms("环境工具"), vec!["环境工", "境工具"]);
+        assert!(retrieval_terms("环境").is_empty());
         assert_eq!(
             retrieval_terms("请用 uv，管理(环境)；pytest"),
             vec!["pytest"]
@@ -844,6 +1011,48 @@ mod tests {
             vec!["t01", "t02", "t03", "t04", "t05", "t06", "t07", "t08"]
         );
         assert!(retrieval_terms("uv 走 好").is_empty());
+        // 滑窗按出现顺序去重
+        assert_eq!(
+            retrieval_terms("这个项目这个项目"),
+            vec!["这个项", "个项目", "项目这", "目这个"]
+        );
+        // 上限在滑窗建完后再收口
+        let capped = retrieval_terms("一二三四五六七八九十甲乙丙丁戊己庚辛壬癸");
+        assert_eq!(capped.len(), RETRIEVAL_TERM_LIMIT);
+        assert_eq!(capped[0], "一二三");
+        assert!(capped.iter().all(|term| term.chars().count() == 3));
+    }
+
+    /// 中文 prompt 常常一个标点都没有：整句在 FTS 里是「要求这串字原样出现」的短语，长句几乎
+    /// 必然零命中，`user`/`global` 事实就永远检索不到。3 字滑窗是这条路径的兜底。
+    #[test]
+    fn unpunctuated_chinese_prompts_retrieve_user_facts() {
+        let env = Env::new("cjk-prompt-retrieval");
+        let fact = env
+            .store
+            .remember(
+                FactScope::User,
+                None,
+                "python_env",
+                "这个项目使用 uv 管理 Python 环境",
+                None,
+            )
+            .unwrap();
+
+        // 负例：prompt 与事实文本没有一句逐字相同，且全无分隔符（没有 `，`）
+        let prompt = "这个项目使用什么依赖管理工具";
+        assert!(!prompt.contains('，'), "本用例故意不带标点");
+        let facts = env.store.prompt_facts(Path::new("/w/a"), prompt).unwrap();
+        assert_eq!(ids(&facts), vec![fact.id]);
+
+        // 2 个字符的 prompt 依旧拆不出检索项，跳过 FTS
+        assert!(retrieval_terms("今晚").is_empty());
+        assert!(
+            env.store
+                .prompt_facts(Path::new("/w/a"), "今晚")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

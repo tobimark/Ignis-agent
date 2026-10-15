@@ -15,6 +15,53 @@ mod store;
 
 pub use store::MemoryStore;
 
+/// 一条事实文本的字符上限。事实会逐字注入**每一次**后续任务的系统提示，写入前就截断
+/// （截断点落在字符边界，末尾补 `…`），库、镜像与提示拿到的永远是这一份。
+pub(crate) const MAX_FACT_TEXT_CHARS: usize = 500;
+/// 一条事实 key 的字符上限；key 与文本同在一行里（镜像与提示），同样在写入前截断。
+pub(crate) const MAX_FACT_KEY_CHARS: usize = 120;
+
+/// 归一化事实字段：所有空白（含 `\n`、`\t`）折叠成单个空格、控制字符剔除、首尾空白裁掉。
+///
+/// 一条事实在系统提示里是一行（`- [scope/key] text`）、在镜像里是一个 bullet：文本里残留的
+/// `\n` 会把一条事实撑成好几行，看起来就像另一条指令/另一个 bullet——而事实文本可能是
+/// `http_fetch` 之类不可信来源转述过来的。写入前在此收口，后续所有读路径拿到的都是单行文本。
+/// 与 [`crate::skills::frontmatter`] 的清洗同一套思路（那边按字段的 `fold_spaces` 开关复用）。
+pub(crate) fn normalize_fact_text(value: &str) -> String {
+    let mut cleaned = String::with_capacity(value.len());
+    let mut pending_space = false;
+    for ch in value.chars() {
+        if ch.is_whitespace() {
+            // 开头的空白不占位，中间的连续空白合并成一个空格
+            pending_space = !cleaned.is_empty();
+            continue;
+        }
+        if ch.is_control() {
+            continue;
+        }
+        if pending_space {
+            cleaned.push(' ');
+            pending_space = false;
+        }
+        cleaned.push(ch);
+    }
+    cleaned
+}
+
+/// 把已归一化的事实字段截到 `max_chars` 个字符：截断点落在字符边界，末尾补一个 `…`。
+///
+/// 超长文本就是这么被挡在库外的（[`MAX_FACT_TEXT_CHARS`]/[`MAX_FACT_KEY_CHARS`]）；库、镜像与
+/// 提示里永远是这一份，读路径不需要再截。
+pub(crate) fn truncate_fact_field(value: &str, max_chars: usize) -> String {
+    let Some((end, _)) = value.char_indices().nth(max_chars) else {
+        return value.to_owned();
+    };
+    let mut truncated = String::with_capacity(end + '…'.len_utf8());
+    truncated.push_str(&value[..end]);
+    truncated.push('…');
+    truncated
+}
+
 use ignis_storage::StorageError;
 use serde::{Deserialize, Serialize};
 

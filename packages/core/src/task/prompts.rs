@@ -17,6 +17,9 @@ const RETRIEVED_FACTS_BUDGET: usize = 2000;
 const TRUNCATED_MARKER: &str = "… [facts truncated]";
 /// 走 project 预算的 `facts.scope` 取值。
 const PROJECT_SCOPE: &str = "project";
+/// 工具使用指引里点名 `remember` 的一句：用户说出的持久偏好或环境事实值得记下来。
+const REMEMBER_GUIDANCE: &str =
+    "Call `remember` when the user states a durable preference or environment fact.";
 
 /// 组装 system prompt：英文骨架（人格一行 + 工作区路径 + 工具使用要求 + 「用用户的语言回答」）
 /// 之后依次追加已知事实段与技能目录段；两段都为空时整个不出现，骨架保持原样。
@@ -39,7 +42,7 @@ pub fn build_system_prompt(
         "You are Ignis, a personal AI agent that does real work with tools.\n\
          Workspace: {}\n\
          Use the tools instead of guessing; prefer absolute paths inside the workspace, and keep \
-         replies concise.\n\
+         replies concise. {REMEMBER_GUIDANCE}\n\
          Available tools: {names}\n\
          Answer in the user's language.",
         workspace.display()
@@ -58,7 +61,7 @@ pub fn build_system_prompt(
 /// 渲染 `Known facts:` 段；没有任何事实时返回 `None`（整段省略）。
 ///
 /// project 事实排在前、检索事实（`user`/`global`）在后，两类各按一份字符预算记账（含行尾换行）：
-/// 顺序即优先级，某一类一旦放不下下一条就停在那里，段尾补一行 [`TRUNCATED_MARKER`]
+/// 顺序即优先级，单条超预算的只跳过自己（见 [`push_class`]），段尾补一行 [`TRUNCATED_MARKER`]
 /// （标记本身不计入预算）。
 fn facts_section(facts: &[FactRecord]) -> Option<String> {
     if facts.is_empty() {
@@ -75,24 +78,27 @@ fn facts_section(facts: &[FactRecord]) -> Option<String> {
     Some(lines.join("\n"))
 }
 
-/// 把一类事实按预算追加进 `lines`：一条一行，放不下的整条跳过（顺序即优先级，从此截断），
-/// 有任何一条没放进去就返回 `true`。
+/// 把一类事实按预算追加进 `lines`：一条一行，单条超预算的**只跳过自己**，后面放得下的条目照旧
+/// 追加（顺序即优先级，但一条失控的超长事实不该把整类事实挡在提示之外）；有任何一条没放进去就
+/// 返回 `true`（段尾补一行截断标记）。
 fn push_class<'a>(
     lines: &mut Vec<String>,
     facts: impl Iterator<Item = &'a FactRecord>,
     budget: usize,
 ) -> bool {
     let mut used = 0;
+    let mut truncated = false;
     for fact in facts {
         let line = fact_line(fact);
         let cost = line.chars().count() + 1;
         if used + cost > budget {
-            return true;
+            truncated = true;
+            continue;
         }
         used += cost;
         lines.push(line);
     }
-    false
+    truncated
 }
 
 /// 一条事实在系统提示里的一行：`- [{scope}/{key}] {text}`。
@@ -247,5 +253,41 @@ mod tests {
         );
         // 没有事实就不留事实段
         assert!(!prompt.contains(FACTS_HEADER), "{prompt}");
+    }
+
+    /// 超预算的是**单条**事实，不是「从这条起全丢」：把它跳过，后面放得下的小事实照旧注入
+    /// （否则一条失控的超长事实能把整类事实挡在提示之外）。
+    #[test]
+    fn an_oversized_fact_does_not_hide_the_later_ones() {
+        let monster = fact(1, "user", "giant", &"a".repeat(RETRIEVED_FACTS_BUDGET * 2));
+        let normal = fact(2, "user", "editor", "偏好 Neovim");
+        let project = fact(3, "project", "pkg_manager", "使用 uv");
+        let facts = [monster, normal, project];
+
+        let prompt = build_system_prompt(Path::new("/w/a"), &[], &facts, &[]);
+
+        assert!(
+            prompt.contains("- [project/pkg_manager] 使用 uv"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("- [user/editor] 偏好 Neovim"), "{prompt}");
+        // 被跳过的那条整条不出现（key 与正文都不在），段尾只补一条截断标记
+        assert!(!prompt.contains("giant"), "{prompt}");
+        assert!(!prompt.contains(&"a".repeat(64)), "{prompt}");
+        assert_eq!(prompt.matches(TRUNCATED_MARKER).count(), 1, "{prompt}");
+        assert!(prompt.trim_end().ends_with(TRUNCATED_MARKER), "{prompt}");
+    }
+
+    /// 工具使用指引里点名 `remember`：用户说出持久的偏好或环境事实时就该写进记忆。
+    #[test]
+    fn tool_guidance_tells_the_model_to_remember_durable_facts() {
+        let prompt = build_system_prompt(Path::new("/w/a"), &[], &[], &[]);
+
+        assert!(prompt.contains(REMEMBER_GUIDANCE), "{prompt}");
+        // 钉住措辞本身（改文案要一起改测试，别把指引悄悄删掉）
+        assert!(
+            prompt.contains("`remember`") && prompt.contains("durable preference"),
+            "{prompt}"
+        );
     }
 }

@@ -80,7 +80,8 @@ fn project_workspace(cli: &Cli, home: &Path) -> Result<PathBuf> {
 
 /// 新增一条事实：与元工具 `remember` 同一套语义（同 `(scope, workspace, key)` 的旧值被取代）。
 ///
-/// 回执也走元工具那份 [`remembered_notice`]（core 里的唯一实现，两边逐字节一致）；
+/// 回执也走元工具那份 [`remembered_notice`]（core 里的唯一实现，两边逐字节一致）：用的是**入库后**
+/// 的 key/text（写入路径已归一化单行并截断），命令行里带换行的原文不会撑成多行回执；
 /// `project` 的工作区由调用方解析后传入。
 fn add_at(
     home: &Path,
@@ -97,7 +98,7 @@ fn add_at(
     let superseded = previous.is_some_and(|old| old.id != record.id);
     Ok(format!(
         "{}\n",
-        remembered_notice(scope, key, text, superseded)
+        remembered_notice(scope, &record.key, &record.text, superseded)
     ))
 }
 

@@ -74,10 +74,13 @@ impl Tool for Remember {
             .remember(scope, workspace, key, text, None)
             .map_err(memory_failure)?;
 
-        // 回显的是真正入库的那份文本（`MemoryStore` 存储前裁掉首尾空白）；文案与 CLI
-        // `ignis memory add` 共用 `remembered_notice`，两边逐字节一致
+        // 回显的是真正入库的那份文本：`MemoryStore` 写入前已归一化（换行折叠成单行、控制字符
+        // 剔除）并按上限截断，所以认它而不是模型递进来的原串——否则回显可能把多行原文又带回
+        // 上下文。文案与 CLI `ignis memory add` 共用 `remembered_notice`，两边逐字节一致；
+        // 整段再按工具输出上限截一次（与 `load_skill` 同一套）。
         let superseded = previous.is_some_and(|old| old.id != record.id);
-        Ok(remembered_notice(scope, key, text, superseded))
+        let notice = remembered_notice(scope, &record.key, &record.text, superseded);
+        Ok(truncate_output(&notice, ctx.limits.tool_output_limit))
     }
 }
 
@@ -166,7 +169,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::meta_tools;
-    use crate::memory::MemoryStore;
+    use crate::memory::{MAX_FACT_TEXT_CHARS, MemoryStore};
     use crate::security::{ApprovalMode, Policy, Redactor};
     use crate::skills::SkillCatalog;
     use crate::tools::{ToolRuntime, default_registry};
@@ -420,6 +423,75 @@ mod tests {
         );
     }
 
+    /// 回显走的是入库后的那一份：单行（换行折叠、控制字符剔除）。
+    #[tokio::test]
+    async fn remember_echoes_the_stored_single_line_text() {
+        let env = Env::new();
+
+        let result = env
+            .call(
+                "remember",
+                json!({
+                    "scope": "global",
+                    "key": "  editor\n ",
+                    "text": "  偏好\nNeovim\t（控制字符\u{7}已剔除）  ",
+                }),
+            )
+            .await;
+
+        assert!(result.ok, "{:?}", result.output);
+        let output = result.output.unwrap();
+        assert_eq!(
+            output,
+            "已记住（global/editor）：偏好 Neovim （控制字符已剔除）"
+        );
+        assert!(!output.contains('\n'), "{output}");
+        assert_eq!(
+            env.active_fact("global", None, "editor").text,
+            "偏好 Neovim （控制字符已剔除）"
+        );
+    }
+
+    /// 回显的两条兜底：入库文本已按 `MAX_FACT_TEXT_CHARS` 截断（带 `…`），回显再按工具输出
+    /// 上限走一遍 `truncate_output`（与 `load_skill` 同一套）。
+    #[tokio::test]
+    async fn remember_echoes_the_capped_text_and_honours_the_output_limit() {
+        let env = Env::new();
+        let text = format!("第一行\n{}", "好".repeat(MAX_FACT_TEXT_CHARS + 100));
+
+        let result = env
+            .call(
+                "remember",
+                json!({"scope": "user", "key": "k", "text": text}),
+            )
+            .await;
+        assert!(result.ok, "{:?}", result.output);
+        let output = result.output.unwrap();
+        let stored = env.active_fact("user", None, "k").text;
+        assert_eq!(stored.chars().count(), MAX_FACT_TEXT_CHARS + 1);
+        assert!(stored.ends_with('…'), "{stored}");
+        // 回显的就是库里的那一份（截断后的），不是模型原样递进来的长文本
+        assert!(output.contains(&stored), "{}", output.len());
+
+        // 超小输出上限：回显带上标准截断标记
+        let env = Env::with_limits(Limits {
+            tool_output_limit: 48,
+            ..Limits::default()
+        });
+        let result = env
+            .call(
+                "remember",
+                json!({"scope": "user", "key": "k", "text": "使用 uv 管理 Python 环境"}),
+            )
+            .await;
+        assert!(result.ok, "{:?}", result.output);
+        let output = result.output.unwrap();
+        assert!(
+            output.ends_with("… [truncated: output exceeded 48 bytes]"),
+            "{output}"
+        );
+    }
+
     #[tokio::test]
     async fn remember_reports_bad_arguments_in_chinese() {
         let env = Env::new();
@@ -448,6 +520,11 @@ mod tests {
             ),
             (
                 json!({"scope": "user", "key": "k", "text": " \n "}),
+                "记忆的 text 不能为空",
+            ),
+            (
+                // 控制字符剔除后为空：同样按空值拒绝
+                json!({"scope": "user", "key": "k", "text": "\u{7}\u{1b}"}),
                 "记忆的 text 不能为空",
             ),
         ] {
