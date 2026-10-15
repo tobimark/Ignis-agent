@@ -13,7 +13,7 @@ use ignis_core::scheduler::{NEVER_DUE, next_due, parse_schedule};
 use ignis_storage::{Db, JobRecord, JobRunRecord};
 
 use super::now_secs;
-use super::task::{format_time, id_prefix, one_line, render_table, truncate};
+use super::task::{format_time, one_line, render_table, truncate};
 use crate::cli::ScheduleCommand;
 
 /// `history` 里摘要/错误列的字符上限：与 `memory list` 的 text 列同一量级。
@@ -70,7 +70,7 @@ fn list_at(home: &Path) -> Result<String> {
     Ok(render_jobs(&jobs, now_secs()))
 }
 
-/// 暂停或恢复：改 `status`，回执点名任务名。
+/// 暂停或恢复：改 `status`，回执点名完整 id（短 id 就是要能整串复制回命令行）与任务名。
 fn set_status_at(home: &Path, id: &str, toggle: Toggle) -> Result<String> {
     let db = db_at(home)?;
     let job = find_job(&db, id)?;
@@ -78,7 +78,7 @@ fn set_status_at(home: &Path, id: &str, toggle: Toggle) -> Result<String> {
     Ok(format!(
         "schedule {}: {} ({})\n",
         toggle.verb(),
-        id_prefix(id),
+        id,
         one_line(&job.name)
     ))
 }
@@ -90,15 +90,27 @@ fn remove_at(home: &Path, id: &str) -> Result<String> {
     db.remove_job(id)?;
     Ok(format!(
         "schedule removed: {} ({}) (run history kept)\n",
-        id_prefix(id),
+        id,
         one_line(&job.name)
     ))
 }
 
 /// 运行历史：按开始时刻倒序；`id` 省略时看全部任务的（含已删任务的留痕）。
+///
+/// 显式 `id` 既不是现存 job、也没有任何运行留痕时，报 `schedule not found: {id}`——拼错的 id
+/// 不能得到一张和「还没跑过」一样的空表。存在性判定是「job 行 **或** 运行留痕」：`remove` 只删
+/// `jobs` 行，删掉的 job 历史照常可查。
 fn history_at(home: &Path, id: Option<&str>, limit: usize) -> Result<String> {
-    let runs = db_at(home)?.list_job_runs(id, limit)?;
-    Ok(render_runs(&runs))
+    let db = db_at(home)?;
+    let Some(id) = id else {
+        return Ok(render_runs(&db.list_job_runs(None, limit)?));
+    };
+    // 存在性探测单独用 limit=1：limit=0 时主查询本来就空，不能把「没限量出来」当「不存在」
+    let known = db.get_job(id)?.is_some() || !db.list_job_runs(Some(id), 1)?.is_empty();
+    if !known {
+        return Err(anyhow!("schedule not found: {id}"));
+    }
+    Ok(render_runs(&db.list_job_runs(Some(id), limit)?))
 }
 
 /// 按 id 取任务行；未知 id 报 `schedule not found: {id}`（`main` 打成 `error:` 并给退出码 1）。
@@ -109,7 +121,7 @@ fn find_job(db: &Db, id: &str) -> Result<JobRecord> {
     }
 }
 
-/// 名单表：`ID  NAME  STATUS  KIND/EXPR  LAST RUN  NEXT DUE`。
+/// 名单表：`ID  NAME  STATUS  KIND/EXPR  LAST RUN  NEXT DUE`；ID 列给完整的短 id。
 fn render_jobs(jobs: &[JobRecord], now: i64) -> String {
     let mut rows = vec![vec![
         "ID".to_string(),
@@ -121,7 +133,7 @@ fn render_jobs(jobs: &[JobRecord], now: i64) -> String {
     ]];
     for job in jobs {
         rows.push(vec![
-            id_prefix(&job.id),
+            job.id.clone(),
             one_line(&job.name),
             job.status.clone(),
             one_line(&format!("{} {}", job.schedule_kind, job.schedule_expr)),
@@ -151,7 +163,7 @@ fn format_due(due_secs: i64) -> String {
     format_time(due_secs.saturating_mul(1_000))
 }
 
-/// 历史表：`ID  STATUS  STARTED  ENDED  TOKENS  SUMMARY/ERROR`。
+/// 历史表：`ID  STATUS  STARTED  ENDED  TOKENS  SUMMARY/ERROR`；ID 列给完整的运行 id。
 fn render_runs(runs: &[JobRunRecord]) -> String {
     let mut rows = vec![vec![
         "ID".to_string(),
@@ -163,7 +175,7 @@ fn render_runs(runs: &[JobRunRecord]) -> String {
     ]];
     for run in runs {
         rows.push(vec![
-            id_prefix(&run.id),
+            run.id.clone(),
             run.status.clone(),
             format_time(run.started_at),
             // 还没收尾的运行：结束时间给 `-`，不编时刻
@@ -247,7 +259,7 @@ mod tests {
         }
     }
 
-    /// 名单行：id 前 8、name、status、kind/expr、last run、next due（现算，永不触发打 `never`）。
+    /// 名单行：完整短 id、name、status、kind/expr、last run、next due（现算，永不触发打 `never`）。
     #[test]
     fn rows_show_the_locked_columns_and_compute_next_due() {
         let db = Db::open_in_memory().unwrap();
@@ -294,7 +306,7 @@ mod tests {
         assert_eq!(
             cells(out.lines().nth(1).unwrap()),
             [
-                "019a1b2c",
+                "019a1b2c-3d4e-7f00-8000-000000000001",
                 "disk-watch",
                 "active",
                 "interval 10m",
@@ -307,7 +319,7 @@ mod tests {
         assert_eq!(
             cells(out.lines().nth(2).unwrap()),
             [
-                "019a1b2c",
+                "019a1b2c-3d4e-7f00-8000-000000000002",
                 "feb-30",
                 "paused",
                 "cron 0 0 30 2 *",
@@ -320,7 +332,7 @@ mod tests {
         assert_eq!(
             cells(out.lines().nth(3).unwrap()),
             [
-                "019a1b2c",
+                "019a1b2c-3d4e-7f00-8000-000000000003",
                 "old-note",
                 "active",
                 "interval 2h",
@@ -346,7 +358,7 @@ mod tests {
         assert_eq!(next_due_cell(&unreachable, STARTED_AT / 1000), "never");
     }
 
-    /// 暂停/恢复改的是 `jobs.status`，回执点名 id 前 8 与任务名。
+    /// 暂停/恢复改的是 `jobs.status`，回执点名完整 id 与任务名。
     #[test]
     fn pause_and_resume_flip_the_status_and_echo_the_job() {
         let home = TempHome::new("toggle");
@@ -358,7 +370,7 @@ mod tests {
 
         assert_eq!(
             set_status_at(home.path(), id, Toggle::Pause).unwrap(),
-            "schedule paused: 019a1b2c (disk-watch)\n"
+            format!("schedule paused: {id} (disk-watch)\n")
         );
         assert_eq!(
             db_at(home.path())
@@ -372,7 +384,7 @@ mod tests {
 
         assert_eq!(
             set_status_at(home.path(), id, Toggle::Resume).unwrap(),
-            "schedule resumed: 019a1b2c (disk-watch)\n"
+            format!("schedule resumed: {id} (disk-watch)\n")
         );
         assert_eq!(
             db_at(home.path())
@@ -404,7 +416,7 @@ mod tests {
 
         assert_eq!(
             remove_at(home.path(), id).unwrap(),
-            "schedule removed: 019a1b2c (disk-watch) (run history kept)\n"
+            format!("schedule removed: {id} (disk-watch) (run history kept)\n")
         );
 
         let db = db_at(home.path()).unwrap();
@@ -412,7 +424,7 @@ mod tests {
         assert_eq!(db.list_job_runs(Some(id), 10).unwrap().len(), 1, "历史留痕");
     }
 
-    /// 未知 id：三条改动型命令都报 `schedule not found: {id}`（`error:` + 退出码 1）。
+    /// 未知 id：改动型命令与 `history` 都报 `schedule not found: {id}`（`error:` + 退出码 1）。
     #[test]
     fn unknown_ids_are_reported_in_the_cli_error_style() {
         let home = TempHome::new("missing");
@@ -425,9 +437,56 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             remove_at(home.path(), "nope").unwrap_err().to_string(),
+            // 历史：显式 id 既不命中 job 行也没有留痕时不能静默空表；limit=0 也不能被空结果带偏
+            history_at(home.path(), Some("nope"), 10)
+                .unwrap_err()
+                .to_string(),
+            history_at(home.path(), Some("nope"), 0)
+                .unwrap_err()
+                .to_string(),
         ] {
             assert_eq!(error, "schedule not found: nope");
         }
+    }
+
+    /// `history <id>` 的存在性判定是「job 行 **或** 运行留痕」：删掉的 job 历史照常可查，
+    /// 而两者都没有的拼错 id 得到与改动型命令同一句错误。
+    #[test]
+    fn history_rejects_unknown_ids_but_serves_removed_jobs() {
+        let home = TempHome::new("history-missing");
+        // 空库里查未知 id：报错，而不是一张与「还没跑过」无法区分的空表
+        assert_eq!(
+            history_at(home.path(), Some("nope"), 10)
+                .unwrap_err()
+                .to_string(),
+            "schedule not found: nope"
+        );
+
+        // 删掉的 job：`jobs` 行没了，但运行留痕还在 → 照常给表
+        let id = "019a1b2c-3d4e-7f00-8000-000000000001";
+        let db = db_at(home.path()).unwrap();
+        db.insert_job(&job(id, "disk-watch", "interval", "10m"))
+            .unwrap();
+        db.insert_job_run(&NewJobRun {
+            id: "run-1".into(),
+            job_id: id.into(),
+            task_id: None,
+            started_at: STARTED_AT,
+        })
+        .unwrap();
+        drop(db);
+
+        remove_at(home.path(), id).unwrap();
+        let out = history_at(home.path(), Some(id), 10).unwrap();
+        assert!(out.contains("run-1"), "{out}");
+        // limit=0：存在性探测不受「主查询本来就空」影响，给表头而不是 not found
+        assert_eq!(
+            history_at(home.path(), Some(id), 0)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
     }
 
     /// 历史表：倒序、`--limit` 生效、摘要/错误截断、未收尾的运行给 `-`，删掉任务后仍可查。

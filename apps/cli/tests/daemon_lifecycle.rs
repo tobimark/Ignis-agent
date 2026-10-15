@@ -46,6 +46,23 @@ impl Drop for StopDaemon {
     }
 }
 
+/// 坏 pidfile 用例的守卫：pidfile 还在（可能已被改坏）时先写回已知的守护进程 pid，再走正规
+/// `stop`——坏 pidfile 下 `stop` 认不出 pid（会报 BadPidfile），收尾不能把守护进程留成泄漏。
+struct RestoreThenStop {
+    home: PathBuf,
+    pid: i32,
+}
+
+impl Drop for RestoreThenStop {
+    fn drop(&mut self) {
+        // pidfile 已被正规 stop 清掉时什么都不做；还在（含被改坏）才写回真 pid 再停
+        if self.home.join("ignis.pid").exists() {
+            let _ = fs::write(self.home.join("ignis.pid"), format!("{}\n", self.pid));
+            let _ = stop(&self.home);
+        }
+    }
+}
+
 /// 跑一次 `ignis`：home 与工作区都钉在临时目录里，密钥走环境变量，stdin 是非 tty。
 fn ignis(home: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_ignis"))
@@ -209,4 +226,47 @@ fn daemon_status_without_pidfile_is_stopped() {
     );
     assert!(!home.join("ignis.pid").exists(), "status 不该创建 pidfile");
     assert_eq!(status(&home), DaemonStatus::Stopped);
+}
+
+/// pidfile 被改坏（锁仍被在跑的守护进程持有）时 `status` 必须报错：退出非 0、stderr 以
+/// `error: ` 开头——这是一条失败态，而不是悄悄说「没在跑」。收尾先把真 pid 写回 pidfile，
+/// 再走正规 `stop`，失败路径由守卫兜底，不留守护进程。
+#[test]
+fn daemon_status_with_a_corrupt_pidfile_fails() {
+    let dir = TempDir::new("bad-pidfile");
+    let home = dir.path().join("home");
+
+    let started = ignis(&home, &["daemon", "start"]);
+    // 基础守卫先进场（此时 pidfile 还是好的）：start 半途失败也不留守护进程
+    let _guard = StopDaemon(home.clone());
+    assert!(started.status.success(), "start 应成功：{}", text(&started));
+    let pid = started_pid(&started);
+    // 坏 pidfile 专用守卫：无论后面哪条断言炸了，收尾都会先写回 pid 再停止
+    let _restore_and_stop = RestoreThenStop {
+        home: home.clone(),
+        pid,
+    };
+
+    // 守护进程在跑、锁被它持有；把 pidfile 改成不是 pid 的内容
+    fs::write(home.join("ignis.pid"), "not-a-pid\n").unwrap();
+
+    let reported = ignis(&home, &["daemon", "status"]);
+    assert!(
+        !reported.status.success(),
+        "坏 pidfile 时 status 必须退出非 0：{}",
+        text(&reported)
+    );
+    let err = String::from_utf8_lossy(&reported.stderr);
+    assert!(
+        err.starts_with("error: "),
+        "错误应走 `error: {{人话}}`：{err}"
+    );
+    assert!(err.contains("pidfile"), "错误要点名 pidfile：{err}");
+
+    // 收尾：先把真 pid 写回（`stop` 靠它找到进程），再走正规 stop
+    fs::write(home.join("ignis.pid"), format!("{pid}\n")).unwrap();
+    let stopped = ignis(&home, &["daemon", "stop"]);
+    assert!(stopped.status.success(), "stop 应成功：{}", text(&stopped));
+    assert_eq!(status(&home), DaemonStatus::Stopped);
+    assert!(!home.join("ignis.pid").exists(), "pidfile 应被清掉");
 }

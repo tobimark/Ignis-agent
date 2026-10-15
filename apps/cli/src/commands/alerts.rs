@@ -2,7 +2,9 @@
 //!
 //! 默认只看未读；`--all` 连已读一起列；`--read` 先按选中的范围展示、再把**所有**未读翻成已读
 //! （`mark_alerts_read` 一把翻牌，不只翻这一屏），最后回一行翻牌条数。一条告警的来源形如
-//! `job:{id 前 8}` / `task:{id 前 8}`，两者都没有（CLI 交互里的 `notify_user`）就是 `cli`。
+//! `job:{完整 id}` / `task:{完整 id}`，两者都没有（CLI 交互里的 `notify_user`）就是 `cli`。
+//! 展示有 [`ALERT_LIMIT`] 行上限；`--read` 时未读超过上限会先说明还有多少条没显示，免得用户
+//! 只看到一屏却被翻掉整箱。
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -12,7 +14,7 @@ use ignis_core::config::{ensure_home, ignis_home};
 use ignis_storage::{AlertRecord, Db};
 
 use super::now_millis;
-use super::task::{format_time, id_prefix, one_line};
+use super::task::{format_time, one_line};
 use crate::cli::AlertsCommand;
 
 /// 一屏最多列出多少条（与 `task list` 的默认量级一致，避免长尾刷屏）。
@@ -33,6 +35,12 @@ fn show_at(home: &Path, all: bool, read: bool) -> Result<String> {
     let alerts = db.list_alerts(all, ALERT_LIMIT)?;
     let mut out = render_alerts(&alerts, all);
     if read {
+        // 翻牌不受展示上限约束（文档语义是「全标已读」）：未读超过一屏时先披露被截掉的条数，
+        // 用户才知道这一屏之外还翻掉了多少
+        let unread = db.unread_alert_count()?;
+        if unread > ALERT_LIMIT {
+            out.push_str(&format!("… and {} more\n", unread - ALERT_LIMIT));
+        }
         let marked = db.mark_alerts_read(now_millis())?;
         out.push_str(&format!("marked {marked} alerts as read\n"));
     }
@@ -67,12 +75,12 @@ fn empty_line(include_read: bool) -> &'static str {
     }
 }
 
-/// 来源列：`job:{前 8}` 优先，其次 `task:{前 8}`，两者都没有给 `cli`。
+/// 来源列：`job:{完整 id}` 优先，其次 `task:{完整 id}`，两者都没有给 `cli`。
 fn source_cell(alert: &AlertRecord) -> String {
     if let Some(job) = alert.source_job_id.as_deref() {
-        format!("job:{}", id_prefix(job))
+        format!("job:{job}")
     } else if let Some(task) = alert.source_task_id.as_deref() {
-        format!("task:{}", id_prefix(task))
+        format!("task:{task}")
     } else {
         "cli".to_string()
     }
@@ -179,11 +187,13 @@ mod tests {
         assert_eq!(lines.len(), 3, "{out}");
         assert_eq!(
             lines[0],
-            "2026-10-15T12:00:00Z  [critical]  磁盘满了 根分区 99%  (job:019a1b2c)"
+            "2026-10-15T12:00:00Z  [critical]  磁盘满了 根分区 99%  \
+             (job:019a1b2c-3d4e-7f00-8000-000000000001)"
         );
         assert_eq!(
             lines[1],
-            "2026-10-15T12:00:00Z  [warning]  任务失败：disk-watch  (task:019a1b2c)"
+            "2026-10-15T12:00:00Z  [warning]  任务失败：disk-watch  \
+             (task:019a1b2c-3d4e-7f00-8000-000000000002)"
         );
         assert_eq!(lines[2], "2026-10-15T12:00:00Z  [info]  构建完成  (cli)");
 
@@ -238,6 +248,45 @@ mod tests {
             show_at(home.path(), true, true)
                 .unwrap()
                 .ends_with("marked 0 alerts as read\n")
+        );
+    }
+
+    /// 未读超过一屏的 `--read`：先披露被截掉的条数（`… and {n} more`），翻牌照旧不受上限约束。
+    #[test]
+    fn read_discloses_alerts_hidden_beyond_the_display_cap() {
+        let home = TempHome::new("read-cap");
+        let db = Db::open(&home.path().join("ignis.db")).unwrap();
+        // 未读 = 上限 + 2：列表只能显示 20 行，但翻牌把 22 条全翻掉
+        for index in 0..(ALERT_LIMIT + 2) {
+            db.insert_alert(&alert(&format!("告警 {index}"), "warning", None, None))
+                .unwrap();
+        }
+        drop(db);
+
+        let out = show_at(home.path(), false, true).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        // 20 行 + 披露行 + `marked` 行；披露行在翻牌行之前
+        assert_eq!(lines.len(), ALERT_LIMIT + 2, "{out}");
+        assert_eq!(lines[ALERT_LIMIT], "… and 2 more", "{out}");
+        assert_eq!(
+            lines[ALERT_LIMIT + 1],
+            format!("marked {} alerts as read", ALERT_LIMIT + 2),
+            "{out}"
+        );
+
+        // 恰好等于上限：不虚报隐藏条数（20 行 + `marked` 行）
+        let db = Db::open(&home.path().join("ignis.db")).unwrap();
+        for index in 0..ALERT_LIMIT {
+            db.insert_alert(&alert(&format!("新告警 {index}"), "info", None, None))
+                .unwrap();
+        }
+        drop(db);
+        let out = show_at(home.path(), false, true).unwrap();
+        assert!(!out.contains("… and "), "{out}");
+        assert_eq!(out.lines().count(), ALERT_LIMIT + 1, "{out}");
+        assert!(
+            out.ends_with(&format!("marked {ALERT_LIMIT} alerts as read\n")),
+            "{out}"
         );
     }
 

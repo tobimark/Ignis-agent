@@ -379,7 +379,8 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 
 /// id 的展示前缀（8 字符；uuid 前 8 字符必然存在）。
 ///
-/// `schedule`/`alerts` 的名单复用同一口径：id 长的 uuid 只露前 8 位。
+/// 只有 `task list` 用：任务 id 仍是完整 uuid，列表里只露前 8 位求一眼能分；
+/// `schedule`/`alerts` 展示的是完整的 10 位短 id，不再截断。
 pub(crate) fn id_prefix(id: &str) -> String {
     id.chars().take(8).collect()
 }

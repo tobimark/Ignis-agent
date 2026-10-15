@@ -113,8 +113,8 @@ impl Tool for ScheduleCreate {
         validate_job(&profile, &self.deps.available_tools).map_err(scheduler_failure)?;
 
         let job = NewJob {
-            // 每建一个 job 都是一条新行：uuid v7 自带时间前缀，按 id 排序即创建顺序
-            id: uuid::Uuid::now_v7().to_string(),
+            // 每建一个 job 都是一条新行：10 位小写十六进制短 id（见 [`new_job_id`]）
+            id: new_job_id(),
             name: name.to_string(),
             prompt: prompt.to_string(),
             schedule_kind: kind.as_str().to_string(),
@@ -144,6 +144,19 @@ impl Tool for ScheduleCreate {
         ))
     }
 }
+
+/// 新 job 的 id：`Uuid::new_v4()` 的 simple（32 位小写十六进制）串取前 [`JOB_ID_CHARS`] 位。
+///
+/// 短 id 是给人用的：`schedule list` / `history` / `alerts` 直接展示整串，用户能把它原样粘回
+/// `pause` / `resume` / `remove` / `history`。不用 uuid v7 的前缀——它的前 8 个十六进制字符是
+/// 毫秒时间戳的高位（约每 65 秒才进位），相近时刻建的 job 会撞成同一个前缀。
+fn new_job_id() -> String {
+    // simple 形式固定 32 个字符，取前 10 位不会越界
+    uuid::Uuid::new_v4().simple().to_string()[..JOB_ID_CHARS].to_string()
+}
+
+/// job id 的字符数：16^10 ≈ 1.1e12 种取值（uuid v4 随机源），本地调度器足够用。
+const JOB_ID_CHARS: usize = 10;
 
 /// 自动判定调度类型：先按 interval 解析（`10m`、`2h`），失败再按 5 字段 cron（`0 9 * * 1-5`）；
 /// 两边都不认时报中文错误，点名表达式与两种可接受写法。
@@ -394,7 +407,7 @@ mod tests {
         );
         assert_eq!(rows[0].risk, "elevated");
 
-        // jobs 行：每 job 唯一 id（uuid v7）、活跃、native、工作区取 ctx.workspace
+        // jobs 行：每 job 一个 10 位短 id、活跃、native、工作区取 ctx.workspace
         let jobs = env.jobs();
         assert_eq!(jobs.len(), 1);
         let job = &jobs[0];
@@ -411,8 +424,13 @@ mod tests {
             "created_at = {} 不在 [{before}, {after}] 内",
             job.created_at
         );
-        let id = uuid::Uuid::parse_str(&job.id).expect("job id 应是 uuid");
-        assert_eq!(id.get_version_num(), 7);
+        // 不是完整 uuid、也不带 version 位：10 位小写十六进制（uuid v4 随机串的前缀）
+        assert_eq!(job.id.len(), 10, "job id = {}", job.id);
+        assert!(
+            job.id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+            "job id 应是 10 位小写十六进制：{}",
+            job.id
+        );
         assert_eq!(
             job.profile_json,
             r#"{"tools":["fs_read","fs_list","shell_run","notify_user"],"risk":"elevated"}"#
