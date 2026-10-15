@@ -12,6 +12,8 @@ rust-version = "1.98"
 ignis-core = { path = "packages/core" }
 ignis-runtime = { path = "packages/runtime" }
 ignis-storage = { path = "packages/storage" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "time", "sync", "io-util", "fs"] }
 tokio-util = "0.7"
 futures = "0.3"

@@ -1,7 +1,25 @@
-// 命令层（`ignis run` 与 REPL）在 Task 14 接入；本任务先落地可单测的渲染器与审批 UI。
-pub mod approval;
-pub mod render;
+//! `ignis` 可执行入口：解析参数、分发命令，把错误打成 `error: {人话}`。
 
-fn main() {
-    println!("ignis v{}", env!("CARGO_PKG_VERSION"));
+pub mod approval;
+pub mod cli;
+pub mod commands;
+pub mod render;
+pub mod repl;
+
+use std::process::ExitCode;
+
+use clap::Parser;
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let cli = cli::Cli::parse();
+
+    match cli::dispatch(&cli).await {
+        Ok(code) => code,
+        // anyhow 的 Display 只给人话；Debug（错误链/堆栈）不进终端
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
