@@ -112,9 +112,22 @@ fn home_from(get: impl Fn(&str) -> Option<String>) -> PathBuf {
         .join(DOT_IGNIS)
 }
 
+/// 配置文件路径：`{home}/{config.json}`。
+pub fn config_path(home: &Path) -> PathBuf {
+    home.join(CONFIG_FILE)
+}
+
 /// 加载配置：缺失文件（含 home 目录尚未创建）用默认值，随后应用环境变量覆盖。
 pub fn load_config(home: &Path) -> Result<Config, ConfigError> {
     load_config_with(home, |key| std::env::var(key).ok())
+}
+
+/// 只读配置文件（加默认值），**不**应用环境变量覆盖。
+///
+/// `ignis config set` 必须走这条路径：把生效值写回文件会把 `IGNIS_MODEL` 之类的环境变量
+/// 派生值持久化进 `config.json`。
+pub fn load_config_file(home: &Path) -> Result<Config, ConfigError> {
+    load_file(home)
 }
 
 /// 与 [`load_config`] 相同，但环境读取走 `get`，便于单测覆盖而不碰真实环境变量。
@@ -122,21 +135,24 @@ fn load_config_with(
     home: &Path,
     get: impl Fn(&str) -> Option<String>,
 ) -> Result<Config, ConfigError> {
-    let path = home.join(CONFIG_FILE);
-    let mut cfg = match fs::read_to_string(&path) {
-        Ok(raw) => {
-            serde_json::from_str(&raw).map_err(|source| ConfigError::Parse { path, source })?
-        }
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Config::default(),
-        Err(source) => return Err(ConfigError::Read { path, source }),
-    };
+    let mut cfg = load_file(home)?;
     apply_env_overrides(&mut cfg, get);
     Ok(cfg)
 }
 
+/// 默认值 + 文件（存在则解析）。
+fn load_file(home: &Path) -> Result<Config, ConfigError> {
+    let path = config_path(home);
+    match fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str(&raw).map_err(|source| ConfigError::Parse { path, source }),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(Config::default()),
+        Err(source) => Err(ConfigError::Read { path, source }),
+    }
+}
+
 /// 保存配置：home 目录按需创建，先写同目录临时文件再 rename，落到 0600。
 pub fn save_config(home: &Path, cfg: &Config) -> Result<(), ConfigError> {
-    let path = home.join(CONFIG_FILE);
+    let path = config_path(home);
     fs::create_dir_all(home).map_err(|source| ConfigError::Write {
         path: home.to_path_buf(),
         source,
@@ -446,6 +462,26 @@ mod tests {
         // 未设置 IGNIS_HOME → <home>/.ignis（HOME 缺失时才退回当前目录）
         assert!(home_from(no_env).ends_with(".ignis"));
         assert_eq!(ignis_home(), home_from(|key| std::env::var(key).ok()));
+    }
+
+    #[test]
+    fn load_config_file_ignores_env_overrides() {
+        let home = TempHome::new("file-only");
+        let raw = r#"{"model":{"model":"file-model"},"api_key":"file-key"}"#;
+        fs::write(home.config_path(), raw).unwrap();
+
+        // 文件加载器完全不看环境；同一份文件走分层加载时会被 `IGNIS_MODEL` 覆盖
+        let file_cfg = load_config_file(home.path()).unwrap();
+        let effective = load_config_with(home.path(), |key| {
+            (key == ENV_MODEL).then(|| "env-model".to_string())
+        })
+        .unwrap();
+
+        assert_eq!(file_cfg.model.model, "file-model");
+        assert_eq!(file_cfg.api_key.as_deref(), Some("file-key"));
+        assert_eq!(effective.model.model, "env-model");
+        // `config set` 只写文件加载器读到的值：覆盖不会被持久化
+        assert_eq!(fs::read_to_string(home.config_path()).unwrap(), raw);
     }
 
     #[test]

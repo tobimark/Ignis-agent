@@ -1,6 +1,10 @@
-//! 命令层：`run` 与 REPL 共用的会话装配（配置/存储/策略/内核/审批）与单次任务执行。
+//! 命令层：`run` 与 REPL 共用的会话装配（配置/存储/策略/内核/审批）与单次任务执行，
+//! 以及 `task`/`config`/`doctor` 三组辅助命令。
 
+pub mod config;
+pub mod doctor;
 pub mod run;
+pub mod task;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};

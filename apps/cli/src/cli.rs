@@ -35,7 +35,7 @@ pub struct Cli {
     #[arg(long = "unsafe", global = true)]
     pub unsafe_ops: bool,
 
-    /// 无子命令时进入 REPL（`task`/`config`/`doctor` 由后续任务接入）
+    /// 无子命令时进入 REPL
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -48,6 +48,48 @@ pub enum Command {
         /// 任务内容
         task: String,
     },
+    /// 查看任务记录
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
+    /// 查看或修改配置
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+    /// 环境自检（home/config/api_key/base_url/workspace/db）
+    Doctor,
+}
+
+/// `ignis task` 的子命令。
+#[derive(Debug, Subcommand)]
+pub enum TaskCommand {
+    /// 任务详情：头部、审批记录与事件流
+    Show {
+        /// 任务 id
+        id: String,
+    },
+    /// 最近的任务
+    List {
+        /// 最多列出多少条
+        #[arg(long, value_name = "N", default_value_t = 20)]
+        limit: usize,
+    },
+}
+
+/// `ignis config` 的子命令。
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// 打印生效配置（环境变量覆盖已应用，api_key 恒为 ***）
+    Show,
+    /// 写回配置文件里的一个标量项，如 `ignis config set model.model gpt-4o-mini`
+    Set {
+        /// 点路径（如 model.model、limits.max_steps、default_kernel）
+        key: String,
+        /// 新值
+        value: String,
+    },
 }
 
 /// 解析参数后分发：错误一律经 `anyhow::Result` 上抛给 `main`。
@@ -56,6 +98,9 @@ pub async fn dispatch(cli: &Cli) -> Result<ExitCode> {
 
     match &cli.command {
         Some(Command::Run { task }) => commands::run::run(cli, task).await,
+        Some(Command::Task { command }) => commands::task::run(command),
+        Some(Command::Config { command }) => commands::config::run(command),
+        Some(Command::Doctor) => commands::doctor::run(),
         // 无子命令 → REPL
         None => repl::run(cli).await,
     }
