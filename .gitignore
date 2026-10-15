@@ -1,0 +1,4 @@
+/target
+.commandcode/
+.agents/
+skills-lock.json
