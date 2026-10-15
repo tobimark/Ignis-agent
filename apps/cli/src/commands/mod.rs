@@ -1,17 +1,21 @@
 //! 命令层：`run` 与 REPL 共用的会话装配（配置/存储/策略/内核/审批）与单次任务执行，
-//! 以及 `task`/`config`/`memory`/`skills`/`doctor` 五组辅助命令。
+//! 以及 `task`/`config`/`memory`/`skills`/`doctor`/`daemon`/`schedule`/`alerts` 八组辅助命令。
 
+pub mod alerts;
 pub mod config;
+pub mod daemon;
 pub mod doctor;
 pub mod memory;
 pub mod run;
+pub mod schedule;
 pub mod skills;
 pub mod task;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
 use ignis_core::alerts::MultiNotifier;
@@ -34,6 +38,8 @@ use crate::render::{Renderer, format_task_end};
 
 /// 一次 CLI 会话的共享依赖：`run` 与 REPL 都从这里取运行器。
 pub struct Session {
+    /// 数据目录（`~/.ignis` 或 `IGNIS_HOME`）：自拉起要拿它探守护进程状态、拉起守护进程。
+    home: PathBuf,
     /// 本次任务的工作区（`--workspace`，否则配置里的 `workspace_root`）。
     workspace: PathBuf,
     runner: TaskRunner,
@@ -41,6 +47,23 @@ pub struct Session {
     /// 不重新开库、也不重新扫描技能目录。
     memory: Arc<MemoryStore>,
     skills: Arc<SkillCatalog>,
+    /// 本会话是否已经做过自拉起提示（每会话至多一次，REPL 跨轮次共享）。
+    already_prompted: AtomicBool,
+}
+
+/// 当前 epoch 毫秒（`alerts --read` 的翻牌时刻）。
+///
+/// 时钟早于 epoch（人工设置过系统时间）时退化成 0：翻牌仍要落库，不该因为时钟怪值失败。
+pub(crate) fn now_millis() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(elapsed) => i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
+        Err(_) => 0,
+    }
+}
+
+/// 当前 epoch 秒（`schedule list` 现算 next due 用，与守护进程同一单位）。
+pub(crate) fn now_secs() -> i64 {
+    now_millis().div_euclid(1_000)
 }
 
 /// 工作区解析与校验：`--workspace` 优先，否则配置里的 `workspace_root`；解析出的路径必须是已存在
@@ -107,7 +130,7 @@ impl Session {
 
         let config = Arc::new(config);
         // 记忆与技能目录都落在 `~/.ignis` 下：运行器在组装期把已知事实与技能目录注入系统提示，
-        // 也把 `remember`/`load_skill` 两个元工具挂进注册表
+        // 也把 `remember`/`load_skill`/`notify_user`/`schedule_create` 四个元工具挂进注册表
         let memory = MemoryStore::new(Arc::clone(&db), home.join("memory"));
         let skills = SkillCatalog::load(&home.join("skills"));
         let runner = TaskRunner::new(
@@ -127,10 +150,12 @@ impl Session {
         );
 
         Ok(Self {
+            home,
             workspace,
             runner,
             memory,
             skills,
+            already_prompted: AtomicBool::new(false),
         })
     }
 
@@ -157,8 +182,8 @@ impl Session {
 
     /// 跑一次任务：渲染任务消费 sink 边跑边输出，Ctrl-C 监听任务负责中止本次运行。
     ///
-    /// 结束后打印结束行并把结果交回调用方。渲染任务与监听任务都必须随本次运行结束，
-    /// 否则 REPL 会攒下一串永远不会触发的监听器。
+    /// 结束后打印结束行并把结果交回调用方；随后按本轮事件决定要不要提示自拉起守护进程。
+    /// 渲染任务与监听任务都必须随本次运行结束，否则 REPL 会攒下一串永远不会触发的监听器。
     pub async fn run_task(
         &self,
         prompt: String,
@@ -166,9 +191,12 @@ impl Session {
         kind: TaskKind,
     ) -> Result<TaskOutcome> {
         let (sink, mut events) = mpsc::unbounded_channel();
+        // 自拉起的判定看「本轮事件里出现过 schedule_create」：由渲染任务顺手记下
+        let saw_schedule_create = Arc::new(AtomicBool::new(false));
         let mut renderer = Renderer {
             out: Box::new(std::io::stdout()),
             color: std::io::stdout().is_terminal(),
+            saw_schedule_create: Arc::clone(&saw_schedule_create),
         };
         let renderer_task = tokio::spawn(async move {
             while let Some(event) = events.recv().await {
@@ -217,6 +245,13 @@ impl Session {
         {
             eprintln!("error: {error}");
         }
+        // 本轮建过调度任务、守护进程又没在跑时提示一次自拉起（每会话至多一次）
+        daemon::autostart(
+            &self.home,
+            saw_schedule_create.load(Ordering::Relaxed),
+            &self.already_prompted,
+        )
+        .await;
         Ok(outcome)
     }
 }

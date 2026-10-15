@@ -7,9 +7,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Result, bail};
-use clap::{Parser, Subcommand};
-use ignis_core::config::ignis_home;
-use ignis_gateway::daemon::{self, DaemonStatus, StartOutcome, StopOutcome};
+use clap::{Args, Parser, Subcommand};
 use ignis_runtime::RunStatus;
 
 use crate::{commands, repl};
@@ -77,6 +75,13 @@ pub enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    /// 调度任务（list / pause / resume / remove / history）
+    Schedule {
+        #[command(subcommand)]
+        command: ScheduleCommand,
+    },
+    /// 告警收件箱（默认只看未读）
+    Alerts(AlertsCommand),
 }
 
 /// `ignis task` 的子命令。
@@ -157,7 +162,8 @@ pub enum SkillsCommand {
 
 /// `ignis daemon` 的子命令。
 ///
-/// T5 只做最小接线（进程管理），输出打磨与创建后自拉起提示留给 T6。
+/// 进程生命周期由 `ignis-gateway` 负责（自守护、pidfile + flock、优雅退出）；命令层只管文案与
+/// 退出码，实现在 [`commands::daemon`]。
 #[derive(Debug, Subcommand)]
 pub enum DaemonCommand {
     /// 启动守护进程（后台自守护）
@@ -175,6 +181,47 @@ pub enum DaemonCommand {
     },
 }
 
+/// `ignis schedule` 的子命令。
+#[derive(Debug, Subcommand)]
+pub enum ScheduleCommand {
+    /// 列出调度任务（含暂停的），显示下次到期时刻
+    List,
+    /// 暂停一个调度任务（守护进程下一次扫描时生效）
+    Pause {
+        /// 任务 id（`schedule list` 的第一列）
+        id: String,
+    },
+    /// 恢复一个暂停的调度任务
+    Resume {
+        /// 任务 id
+        id: String,
+    },
+    /// 删除一个调度任务（运行历史保留，`schedule history` 仍可查）
+    Remove {
+        /// 任务 id
+        id: String,
+    },
+    /// 查看运行历史
+    History {
+        /// 任务 id；省略时看全部任务的历史
+        id: Option<String>,
+        /// 最多列出多少条
+        #[arg(long, value_name = "N", default_value_t = 20)]
+        limit: usize,
+    },
+}
+
+/// `ignis alerts` 的开关。
+#[derive(Debug, Args)]
+pub struct AlertsCommand {
+    /// 连已读告警一起列出
+    #[arg(long)]
+    pub all: bool,
+    /// 展示后把所有未读告警标记为已读
+    #[arg(long)]
+    pub read: bool,
+}
+
 /// 解析参数后分发：错误一律经 `anyhow::Result` 上抛给 `main`。
 pub async fn dispatch(cli: &Cli) -> Result<ExitCode> {
     ensure_kernel(&cli.kernel)?;
@@ -186,41 +233,12 @@ pub async fn dispatch(cli: &Cli) -> Result<ExitCode> {
         Some(Command::Memory { command }) => commands::memory::run(cli, command),
         Some(Command::Skills { command }) => commands::skills::run(command),
         Some(Command::Doctor) => commands::doctor::run(),
-        Some(Command::Daemon { command }) => run_daemon(command).await,
+        Some(Command::Daemon { command }) => commands::daemon::run(command).await,
+        Some(Command::Schedule { command }) => commands::schedule::run(command),
+        Some(Command::Alerts(command)) => commands::alerts::run(command),
         // 无子命令 → REPL
         None => repl::run(cli).await,
     }
-}
-
-/// `ignis daemon start|stop|status|run`：全部委托给 `ignis-gateway`，这一层只做文案与退出码。
-///
-/// `start` 由 gateway 自守护（`setsid` + re-exec `daemon run --foreground`）并等到 pidfile 就绪；
-/// `stop` 幂等（没在跑也是退出 0）；`run --foreground` 是隐藏入口，前台跑调度循环直到信号。
-async fn run_daemon(command: &DaemonCommand) -> Result<ExitCode> {
-    let home = ignis_home();
-    match command {
-        DaemonCommand::Start => match daemon::start(&home)? {
-            StartOutcome::Started { pid } => println!("daemon started (pid {pid})"),
-        },
-        DaemonCommand::Stop => match daemon::stop(&home)? {
-            StopOutcome::Stopped { pid } => println!("daemon stopped (pid {pid})"),
-            StopOutcome::NotRunning => println!("daemon is not running"),
-        },
-        DaemonCommand::Status => match daemon::status(&home) {
-            DaemonStatus::Running { pid } => println!("daemon running (pid {pid})"),
-            DaemonStatus::Stopped => println!("daemon is not running"),
-            // 进程死了没清 pidfile：下一次 start 会覆盖它
-            DaemonStatus::StalePidfile => println!("daemon is not running (stale pidfile)"),
-            // 锁被持有但 pid 读不出来（被改坏/写入未完成）：状态无法确认，不拿猜的 pid 冒充
-            // （T6 再统一文案；status 仍只读、退出 0）
-            DaemonStatus::BadPidfile { path } => println!(
-                "daemon state unknown (unreadable pidfile {}): check the file and retry",
-                path.display()
-            ),
-        },
-        DaemonCommand::Run { .. } => daemon::run_foreground(&home).await?,
-    }
-    Ok(ExitCode::SUCCESS)
 }
 
 /// 内核白名单：v0.1 只有 native，其余取值明确告知是 P4 的能力。

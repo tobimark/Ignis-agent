@@ -378,7 +378,9 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 /// id 的展示前缀（8 字符；uuid 前 8 字符必然存在）。
-fn id_prefix(id: &str) -> String {
+///
+/// `schedule`/`alerts` 的名单复用同一口径：id 长的 uuid 只露前 8 位。
+pub(crate) fn id_prefix(id: &str) -> String {
     id.chars().take(8).collect()
 }
 

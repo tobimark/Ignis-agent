@@ -1,9 +1,12 @@
 //! 流式渲染：把内核事件写成终端可读的输出。
 //!
 //! `out` 可注入（测试传可读回的缓冲区），`color` 由命令层按 `std::io::stdout().is_terminal()`
-//! 决定，模块内不做 tty 探测。
+//! 决定，模块内不做 tty 探测。`saw_schedule_create` 是「本轮出现过 `schedule_create`」的信号，
+//! 命令层在任务结束后读它决定要不要提示自拉起。
 
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use ignis_runtime::{RunStatus, RuntimeEvent, Usage};
@@ -18,12 +21,17 @@ const RESET: &str = "\x1b[0m";
 /// 工具失败输出最多展示的字符数。
 const ERROR_PREVIEW_CHARS: usize = 200;
 
+/// 建过调度任务的标志所认的元工具名：任务结束后据此决定要不要提示自拉起。
+const SCHEDULE_CREATE: &str = "schedule_create";
+
 /// 事件渲染器：文本增量原样输出，工具执行/失败各写一行。
 pub struct Renderer {
     /// 渲染目标：命令层给 stdout，测试给可读回的缓冲区。
     pub out: Box<dyn Write + Send>,
     /// 是否输出 ANSI 颜色。
     pub color: bool,
+    /// 本轮事件里是否出现过 `schedule_create`（命令层在任务结束后读它决定自拉起提示）。
+    pub saw_schedule_create: Arc<AtomicBool>,
 }
 
 impl Renderer {
@@ -36,7 +44,12 @@ impl Renderer {
             RuntimeEvent::TextDelta { text } => {
                 let _ = self.out.write_all(text.as_bytes());
             }
-            RuntimeEvent::ToolExec { summary, .. } => {
+            RuntimeEvent::ToolExec { name, summary, .. } => {
+                // 记「发起过」而不是「建成了」：工具可能被审批拒掉，但用户想建调度任务的意图
+                // 已经明确，任务结束后照样该提示一次守护进程没在跑
+                if name == SCHEDULE_CREATE {
+                    self.saw_schedule_create.store(true, Ordering::Relaxed);
+                }
                 let line = self.style(&format!("→ {summary}"), DIM);
                 let _ = writeln!(self.out, "{line}");
             }
@@ -152,12 +165,46 @@ mod tests {
         }
     }
 
+    /// 测试用渲染器：标志位可独立观察。
+    fn renderer_with(out: SharedBuf, color: bool, flag: &Arc<AtomicBool>) -> Renderer {
+        Renderer {
+            out: Box::new(out),
+            color,
+            saw_schedule_create: Arc::clone(flag),
+        }
+    }
+
+    #[test]
+    fn schedule_create_flips_the_autostart_flag() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let buf = SharedBuf::default();
+        let mut renderer = renderer_with(buf, false, &flag);
+
+        // 别的工具（含工具结果）都不该翻这个标志
+        renderer.on_event(&tool_exec("Reading a.txt"));
+        renderer.on_event(&RuntimeEvent::ToolResult {
+            name: "schedule_create".to_string(),
+            ok: true,
+            output: None,
+        });
+        assert!(!flag.load(Ordering::Relaxed), "只有 ToolExec 才算数");
+
+        renderer.on_event(&RuntimeEvent::ToolExec {
+            name: "schedule_create".to_string(),
+            summary: "Running schedule_create".to_string(),
+            args: json!({ "name": "disk-watch" }),
+        });
+        assert!(flag.load(Ordering::Relaxed), "schedule_create 必须翻标志");
+    }
+
     #[test]
     fn renderer_prints_tool_lines_and_text() {
         let buf = SharedBuf::default();
+        let flag = Arc::new(AtomicBool::new(false));
         let mut renderer = Renderer {
             out: Box::new(buf.clone()),
             color: false,
+            saw_schedule_create: Arc::clone(&flag),
         };
 
         renderer.on_event(&RuntimeEvent::TextDelta {
@@ -203,10 +250,7 @@ mod tests {
     #[test]
     fn color_wraps_tool_lines_in_ansi() {
         let buf = SharedBuf::default();
-        let mut renderer = Renderer {
-            out: Box::new(buf.clone()),
-            color: true,
-        };
+        let mut renderer = renderer_with(buf.clone(), true, &Arc::new(AtomicBool::new(false)));
 
         renderer.on_event(&tool_exec("Reading a.txt"));
         renderer.on_event(&RuntimeEvent::ToolResult {
@@ -228,10 +272,7 @@ mod tests {
         let long = "你".repeat(300);
         for output in [long.clone(), format!("{long}\n尾巴")] {
             let buf = SharedBuf::default();
-            let mut renderer = Renderer {
-                out: Box::new(buf.clone()),
-                color: false,
-            };
+            let mut renderer = renderer_with(buf.clone(), false, &Arc::new(AtomicBool::new(false)));
             renderer.on_event(&RuntimeEvent::ToolResult {
                 name: "shell_run".to_string(),
                 ok: false,
