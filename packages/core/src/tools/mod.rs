@@ -5,8 +5,11 @@
 
 mod fs;
 mod http;
+mod runtime;
 mod shell;
 pub mod util;
+
+pub use runtime::ToolRuntime;
 
 use std::path::Path;
 

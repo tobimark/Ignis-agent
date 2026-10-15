@@ -530,6 +530,7 @@ dependencies = [
  "async-trait",
  "dirs",
  "ignis-runtime",
+ "ignis-storage",
  "libc",
  "regex",
  "reqwest",

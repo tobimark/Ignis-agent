@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 ignis-runtime = { workspace = true }
+ignis-storage = { workspace = true }
 dirs = { workspace = true }
 libc = { workspace = true }
 regex = { workspace = true }
@@ -16,3 +17,7 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 reqwest = { workspace = true }
+
+[dev-dependencies]
+# 测试用 `ignis_runtime::test_support`（ScriptedApproval）需要该 feature
+ignis-runtime = { workspace = true, features = ["test-support"] }
