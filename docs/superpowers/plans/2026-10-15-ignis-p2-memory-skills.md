@@ -14,7 +14,7 @@
 
 继承 P1 全部约束（edition 2024；依赖方向 `core → {runtime, storage}`；提交 Conventional Commits 中文 body + `Co-authored-by: CommandCodeBot <noreply@commandcode.ai>` 尾注；收口三连 `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`）。P2 新增：
 
-- **零新依赖**（本机离线）。内置技能 = `const BUILTIN_SKILLS: &[(&str, &str)]`，用 `include_str!("../../../skills/<name>/SKILL.md")`（**内容文件必须随代码同任务先行落盘，否则编译失败**）。
+- **零新依赖**（本机离线）。内置技能 = `const BUILTIN_SKILLS: &[(&str, &str)]`，用 `include_str!("../../../../skills/<name>/SKILL.md")`（**内容文件必须随代码同任务先行落盘，否则编译失败**）。
 - **事实模型（锁死，迁移 002）**：`facts(id INTEGER PK AUTOINCREMENT, scope TEXT[user|project|global], workspace TEXT NULL, key TEXT NOT NULL, text TEXT NOT NULL, status TEXT[active|superseded], superseded_by INTEGER NULL, source_task_id TEXT NULL, created_at INTEGER, updated_at INTEGER)`；`scope=project` 必须带 `workspace`（工作区绝对路径字符串）。FTS：`CREATE VIRTUAL TABLE facts_fts USING fts5(text, content='facts', content_rowid='id', tokenize='trigram')` + ai/ad/au 三触发器同步 + 索引 `(scope, workspace, status)`。
 - **supersede 规则（锁死）**：同 `(scope, workspace, key)` 写新值 → 旧 active 行 `status='superseded'、superseded_by=新 id`；检索/注入/镜像只取 `active`。
 - **注入规则（锁死 = spec 决策 #21）**：当前工作区的 active `project` 事实**无条件注入**；`user`/`global` 按 FTS 检索（查询 = 任务 prompt；`chars().count() < 3` 时跳过 FTS 仅保留 project 段）取 bm25+新近度前 6 条。段标题英文 `Known facts:`；预算：project 段 ≤2000 字符、检索段 ≤2000 字符（截断附 `… [facts truncated]`）。
