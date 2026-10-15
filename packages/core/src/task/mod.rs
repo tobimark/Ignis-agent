@@ -28,7 +28,9 @@ use crate::config::Config;
 use crate::memory::MemoryStore;
 use crate::security::{Policy, Redactor};
 use crate::skills::SkillCatalog;
-use crate::tools::{ToolRuntime, default_registry, meta_tools};
+use crate::tools::{
+    SchedulerDeps, ToolRuntime, available_tool_names, default_registry, meta_tools,
+};
 
 /// 任务来源：`ignis run` 的一次性运行，或 REPL 的一轮输入。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,8 +236,8 @@ impl TaskRunner {
             }
         };
 
-        // 注册表 = 内置工具 + 元工具（remember 写记忆、load_skill 取技能正文、notify_user 升告警）；
-        // 顺序即模型看到的工具表顺序，元工具排在末尾
+        // 注册表 = 内置工具 + 元工具（remember 写记忆、load_skill 取技能正文、notify_user 升告警、
+        // schedule_create 建调度任务）；顺序即模型看到的工具表顺序，元工具排在末尾
         let mut registry = default_registry();
         // 告警出口：告警行落库（CLI 未读收件箱即渠道①），投递走构造期注入的渠道组合——
         // 真实渠道由 T5 的 gateway 注入，这一层只管把渠道接上
@@ -243,7 +245,18 @@ impl TaskRunner {
             Arc::clone(&self.db),
             Arc::clone(&self.notifier),
         ));
-        for tool in meta_tools(Arc::clone(&self.memory), Arc::clone(&self.skills), alerts) {
+        // 调度任务创建：可用工具名清单与守护进程共用一份口径，默认工作区取配置里的根
+        let scheduler = SchedulerDeps {
+            db: Arc::clone(&self.db),
+            available_tools: available_tool_names(),
+            default_workspace: self.config.workspace_root.clone(),
+        };
+        for tool in meta_tools(
+            Arc::clone(&self.memory),
+            Arc::clone(&self.skills),
+            alerts,
+            scheduler,
+        ) {
             registry.register(tool);
         }
         let executor = Arc::new(ToolRuntime::new(

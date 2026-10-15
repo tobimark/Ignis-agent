@@ -155,6 +155,12 @@ impl ToolRuntime {
             output: Some(self.redactor.redact(&text.into())),
         }
     }
+
+    /// 本次调用的风险分类。profile 拒绝留痕（[`crate::tools::ProfileExecutor`]）要记真实等级，
+    /// 而不是编一个；分类口径与闸门用的是同一份。
+    pub(crate) fn classify_call(&self, call: &ToolCall) -> RiskLevel {
+        classify(call, &self.workspace)
+    }
 }
 
 #[async_trait]
@@ -197,9 +203,16 @@ impl ToolExecutor for ToolRuntime {
     }
 }
 
-/// 风险分类：元工具恒定 `Safe`，敏感路径优先于工具本身，命令再看危险命令库。
+/// 风险分类：元工具里 `schedule_create` 恒定 `Elevated`、其余恒定 `Safe`，敏感路径优先于工具
+/// 本身，命令再看危险命令库。
 fn classify(call: &ToolCall, workspace: &Path) -> RiskLevel {
-    // 元工具只写 agent 自有状态（记忆事实、技能目录、告警收件箱，用户可经 CLI 改删），也不
+    // `schedule_create` 写的是「以后自动干什么」：创建时必须显式确认（交互 Ask / `--yes` 预授权 /
+    // 无人值守拒绝），因此恒定 Elevated；判定放在敏感路径与回退臂之前——元工具不解析路径，参数里
+    // 混进 `path` 之类也不该升级成 Dangerous。
+    if call.name == "schedule_create" {
+        return RiskLevel::Elevated;
+    }
+    // 其余元工具只写 agent 自有状态（记忆事实、技能目录、告警收件箱，用户可经 CLI 改删），也不
     // 解析任何路径：恒定 Safe，且判定放在最前面——参数里混进 `path` 之类也不该改分类。
     if matches!(
         call.name.as_str(),
@@ -265,8 +278,9 @@ fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
-/// `RiskLevel` 的 serde 小写名，与 `approvals.risk` 的取值契约一致。
-fn risk_name(risk: RiskLevel) -> &'static str {
+/// `RiskLevel` 的 serde 小写名，与 `approvals.risk` 的取值契约一致；profile 拒绝留痕
+/// （[`crate::tools::ProfileExecutor`]）共用同一份映射。
+pub(crate) fn risk_name(risk: RiskLevel) -> &'static str {
     match risk {
         RiskLevel::Safe => "safe",
         RiskLevel::Elevated => "elevated",
@@ -283,8 +297,9 @@ fn mode_name(mode: ApprovalMode) -> &'static str {
     }
 }
 
-/// epoch 毫秒；时钟早于 epoch（人工设置过系统时间）时退化成 0，保证记录仍能写入。
-fn now_millis() -> i64 {
+/// epoch 毫秒；时钟早于 epoch（人工设置过系统时间）时退化成 0，保证记录仍能写入。profile 拒绝
+/// 留痕（[`crate::tools::ProfileExecutor`]）共用同一份时间口径。
+pub(crate) fn now_millis() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(elapsed) => i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
         Err(_) => 0,
@@ -796,6 +811,36 @@ mod tests {
                 classify(&call(name, args), workspace),
                 RiskLevel::Safe,
                 "{name}"
+            );
+        }
+    }
+
+    /// `schedule_create` 恒定 `Elevated`：判定放在敏感路径检查与回退臂之前——元工具不解析路径，
+    /// 参数里混进 `path` 也不会升级成 Dangerous（回退臂同样兜不住它，只是恰好同值）。
+    #[test]
+    fn schedule_create_classifies_as_elevated() {
+        let call = |args: Value| ToolCall {
+            id: "c1".into(),
+            name: "schedule_create".into(),
+            args,
+        };
+        let workspace = Path::new("/home/dev/app");
+
+        for args in [
+            json!({"name": "disk-watch", "prompt": "检查磁盘", "schedule": "10m"}),
+            json!({"name": "standup", "prompt": "总结提交", "schedule": "0 9 * * 1-5"}),
+            json!({
+                "name": "reader",
+                "prompt": "只读地看一眼",
+                "schedule": "10m",
+                "tools": ["fs_read"],
+                "path": ".env",
+            }),
+        ] {
+            assert_eq!(
+                classify(&call(args.clone()), workspace),
+                RiskLevel::Elevated,
+                "{args}"
             );
         }
     }

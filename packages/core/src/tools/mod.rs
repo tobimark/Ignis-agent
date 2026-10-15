@@ -2,17 +2,24 @@
 //!
 //! 每个工具自行解析参数，路径一律先经 [`crate::security::resolve_in_workspace`] 落到工作区内；
 //! 失败返回 [`ToolError`]（消息原样作为工具结果回填给模型），成功返回纯文本输出。
+//!
+//! 调度任务对模型开放的工具集比一轮交互任务小：job 的 profile 白名单由
+//! [`ProfileExecutor`] 兜底（白名单外既看不见也调不动）。
 
 mod fs;
 mod http;
 mod meta;
 mod notify;
+mod profile;
 mod runtime;
+mod schedule;
 mod shell;
 pub mod util;
 
 pub use meta::meta_tools;
+pub use profile::ProfileExecutor;
 pub use runtime::ToolRuntime;
+pub use schedule::SchedulerDeps;
 
 use std::path::Path;
 
@@ -90,6 +97,26 @@ pub fn default_registry() -> Registry {
     registry
 }
 
+/// 元工具名（顺序即注册顺序）：[`meta_tools`] 挂进注册表的就是这几个。
+///
+/// [`available_tool_names`] 与 `meta_tools` 的实际装配共用这一份清单；`meta` 模块的用例逐字对齐
+/// 两者，改了名字却忘了改清单会当场失败。
+pub const META_TOOL_NAMES: [&str; 4] = ["remember", "load_skill", "notify_user", "schedule_create"];
+
+/// 一轮任务可用的工具名全集（内置工具 + 元工具，顺序即注册顺序）。
+///
+/// `schedule_create` 用它校验 job profile 的白名单（见 [`SchedulerDeps::available_tools`]）：
+/// 能建出来的 job 一定引用得了真实工具。CLI 与 T5 的守护进程构造 [`SchedulerDeps`] 时取同一份
+/// 清单，校验口径因此只有一处。
+pub fn available_tool_names() -> Vec<String> {
+    default_registry()
+        .specs()
+        .into_iter()
+        .map(|spec| spec.name)
+        .chain(META_TOOL_NAMES.iter().map(|name| (*name).to_owned()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +160,26 @@ mod tests {
             );
         }
         assert!(registry.get("fs_missing").is_none());
+    }
+
+    /// 可用工具名清单 = 内置工具 + 元工具，顺序与注册顺序一致（`schedule_create` 的白名单校验
+    /// 与守护进程的装配共用它）。
+    #[test]
+    fn available_tool_names_cover_the_builtins_and_the_meta_tools() {
+        let names = available_tool_names();
+        let builtins: Vec<String> = default_registry()
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect();
+        assert!(
+            names.starts_with(&builtins),
+            "内置工具必须原样排在前面：{names:?}"
+        );
+        assert_eq!(
+            &names[builtins.len()..],
+            META_TOOL_NAMES.map(str::to_string),
+            "{names:?}"
+        );
     }
 }

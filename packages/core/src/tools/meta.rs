@@ -1,9 +1,12 @@
-//! 元工具：`remember`（写入一条长期记忆）、`load_skill`（读取一个技能的 SKILL.md 全文）与
-//! `notify_user`（升一条告警，见 [`crate::alerts`]）。
+//! 元工具：`remember`（写入一条长期记忆）、`load_skill`（读取一个技能的 SKILL.md 全文）、
+//! `notify_user`（升一条告警，见 [`crate::alerts`]）与 `schedule_create`（建一条调度任务，
+//! 见 [`crate::tools::SchedulerDeps`]）。
 //!
-//! 三者都只写 agent 自有状态（记忆事实、技能目录、告警收件箱，用户可经 CLI 改删），因此
-//! [`crate::tools::ToolRuntime`] 一律按 `Safe` 分类：不弹审批、不落审批行。参数一律先解析成
-//! 中文可读的错误再回填给模型（缺参、非法 scope、空 key/text、未知技能、非法告警级别）。
+//! 前三个只写 agent 自有状态（记忆事实、技能目录、告警收件箱，用户可经 CLI 改删），因此
+//! [`crate::tools::ToolRuntime`] 一律按 `Safe` 分类：不弹审批、不落审批行；`schedule_create`
+//! 决定了「以后自动干什么」，分类为 `Elevated`（交互确认、`--yes` 预授权、无人值守拒绝）。
+//! 参数一律先解析成中文可读的错误再回填给模型（缺参、非法 scope、空 key/text、未知技能、非法
+//! 告警级别、解析不了的调度表达式、不可用的工具名）。
 
 use std::sync::Arc;
 
@@ -12,23 +15,26 @@ use ignis_runtime::ToolSpec;
 use serde_json::{Value, json};
 
 use super::notify::NotifyUser;
+use super::schedule::{ScheduleCreate, SchedulerDeps};
 use super::util::{required_str, truncate_output};
 use super::{Tool, ToolCtx, ToolError};
 use crate::alerts::AlertSink;
 use crate::memory::{FactScope, MemoryError, MemoryStore, remembered_notice};
 use crate::skills::SkillCatalog;
 
-/// v0.1 元工具：`remember`、`load_skill` 与 `notify_user`；返回顺序即注册顺序，也就是模型看到的
-/// 工具表顺序。
+/// v0.1 元工具：`remember`、`load_skill`、`notify_user` 与 `schedule_create`；返回顺序即注册
+/// 顺序，也就是模型看到的工具表顺序。
 pub fn meta_tools(
     memory: Arc<MemoryStore>,
     skills: Arc<SkillCatalog>,
     alerts: Arc<AlertSink>,
+    scheduler: SchedulerDeps,
 ) -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(Remember { memory }),
         Box::new(LoadSkill { skills }),
         Box::new(NotifyUser::new(alerts)),
+        Box::new(ScheduleCreate::new(scheduler)),
     ]
 }
 
@@ -183,7 +189,9 @@ mod tests {
     use crate::memory::{MAX_FACT_TEXT_CHARS, MemoryStore};
     use crate::security::{ApprovalMode, Policy, Redactor};
     use crate::skills::SkillCatalog;
-    use crate::tools::{ToolRuntime, default_registry};
+    use crate::tools::{
+        META_TOOL_NAMES, SchedulerDeps, ToolRuntime, available_tool_names, default_registry,
+    };
 
     /// 本次任务的 id：审批记录按它归属。
     const TASK_ID: &str = "01J9Z6Q3T7R8S9V0W1X2Y3Z4AB";
@@ -269,7 +277,12 @@ mod tests {
             let channel: Arc<dyn Notifier> = notifier.clone();
             let alerts = Arc::new(AlertSink::new(Arc::clone(&db), channel));
             let mut registry = default_registry();
-            for tool in meta_tools(memory, skills, alerts) {
+            let scheduler = SchedulerDeps {
+                db: Arc::clone(&db),
+                available_tools: available_tool_names(),
+                default_workspace: dir.path().to_path_buf(),
+            };
+            for tool in meta_tools(memory, skills, alerts, scheduler) {
                 registry.register(tool);
             }
             let approval = ScriptedApproval::new(Vec::new());
@@ -327,6 +340,31 @@ mod tests {
         fn mirror(&self, file: &str) -> String {
             fs::read_to_string(self.mirror_dir().join(file)).unwrap()
         }
+    }
+
+    /// 元工具清单与实际注册顺序逐字一致：`available_tool_names`（`schedule_create` 的白名单校验
+    /// 与守护进程装配共用它）不得与真实注册表漂移。
+    #[test]
+    fn meta_tools_register_the_declared_names_in_order() {
+        let dir = TempDir::new();
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let memory = MemoryStore::new(Arc::clone(&db), dir.path().join("memory"));
+        let skills = SkillCatalog::load(&dir.path().join("skills"));
+        let notifier = Arc::new(RecordingNotifier::new());
+        let channel: Arc<dyn Notifier> = notifier.clone();
+        let alerts = Arc::new(AlertSink::new(Arc::clone(&db), channel));
+        let scheduler = SchedulerDeps {
+            db: Arc::clone(&db),
+            available_tools: available_tool_names(),
+            default_workspace: dir.path().to_path_buf(),
+        };
+
+        let names: Vec<String> = meta_tools(memory, skills, alerts, scheduler)
+            .iter()
+            .map(|tool| tool.spec().name)
+            .collect();
+
+        assert_eq!(names, META_TOOL_NAMES);
     }
 
     #[tokio::test]
