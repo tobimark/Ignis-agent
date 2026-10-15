@@ -191,8 +191,13 @@ impl ToolExecutor for ToolRuntime {
     }
 }
 
-/// 风险分类：敏感路径优先于工具本身，命令再看危险命令库。
+/// 风险分类：元工具恒定 `Safe`，敏感路径优先于工具本身，命令再看危险命令库。
 fn classify(call: &ToolCall, workspace: &Path) -> RiskLevel {
+    // 元工具只写 agent 自有状态（记忆事实、技能目录，用户可经 CLI 改删），也不解析任何路径：
+    // 恒定 Safe，且判定放在最前面——参数里混进 `path` 之类也不该改分类。
+    if matches!(call.name.as_str(), "remember" | "load_skill") {
+        return RiskLevel::Safe;
+    }
     // 任意工具的路径参数指向敏感文件 → 危险：读 `.env`、写 `id_rsa` 都要显式授权
     let sensitive = call
         .args
@@ -739,6 +744,40 @@ mod tests {
         );
         assert!(!env.path_of("b.txt").exists());
         assert_eq!(env.approvals().len(), 6);
+    }
+
+    #[test]
+    fn meta_tools_classify_as_safe() {
+        let call = |name: &str, args: Value| ToolCall {
+            id: "c1".into(),
+            name: name.into(),
+            args,
+        };
+        let workspace = Path::new("/home/dev/app");
+
+        // remember/load_skill 只写 agent 自有状态（记忆事实与技能目录，CLI 可改可删）→ 恒 Safe；
+        // 判定放在敏感路径与回退臂之前：参数里混进 `path` 也不改分类（元工具不解析路径）
+        for (name, args) in [
+            (
+                "remember",
+                json!({"scope": "user", "key": "k", "text": "值"}),
+            ),
+            (
+                "remember",
+                json!({"scope": "project", "key": "k", "text": "值", "path": ".env"}),
+            ),
+            ("load_skill", json!({"name": "server-health"})),
+            (
+                "load_skill",
+                json!({"name": "server-health", "path": "id_rsa"}),
+            ),
+        ] {
+            assert_eq!(
+                classify(&call(name, args), workspace),
+                RiskLevel::Safe,
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test]

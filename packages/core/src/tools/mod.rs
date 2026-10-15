@@ -5,10 +5,12 @@
 
 mod fs;
 mod http;
+mod meta;
 mod runtime;
 mod shell;
 pub mod util;
 
+pub use meta::meta_tools;
 pub use runtime::ToolRuntime;
 
 use std::path::Path;
@@ -50,7 +52,8 @@ pub struct Registry {
 }
 
 impl Registry {
-    fn register(&mut self, tool: Box<dyn Tool>) {
+    /// 注册一个工具：后注册的排在工具表末尾。
+    pub fn register(&mut self, tool: Box<dyn Tool>) {
         self.tools.push(tool);
     }
 

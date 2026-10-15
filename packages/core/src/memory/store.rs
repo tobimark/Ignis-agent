@@ -72,6 +72,23 @@ impl MemoryStore {
         Ok(record)
     }
 
+    /// 查某个 `(scope, workspace, key)` 位置上的 `active` 事实；没有就回 `None`。
+    ///
+    /// 给元工具 `remember` 用：写入前先看这个位置有没有旧值，写完对比 id 就知道这次是不是真的
+    /// supersede 了一条旧事实。`key` 与 [`MemoryStore::remember`] 同口径裁掉首尾空白，工作区校验
+    /// 也同一套（`project` 必须带、其它范围必须不带）。
+    pub fn recall_by_key(
+        &self,
+        scope: FactScope,
+        workspace: Option<&Path>,
+        key: &str,
+    ) -> Result<Option<FactRecord>, MemoryError> {
+        let workspace = workspace_string(scope, workspace)?;
+        Ok(self
+            .db
+            .active_fact_by_key(scope.as_str(), workspace.as_deref(), key.trim())?)
+    }
+
     /// 任务上下文要注入的事实：本工作区的 active `project` 事实（无条件、新近在前）+ 按 prompt
     /// 检索到的 `user`/`global` 事实（最多 6 条、新近在前）。
     ///
@@ -451,6 +468,67 @@ mod tests {
         );
         // 别的 key 不凭空多出 active 行
         assert_eq!(active_row_count(&env, "project", Some("/w/a"), "editor"), 0);
+    }
+
+    #[test]
+    fn recall_by_key_reads_the_active_row_at_the_exact_position() {
+        let env = Env::new("recall-by-key");
+        env.store
+            .remember(FactScope::User, None, "pkg_manager", "使用 pip", None)
+            .unwrap();
+        let latest = env
+            .store
+            .remember(FactScope::User, None, "pkg_manager", "使用 uv", None)
+            .unwrap();
+
+        // 只回 active 行；key 的前后空白按写入路径同样的口径裁掉
+        assert_eq!(
+            env.store
+                .recall_by_key(FactScope::User, None, "  pkg_manager  ")
+                .unwrap(),
+            Some(latest)
+        );
+        assert_eq!(
+            env.store
+                .recall_by_key(FactScope::User, None, "editor")
+                .unwrap(),
+            None
+        );
+        // 位置算错就查不到：换个 scope 或换个工作区都不算同一条
+        assert_eq!(
+            env.store
+                .recall_by_key(FactScope::Global, None, "pkg_manager")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            env.store
+                .recall_by_key(FactScope::Project, Some(Path::new("/w/a")), "pkg_manager")
+                .unwrap(),
+            None
+        );
+        // project 位置必须带工作区（与 `remember` 同一套校验）
+        assert!(matches!(
+            env.store
+                .recall_by_key(FactScope::Project, None, "pkg_manager"),
+            Err(MemoryError::MissingWorkspace)
+        ));
+
+        env.store
+            .remember(
+                FactScope::Project,
+                Some(Path::new("/w/a")),
+                "pkg_manager",
+                "A 用 uv",
+                None,
+            )
+            .unwrap();
+        assert!(
+            env.store
+                .recall_by_key(FactScope::Project, Some(Path::new("/w/a")), "pkg_manager")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
