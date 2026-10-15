@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use ignis_runtime::ToolSpec;
 use serde_json::{Value, json};
 
-use super::util::truncate_output;
+use super::util::{optional_str, required_str, truncate_output};
 use super::{Tool, ToolCtx, ToolError};
 use crate::security::{SecurityError, resolve_in_workspace};
 
@@ -271,22 +271,6 @@ fn line_range(
     // 给提示预留配额，保证正文被截断时提示仍然出现
     let budget = output_limit.saturating_sub(footer.len());
     Ok(format!("{}{footer}", truncate_output(&body, budget)))
-}
-
-/// 取必填字符串参数；缺失或类型不对都给出可操作的错误。
-fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, ToolError> {
-    optional_str(args, key)?
-        .ok_or_else(|| ToolError::message(format!("缺少必需的参数 `{key}`（字符串）")))
-}
-
-fn optional_str<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, ToolError> {
-    match args.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(value) => value
-            .as_str()
-            .map(Some)
-            .ok_or_else(|| ToolError::message(format!("参数 `{key}` 必须是字符串"))),
-    }
 }
 
 fn optional_usize(args: &Value, key: &str) -> Result<Option<usize>, ToolError> {

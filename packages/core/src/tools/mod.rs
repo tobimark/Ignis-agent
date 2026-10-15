@@ -1,9 +1,10 @@
-//! 工具层：`Tool` 契约、注册表与内置工具（文件工具、shell）。
+//! 工具层：`Tool` 契约、注册表与内置工具（文件工具、shell、HTTP）。
 //!
 //! 每个工具自行解析参数，路径一律先经 [`crate::security::resolve_in_workspace`] 落到工作区内；
 //! 失败返回 [`ToolError`]（消息原样作为工具结果回填给模型），成功返回纯文本输出。
 
 mod fs;
+mod http;
 mod shell;
 pub mod util;
 
@@ -64,7 +65,7 @@ impl Registry {
     }
 }
 
-/// v0.1 内置工具集：四个文件工具 + `shell_run`（`http_fetch` 由后续任务注册）。
+/// v0.1 内置工具集：四个文件工具 + `shell_run` + `http_fetch`。
 pub fn default_registry() -> Registry {
     let mut registry = Registry::default();
     registry.register(Box::new(fs::FsRead));
@@ -72,6 +73,7 @@ pub fn default_registry() -> Registry {
     registry.register(Box::new(fs::FsWrite));
     registry.register(Box::new(fs::FsEdit));
     registry.register(Box::new(shell::ShellRun));
+    registry.register(Box::new(http::HttpFetch::new()));
     registry
 }
 
@@ -86,19 +88,27 @@ mod tests {
         let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
         assert_eq!(
             names,
-            ["fs_read", "fs_list", "fs_write", "fs_edit", "shell_run"]
+            [
+                "fs_read",
+                "fs_list",
+                "fs_write",
+                "fs_edit",
+                "shell_run",
+                "http_fetch"
+            ]
         );
 
         for spec in &specs {
             assert!(!spec.description.is_empty(), "{}", spec.name);
             assert_eq!(spec.parameters["type"], "object", "{}", spec.name);
         }
-        // 参数契约：文件工具除 fs_list 外都必须给 path，shell_run 必须给 command
+        // 参数契约：文件工具除 fs_list 外都必须给 path，shell_run 必须给 command，http_fetch 必须给 url
         for (name, required) in [
             ("fs_read", "path"),
             ("fs_write", "path"),
             ("fs_edit", "path"),
             ("shell_run", "command"),
+            ("http_fetch", "url"),
         ] {
             let parameters = &registry.get(name).unwrap().spec().parameters;
             assert!(

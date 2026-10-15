@@ -1,4 +1,8 @@
-//! 工具输出辅助。
+//! 工具输出与参数辅助。
+
+use serde_json::Value;
+
+use super::ToolError;
 
 /// 把输出截到 `limit` 字节以内；截断点回退到字符边界（不切坏 UTF-8），并追加尾部标记
 /// `\n… [truncated: output exceeded {limit} bytes]`，其余情况下原样返回。
@@ -14,6 +18,23 @@ pub fn truncate_output(s: &str, limit: usize) -> String {
     output.push_str(&s[..end]);
     output.push_str(&format!("\n… [truncated: output exceeded {limit} bytes]"));
     output
+}
+
+/// 取必填字符串参数；缺失或类型不对都给出可操作的错误。
+pub(crate) fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, ToolError> {
+    optional_str(args, key)?
+        .ok_or_else(|| ToolError::message(format!("缺少必需的参数 `{key}`（字符串）")))
+}
+
+/// 取可选字符串参数；字段缺失与显式 `null` 等价，类型不对报错。
+pub(crate) fn optional_str<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, ToolError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| ToolError::message(format!("参数 `{key}` 必须是字符串"))),
+    }
 }
 
 #[cfg(test)]

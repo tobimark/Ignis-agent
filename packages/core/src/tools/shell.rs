@@ -19,7 +19,7 @@ use regex::Regex;
 use serde_json::{Value, json};
 use tokio::process::Command;
 
-use super::util::truncate_output;
+use super::util::{optional_str, required_str, truncate_output};
 use super::{Tool, ToolCtx, ToolError};
 use crate::security::{SecurityError, resolve_in_workspace};
 
@@ -189,22 +189,6 @@ fn resolve_cwd(ctx: &ToolCtx<'_>, cwd: Option<&str>) -> Result<PathBuf, ToolErro
             ToolError::message(format!("cwd {user_path}：{other}"))
         }
     })
-}
-
-/// 取必填字符串参数；缺失或类型不对都给出可操作的错误。
-fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, ToolError> {
-    optional_str(args, key)?
-        .ok_or_else(|| ToolError::message(format!("缺少必需的参数 `{key}`（字符串）")))
-}
-
-fn optional_str<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, ToolError> {
-    match args.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(value) => value
-            .as_str()
-            .map(Some)
-            .ok_or_else(|| ToolError::message(format!("参数 `{key}` 必须是字符串"))),
-    }
 }
 
 #[cfg(test)]
