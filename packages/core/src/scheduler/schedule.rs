@@ -4,8 +4,13 @@
 //! 每个字段是 `*`、单值、`a-b` 区间、`a,b,c` 列表或 `*/N` 步长（`a/N`、`a-b/N` 同样接受）。
 //! 区间必须递增且落在界内：分 0-59、时 0-23、日 1-31、月 1-12、周 0-6（周日 = 0）。
 //!
-//! 日匹配沿用 Vixie cron 的规则：`日` 与 `周` **都不是**字面 `*` 时按「或」（任一命中即命中），
-//! 否则两边都要命中——`0 0 1 * 1` 因此是「每月 1 日或每周一」。
+//! 日匹配按**本实现钉死的字面口径**：`日`、`周` 两个字段里，只要有任意一个不是字面 `*`（写成
+//! 单值、区间、列表或步长形式都算「受限」）就按「或」（任一命中即命中），两个都是字面 `*` 时按
+//! 「与」——`0 0 1 * 1` 因此是「每月 1 日或每周一」。
+//!
+//! 注意这与 Vixie cron 源码**不同**：Vixie 按「字段是否以 `*` 开头」判定未受限，所以 `*/2` 在
+//! Vixie 里是 `DOM_STAR`，`0 0 */2 * 1` 会变成「奇数日且周一」；本实现认字面口径，同一个表达式
+//! 是「奇数日或周一」。钉死字面口径是因为解析与匹配都由本层负责，两处必须共用同一份语义。
 
 use serde::{Deserialize, Serialize};
 
@@ -53,8 +58,8 @@ pub enum ScheduleSpec {
 
 /// 按 `jobs.schedule_kind` 的取值解析表达式。
 ///
-/// interval 侧只认 `<正整数><s|m|h>`（至少 1 秒），cron 侧只认 5 个子段；两侧的错误都带上
-/// 原表达式。
+/// interval 侧只认 `<正整数><s|m|h>`（至少 1 秒、最大 `i64::MAX` 秒），cron 侧只认 5 个子段；
+/// 两侧的错误都带上原表达式。
 pub fn parse_schedule(kind: &str, expr: &str) -> Result<ScheduleSpec, SchedulerError> {
     match ScheduleKind::parse(kind)? {
         ScheduleKind::Interval => Ok(ScheduleSpec::Interval {
@@ -64,7 +69,7 @@ pub fn parse_schedule(kind: &str, expr: &str) -> Result<ScheduleSpec, SchedulerE
     }
 }
 
-/// 解析 interval 表达式：`<正整数><s|m|h>`，换算成秒（至少 1 秒）。
+/// 解析 interval 表达式：`<正整数><s|m|h>`，换算成秒（至少 1 秒，上限 `i64::MAX` 秒）。
 fn parse_interval(expr: &str) -> Result<u64, SchedulerError> {
     let invalid = |reason: String| SchedulerError::Interval {
         expr: expr.to_owned(),
@@ -98,9 +103,18 @@ fn parse_interval(expr: &str) -> Result<u64, SchedulerError> {
     if count == 0 {
         return Err(invalid("间隔至少为 1 秒".into()));
     }
-    count
+    let seconds = count
         .checked_mul(seconds_per_unit)
-        .ok_or_else(|| invalid(format!("数值「{digits}{unit}」过大")))
+        .ok_or_else(|| invalid(format!("数值「{digits}{unit}」过大")))?;
+    // 秒数上限收到 `i64::MAX`：`next_due` 的时间算术全在 i64 上，放不进去的间隔没有意义，
+    // 在这里当场拒绝——而不是让它悄悄退化成「永不到期」哨兵，两者必须可区分。
+    if seconds > i64::MAX as u64 {
+        return Err(invalid(format!(
+            "间隔「{digits}{unit}」过大：最大只能是 {} 秒",
+            i64::MAX
+        )));
+    }
+    Ok(seconds)
 }
 
 /// 搜索上限：4 年（按 366 天/年取上界）。越过它仍无命中即视为「永不到期」，返回 `None`。
@@ -190,7 +204,8 @@ impl CronExpr {
 /// 解析一个 cron 字段，返回位掩码（第 i 位 = 取值 i 被选中）。
 ///
 /// 字段是逗号分隔的列表，每项为 `*`、`a`、`a-b`、`*/N`、`a/N` 或 `a-b/N`；`a/N` 按自然推广
-/// 理解为「从 a 到上界、步长 N」。
+/// 理解为「从 a 到上界、步长 N」。步长不受字段上界约束（`u32` 全范围都收，只有 0 被拒）：
+/// 比区间跨度还大时只标记起点那一位，推进用 `saturating_add`，绝不上溢。
 fn parse_field(
     field: &str,
     name: &str,
@@ -242,7 +257,9 @@ fn parse_field(
         let mut value = lo;
         while value <= hi {
             mask |= 1u64 << value;
-            value += step;
+            // 步长可以是任意 u32（只拒 0）：`value + step` 会溢出 u32（debug panic / release
+            // 回绕成错误掩码），饱和推进让循环在下一轮自然退出，只留起点那一位。
+            value = value.saturating_add(step);
         }
     }
     Ok(mask)
@@ -369,6 +386,29 @@ mod tests {
     }
 
     #[test]
+    fn interval_parse_rejects_values_that_do_not_fit_in_i64_seconds() {
+        // 上限是 i64::MAX 秒（`next_due` 的时间算术全在 i64 上）
+        assert_eq!(
+            interval("9223372036854775807s"),
+            ScheduleSpec::Interval {
+                every_secs: i64::MAX as u64
+            }
+        );
+        for expr in [
+            "9223372036854775808s",  // i64::MAX + 1 秒
+            "18446744073709551615s", // u64::MAX 秒
+            "18446744073709551615m", // 换算成秒连 u64 都装不下
+        ] {
+            let err = parse_schedule("interval", expr).unwrap_err().to_string();
+            assert!(err.contains("过大"), "{expr}: {err}");
+            assert!(
+                err.contains(&format!("「{expr}」")),
+                "{expr}: 错误里必须带原表达式：{err}"
+            );
+        }
+    }
+
+    #[test]
     fn cron_parse_accepts_every_field_form() {
         for expr in [
             "* * * * *",
@@ -472,6 +512,18 @@ mod tests {
     }
 
     #[test]
+    fn cron_dom_step_form_counts_as_restricted_and_is_ored_with_dow() {
+        // 0 0 */2 * 1：`日` 取奇数日（1,3,…,31），`周` 取周一。`*/2` 不是字面 `*` → 两边都受限
+        // → 按「或」。起点 2024-02-10T00:00Z（周六、10 日，两条腿都不命中）：下一个命中是
+        // 2024-02-11T00:00Z（周日、11 日）——只有「日」这条腿命中，结果因此钉死「或」。
+        let expr = cron("0 0 */2 * 1");
+        // 1707523200 = 2024-02-10T00:00Z；1707609600 = 2024-02-11T00:00Z（+86400 秒）
+        assert_eq!(expr.next_after(1_707_523_200), Some(1_707_609_600));
+        // 若按 Vixie 源码（字段以 `*` 开头即视为未受限 → 这里退化成「与」），下一个命中要等到
+        // 2024-02-19（周一、19 日）00:00 = 1708300800，与本断言不同。
+    }
+
+    #[test]
     fn cron_expression_that_never_matches_is_none() {
         // 2 月 30 日不存在：4 年搜索窗内一次都不会命中
         let expr = cron("0 0 30 2 *");
@@ -484,5 +536,43 @@ mod tests {
         // 下一个是 2028-02-29 = 1709251200 + 1460 天 × 86400 秒，仍在 4 年（1464 天）窗内
         let expr = cron("0 0 29 2 *");
         assert_eq!(expr.next_after(1_709_251_200), Some(1_835_395_200));
+    }
+
+    #[test]
+    fn cron_huge_step_in_star_form_marks_only_the_start_value() {
+        // `*/N` 落在「日」（下界 1）：1 + u32::MAX 会溢出 u32 —— 步长必须饱和推进，只留第 1 日。
+        // 第一行是评审点名的原样输入。
+        assert_eq!(cron("* * */4294967295 * *").days_of_month, 1 << 1);
+        let expr = cron("0 0 */4294967295 * *");
+        assert_eq!(expr.days_of_month, 1 << 1);
+        // 每月 1 日 00:00：2024-01-01T00:00Z 之后是 2024-02-01T00:00Z（1706745600）
+        assert_eq!(expr.next_after(1_704_067_200), Some(1_706_745_600));
+    }
+
+    #[test]
+    fn cron_huge_step_in_value_form_marks_only_the_start_value() {
+        // `a/N`：只剩第 30 分钟
+        let expr = cron("30/4294967295 * * * *");
+        assert_eq!(expr.minutes, 1 << 30);
+    }
+
+    #[test]
+    fn cron_huge_step_in_range_form_marks_only_the_start_value() {
+        // `a-b/N`：只剩区间起点第 5 分钟
+        let expr = cron("5-10/4294967295 * * * *");
+        assert_eq!(expr.minutes, 1 << 5);
+    }
+
+    #[test]
+    fn cron_next_after_handles_negative_after_before_1970() {
+        // 0 0 1 * *：每月 1 日 00:00；整分钟对齐用 `div_euclid`，负数秒同样正确。
+        let expr = cron("0 0 1 * *");
+        // after = -10000000（1969-09-07T06:13:20Z）→ 1969-10-01T00:00Z（epoch 前 92 天）
+        assert_eq!(expr.next_after(-10_000_000), Some(-7_948_800));
+        // after = -86400（1969-12-31T00:00Z）→ 跨过 epoch：1970-01-01T00:00Z
+        assert_eq!(expr.next_after(-86_400), Some(0));
+        // 含 `周` 字段的表达式在 1970 年前同样按 UTC 星期几匹配：1969-12-31 是周三，
+        // after = -3600（当日 23:00Z）→ 1970-01-01（周四）09:00Z
+        assert_eq!(cron("0 9 * * 1-5").next_after(-3_600), Some(32_400));
     }
 }

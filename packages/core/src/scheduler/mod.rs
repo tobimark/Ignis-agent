@@ -7,11 +7,15 @@
 //! 三条硬规则：
 //! - **无补跑**：到期时刻永远从「现在」或「上次运行」往后算，停机错过的时间点不会被补齐
 //!   （见 `due` 模块）。
-//! - **cron 走 Vixie 语义**：`日` 与 `周` 都不是字面 `*` 时按「或」匹配（见 [`CronExpr`]）。
+//! - **cron 的日匹配按钉死的字面口径**：`日` 与 `周` 都不是字面 `*` 时按「或」匹配；对 `*/2`
+//!   这类写法这与 Vixie 源码不同（见 [`CronExpr`] 的模块文档）。
 //! - **执行边界显式声明**：job 的 [`JobProfile`] 必须给出工具白名单与风险等级，
 //!   [`validate_job`] 再核对白名单里的名字确实存在于内核注册的工具里。
 //!
-//! 所有错误消息都是中文，并带上出错的原文（表达式、字段名或工具名）。
+//! 错误消息的语种：interval / cron / 校验类错误都是中文，并带上出错的原文（表达式、字段名或
+//! 工具名）；[`SchedulerError::Profile`] 与 [`SchedulerError::Limits`] 里由 serde 裁定的 JSON
+//! 形状错误保留 serde 的英文原文（未知字段、字段类型、枚举取值等细节以 serde 为准），取值类
+//! 错误（tools 为空、工具名重复等）仍是中文。
 
 mod due;
 mod schedule;
@@ -20,7 +24,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-pub use due::next_due;
+pub use due::{NEVER_DUE, next_due};
 pub use schedule::{CronExpr, ScheduleKind, ScheduleSpec, parse_schedule};
 
 /// job 的执行限额，复用运行时 [`ignis_runtime::Limits`]（字段可逐个缺省）。
@@ -74,9 +78,10 @@ pub enum ProfileRisk {
 
 /// 解析 `jobs.profile_json`。
 ///
-/// JSON 形状不合法（未知字段、缺字段、`risk` 取值不在册）与取值不合法（`tools` 为空、项为
-/// 空白、重名）都返回中文错误。`tools` 里的名字先裁掉首尾空白，落回来的也是裁过的那份——
-/// 否则「 fs_read 」这种多一个空格的写法会在 [`validate_job`] 那里变成「不可用工具」。
+/// JSON 形状不合法（未知字段、缺字段、`risk` 取值不在册）时，serde 的英文原文会嵌在中文的
+/// `job profile 不合法：…` 里抛出；取值不合法（`tools` 为空、项为空白、重名）是纯中文错误。
+/// `tools` 里的名字先裁掉首尾空白，落回来的也是裁过的那份——否则「 fs_read 」这种多一个空格的
+/// 写法会在 [`validate_job`] 那里变成「不可用工具」。
 pub fn parse_profile(json: &str) -> Result<JobProfile, SchedulerError> {
     let invalid = |reason: String| SchedulerError::Profile { reason };
     let mut profile: JobProfile =
