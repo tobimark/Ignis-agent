@@ -248,6 +248,7 @@ dependencies = [
  "async-trait",
  "dirs",
  "ignis-runtime",
+ "libc",
  "regex",
  "serde",
  "serde_json",

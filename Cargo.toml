@@ -23,3 +23,4 @@ uuid = { version = "1", features = ["v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
 regex = "1"
+libc = "0.2"
