@@ -87,6 +87,23 @@ pub fn read_approvals(db_path: &Path, task_id: &str) -> Vec<(String, String, Str
     rows.map(|row| row.expect("审批行应可读取")).collect()
 }
 
+/// 某个 key 的全部事实行，按 id 升序：`(id, status, superseded_by, text)`。
+///
+/// 直读 `facts` 表而不是走读路径：Demo B 要断言的正是「库里到底留了几行、旧行指向谁」，
+/// 而只回 active 的读路径会把 supersede 的现场抹掉（`superseded_by` 为 NULL 时给 `None`）。
+pub fn read_facts(db_path: &Path, key: &str) -> Vec<(i64, String, Option<i64>, String)> {
+    let conn = rusqlite::Connection::open(db_path).expect("事实表应可直读");
+    let mut stmt = conn
+        .prepare("SELECT id, status, superseded_by, text FROM facts WHERE key = ?1 ORDER BY id ASC")
+        .expect("事实查询应可编译");
+    let rows = stmt
+        .query_map([key], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .expect("事实查询应可执行");
+    rows.map(|row| row.expect("事实行应可读取")).collect()
+}
+
 /// 在 `dir` 里跑 `npm test`，返回退出状态（输出丢弃，断言只看退出码）。
 pub fn run_npm_test(dir: &Path) -> ExitStatus {
     Command::new("npm")

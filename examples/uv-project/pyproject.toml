@@ -1,0 +1,13 @@
+[project]
+name = "uv-project"
+version = "0.1.0"
+description = "Ignis Demo B 夹具：一个极简的 uv 风格 Python 项目"
+requires-python = ">=3.11"
+
+# 测试依赖走 uv 的 dev 组：`uv sync` 之后 `uv run pytest` 即可运行测试
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+# 让 `uv run pytest` 能从项目根导入 `app`（tests/ 不带 __init__.py）
+pythonpath = ["."]
