@@ -1,13 +1,16 @@
-//! `ignis config show|set`：打印生效配置、写回文件配置。
+//! `ignis config show|set`：打印生效配置、改写文件配置。
 //!
-//! `show` 走 `load_config`（含环境变量覆盖），`set` 走 `load_config_file`（**不含**覆盖）：
-//! 把生效值写回文件会把 `IGNIS_MODEL` 之类的环境派生值持久化进 `config.json`。
+//! `show` 走 `load_config`（含环境变量覆盖）；`set` 以**文件原文**为底稿
+//! （`load_config_value`：缺失文件给 `{}`，不是 `Config::default()`），只改写被点名的
+//! 那一项，再用 `save_config_value` 原样写回。因此既不会把 `IGNIS_MODEL` 之类的环境派生值
+//! 持久化，也不会把 `workspace_root` 这类默认值物化进 `config.json`（否则一次 `config set`
+//! 就会把当时的 cwd 钉死成工作区）。
 
 use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::{Result, anyhow};
-use ignis_core::config::{Config, ignis_home, load_config, load_config_file, save_config};
+use ignis_core::config::{Config, ignis_home, load_config, load_config_value, save_config_value};
 use serde_json::{Value, json};
 
 use crate::cli::ConfigCommand;
@@ -126,6 +129,9 @@ impl Kind {
 }
 
 /// 把白名单内的标量点路径写回 `config.json`，返回回显值（密钥打码）。
+///
+/// 底稿是文件原文而非 `Config::default()`：文件因此保持「只写覆盖项」，
+/// 一次 `config set` 不会顺手把其它字段（尤其 `workspace_root`）写死成当时的默认值。
 fn set_value(home: &Path, key: &str, value: &str) -> Result<String> {
     let Some((_, kind)) = FIELDS.iter().find(|(path, _)| *path == key).copied() else {
         return Err(anyhow!("未知配置项：{key}"));
@@ -134,17 +140,11 @@ fn set_value(home: &Path, key: &str, value: &str) -> Result<String> {
         .parse(value)
         .ok_or_else(|| anyhow!("取值不合法：{value}（{key} 需要{}）", kind.expected()))?;
 
-    // 只看文件配置：环境变量派生值（IGNIS_MODEL 等）绝不写回 config.json
-    let mut config = load_config_file(home)?;
-    let mut json = serde_json::to_value(&config)?;
-    let pointer = format!("/{}", key.replace('.', "/"));
-    // 白名单路径必然存在于 `Config` 的 JSON 形状里；仍不用 unwrap，缺了就报错
-    let target = json
-        .pointer_mut(&pointer)
-        .ok_or_else(|| anyhow!("配置项缺失：{key}"))?;
-    *target = scalar;
-    config = serde_json::from_value(json)?;
-    save_config(home, &config)?;
+    let mut json = load_config_value(home)?;
+    write_scalar(&mut json, key, scalar)?;
+    // 校验：改完的文件仍须能反序列化成 `Config`（类型不符、枚举非法在这里报错）
+    serde_json::from_value::<Config>(json.clone())?;
+    save_config_value(home, &json)?;
 
     Ok(if kind == Kind::Secret {
         REDACTED.to_string()
@@ -153,13 +153,35 @@ fn set_value(home: &Path, key: &str, value: &str) -> Result<String> {
     })
 }
 
+/// 在 JSON 对象上按点路径写入标量；父级对象缺失时按需创建（新文件从 `{}` 起步）。
+fn write_scalar(root: &mut Value, key: &str, scalar: Value) -> Result<()> {
+    let segments: Vec<&str> = key.split('.').filter(|part| !part.is_empty()).collect();
+    let Some((leaf, parents)) = segments.split_last() else {
+        return Err(anyhow!("未知配置项：{key}"));
+    };
+
+    let mut target = root;
+    for parent in parents {
+        target = target
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("配置项缺失：{key}"))?
+            .entry((*parent).to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    }
+    target
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("配置项缺失：{key}"))?
+        .insert((*leaf).to_string(), scalar);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use ignis_core::config::load_config_file;
+    use ignis_core::config::{load_config, load_config_file};
     use ignis_runtime::ModelConfig;
 
     use super::*;
@@ -249,6 +271,77 @@ mod tests {
         // `save_config` 的 0600 不能被破坏
         #[cfg(unix)]
         assert_eq!(mode(&home.path().join("config.json")), 0o600);
+    }
+
+    #[test]
+    fn config_set_on_fresh_home_keeps_file_overrides_only() {
+        let home = TempHome::new("fresh");
+        assert!(!home.path().join("config.json").exists());
+
+        assert_eq!(
+            set_value(home.path(), "limits.max_steps", "7").unwrap(),
+            "7"
+        );
+
+        // 文件里只有被点名的那一项：默认值（尤其 workspace_root）一个都没物化
+        let raw = fs::read_to_string(home.path().join("config.json")).unwrap();
+        let json: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(json, json!({"limits": {"max_steps": 7}}), "{raw}");
+        assert!(json.get("workspace_root").is_none(), "{raw}");
+        assert!(json.get("default_kernel").is_none(), "{raw}");
+
+        // 生效配置的 workspace_root 仍是默认（进程启动目录），没有被钉死在某个项目
+        let effective = load_config(home.path()).unwrap();
+        assert_eq!(effective.workspace_root, std::env::current_dir().unwrap());
+        assert_eq!(effective.limits.max_steps, 7);
+    }
+
+    #[test]
+    fn config_set_preserves_existing_file_keys() {
+        let home = TempHome::new("preserve");
+        fs::write(
+            home.path().join("config.json"),
+            r#"{
+  "model": { "model": "file-model" },
+  "api_key": "sk-file-secret",
+  "limits": { "max_steps": 3 }
+}"#,
+        )
+        .unwrap();
+
+        set_value(home.path(), "model.base_url", "http://localhost:11434/v1").unwrap();
+
+        // 无键丢失、无默认值补齐：改了 base_url，其余原样，没多出任何键
+        let raw = fs::read_to_string(home.path().join("config.json")).unwrap();
+        let json: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            json,
+            json!({
+                "model": {
+                    "model": "file-model",
+                    "base_url": "http://localhost:11434/v1",
+                },
+                "api_key": "sk-file-secret",
+                "limits": { "max_steps": 3 },
+            }),
+            "{raw}"
+        );
+        #[cfg(unix)]
+        assert_eq!(mode(&home.path().join("config.json")), 0o600);
+    }
+
+    #[test]
+    fn config_set_refuses_to_overwrite_unparsable_file() {
+        let home = TempHome::new("corrupt");
+        let path = home.path().join("config.json");
+        fs::write(&path, "{oops").unwrap();
+
+        let error = set_value(home.path(), "limits.max_steps", "7")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("配置文件无法解析"), "{error}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{oops");
     }
 
     #[test]

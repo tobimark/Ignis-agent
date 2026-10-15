@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use ignis_runtime::{Limits, ModelConfig};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// 配置文件名，位于 home 目录下。
 const CONFIG_FILE: &str = "config.json";
@@ -140,29 +141,72 @@ fn load_config_with(
     Ok(cfg)
 }
 
+/// 文件原文的 JSON 表示：文件缺失给 `{}`，内容坏掉仍报 [`ConfigError::Parse`]。
+///
+/// `ignis config set` 用它当底稿（而不是 `Config::default()`）：一次 `set` 只落地被改写的
+/// 那一项，`workspace_root` 之类的默认值不会被物化进 `config.json`。
+pub fn load_config_value(home: &Path) -> Result<Value, ConfigError> {
+    match read_raw(home)? {
+        Some(raw) => serde_json::from_str(&raw).map_err(|source| parse_error(home, source)),
+        None => Ok(Value::Object(serde_json::Map::new())),
+    }
+}
+
 /// 默认值 + 文件（存在则解析）。
 fn load_file(home: &Path) -> Result<Config, ConfigError> {
+    match read_raw(home)? {
+        Some(raw) => serde_json::from_str(&raw).map_err(|source| parse_error(home, source)),
+        None => Ok(Config::default()),
+    }
+}
+
+/// 读配置文件原文：文件缺失给 `None`，其它读取失败带上路径报错。
+fn read_raw(home: &Path) -> Result<Option<String>, ConfigError> {
     let path = config_path(home);
     match fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str(&raw).map_err(|source| ConfigError::Parse { path, source }),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(Config::default()),
+        Ok(raw) => Ok(Some(raw)),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(ConfigError::Read { path, source }),
+    }
+}
+
+/// 解析失败一律带上配置文件路径。
+fn parse_error(home: &Path, source: serde_json::Error) -> ConfigError {
+    ConfigError::Parse {
+        path: config_path(home),
+        source,
     }
 }
 
 /// 保存配置：home 目录按需创建，先写同目录临时文件再 rename，落到 0600。
 pub fn save_config(home: &Path, cfg: &Config) -> Result<(), ConfigError> {
+    write_config(home, json_bytes(cfg)?)
+}
+
+/// 保存一份原始 JSON 文档，排版与 [`save_config`] 一致。
+///
+/// `ignis config set` 用它把「只改了一处」的文件原文写回：走 `Config` 的序列化会把
+/// `Config::default()` 的所有默认值（尤其 `workspace_root`）物化进配置文件。
+pub fn save_config_value(home: &Path, value: &Value) -> Result<(), ConfigError> {
+    write_config(home, json_bytes(value)?)
+}
+
+/// 配置文件排版：pretty JSON + 末尾换行。
+fn json_bytes(value: &impl Serialize) -> Result<Vec<u8>, ConfigError> {
+    let mut data =
+        serde_json::to_vec_pretty(value).map_err(|source| ConfigError::Serialize { source })?;
+    data.push(b'\n');
+    Ok(data)
+}
+
+/// 原子落盘：home 按需创建，同目录临时文件 + rename（0600，不留半截 JSON）。
+fn write_config(home: &Path, data: Vec<u8>) -> Result<(), ConfigError> {
     let path = config_path(home);
     fs::create_dir_all(home).map_err(|source| ConfigError::Write {
         path: home.to_path_buf(),
         source,
     })?;
 
-    let mut data =
-        serde_json::to_vec_pretty(cfg).map_err(|source| ConfigError::Serialize { source })?;
-    data.push(b'\n');
-
-    // 同目录临时文件 + rename：替换是原子的，也不会留下半截 JSON
     let tmp = home.join(format!(".{CONFIG_FILE}.{}.tmp", std::process::id()));
     write_private(&tmp, &data).map_err(|source| ConfigError::Write {
         path: tmp.clone(),
@@ -221,6 +265,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use ignis_runtime::ModelProtocol;
+    use serde_json::json;
 
     use super::*;
 
@@ -411,6 +456,59 @@ mod tests {
 
         save_config(&home, &Config::default()).unwrap();
         assert!(home.join(CONFIG_JSON).is_file());
+    }
+
+    #[test]
+    fn load_config_value_missing_file_is_empty_object() {
+        let home = TempHome::new("raw-missing");
+        // 文件不存在时给 `{}` 而不是默认配置：`config set` 的底稿不能含默认值
+        assert_eq!(load_config_value(home.path()).unwrap(), json!({}));
+        assert_eq!(
+            load_config_value(&home.path().join("absent")).unwrap(),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn load_config_value_reports_bad_json() {
+        let home = TempHome::new("raw-invalid");
+        let path = home.config_path();
+        fs::write(&path, "{oops").unwrap();
+
+        let err = load_config_value(home.path()).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::Parse { path: p, .. } if p == &path),
+            "unexpected error: {err:?}"
+        );
+        assert!(err.to_string().contains(CONFIG_JSON), "err: {err}");
+    }
+
+    #[test]
+    fn save_config_value_writes_raw_json_without_defaults() {
+        let home = TempHome::new("raw-save");
+        let value = json!({"limits": {"max_steps": 7}});
+
+        save_config_value(home.path(), &value).unwrap();
+
+        let raw = fs::read_to_string(home.config_path()).unwrap();
+        let parsed: Value = serde_json::from_str(&raw).unwrap();
+        // 逐字保留：没有 workspace_root / default_kernel 之类的默认值
+        assert_eq!(parsed, value);
+        assert!(parsed.get("workspace_root").is_none(), "{raw}");
+        // 落到文件的内容仍能按「默认值 + 文件」读回
+        assert_eq!(
+            load_config_with(home.path(), no_env)
+                .unwrap()
+                .limits
+                .max_steps,
+            7
+        );
+        #[cfg(unix)]
+        assert_eq!(mode(&home.config_path()), 0o600);
+        // 分支覆盖：文件不存在时用默认值装载，仍走同一套写盘代码
+        let fresh = TempHome::new("raw-save-fresh");
+        save_config_value(&fresh.path().join("not-created"), &json!({"api_key": null})).unwrap();
+        assert!(fresh.path().join("not-created").join(CONFIG_JSON).is_file());
     }
 
     #[test]
