@@ -104,12 +104,32 @@ pub fn run_npm_test(dir: &Path) -> ExitStatus {
 /// stdin 必须是「非 tty」，审批模式才会按无旗标那条路径落到 `Unattended`——不能被 runner
 /// 恰好挂在终端上这件事影响。`home` 与 `workspace` 一律指向用例自己的临时目录。
 pub fn ignis_cmd(home: &Path, workspace: &Path, base_url: &str) -> Command {
+    let mut cmd = base_cmd(home, workspace, base_url);
+    cmd.env("IGNIS_API_KEY", "test-key");
+    cmd
+}
+
+/// 密钥只走 `api_key_env`（默认 `OPENAI_API_KEY`）的变体：**不设** `IGNIS_API_KEY`，并显式把
+/// 它从子进程环境里摘掉——运行者环境里恰好有 `IGNIS_API_KEY` 时，这条路径会悄悄变成
+/// 「配置文件/覆盖密钥」路径，回归就观测不到了。
+pub fn ignis_cmd_with_api_key_env(
+    home: &Path,
+    workspace: &Path,
+    base_url: &str,
+    key: &str,
+) -> Command {
+    let mut cmd = base_cmd(home, workspace, base_url);
+    cmd.env_remove("IGNIS_API_KEY").env("OPENAI_API_KEY", key);
+    cmd
+}
+
+/// 两个变体的共同部分：home、工作区、假模型地址与固定的 stdio。
+fn base_cmd(home: &Path, workspace: &Path, base_url: &str) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ignis"));
     cmd.env("IGNIS_HOME", home)
         .env("IGNIS_WORKSPACE", workspace)
         .env("IGNIS_BASE_URL", base_url)
         .env("IGNIS_MODEL", "test-model")
-        .env("IGNIS_API_KEY", "test-key")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

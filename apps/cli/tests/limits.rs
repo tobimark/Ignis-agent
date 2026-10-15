@@ -30,8 +30,13 @@ fn max_steps_reaches_limit_and_stays_visible() {
         .output()
         .expect("ignis 二进制应可执行");
     let text = output_text(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{text}");
     assert!(text.contains("limit_reached"), "{text}");
+    // 结束行留在 stdout（渲染流），原因行留在 stderr：两条流各看各的
+    assert!(stdout.contains("● Finished: limit_reached"), "{text}");
+    assert!(!stdout.contains("error: "), "{text}");
     assert_eq!(model.requests().len(), 1, "触限后不得再请求模型");
 
     // 任务行：状态是终态 `limit_reached`，原因可查
@@ -39,6 +44,10 @@ fn max_steps_reaches_limit_and_stays_visible() {
     let (task_id, status, error) = latest_task(&db);
     assert_eq!(status, "limit_reached", "{text}");
     assert!(error.contains("max_steps"), "{error}");
+    // 终端必须自己说清为什么没成功（I2）：与 `tasks.error` 同一份文本打到 stderr
+    assert!(stderr.contains(&format!("error: {error}")), "{text}");
+    // 结束行带任务 id：失败/触限的运行不必翻库就能接着 `ignis task show {id}`
+    assert!(stdout.contains(&format!("· task {task_id}")), "{text}");
 
     // JSONL：内核的 `done` 行带着 limit_reached；收尾行是 `task_end`（不是第二个 `done`）
     let raw = fs::read_to_string(home.join("logs").join(format!("{task_id}.jsonl")))

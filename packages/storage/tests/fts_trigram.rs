@@ -22,6 +22,29 @@ fn bundled_sqlite_supports_fts5_trigram_chinese_substring() {
         })
         .unwrap();
     assert_eq!(n, 1);
+    // 中文子串检索：trigram 的 MATCH 要求查询串不少于 3 个 unicode 字符（`项目使用` 是 4 个），
+    // 这条断言证明的是「中文子串真的能被检索到」，不只是「bundled SQLite 认 fts5」
+    let n: i64 = db
+        .with_conn(|c| {
+            c.query_row(
+                "SELECT count(*) FROM t WHERE t MATCH '项目使用'",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(n, 1);
+    // 不在文本里的中文串不得命中（MATCH 的否定面）
+    let n: i64 = db
+        .with_conn(|c| {
+            c.query_row(
+                "SELECT count(*) FROM t WHERE t MATCH '项目管理'",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(n, 0);
     let n: i64 = db
         .with_conn(|c| {
             c.query_row(

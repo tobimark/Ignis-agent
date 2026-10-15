@@ -84,6 +84,13 @@ fn demo_a_fixes_broken_project_end_to_end() {
         ("success", ""),
         "{task_id}"
     );
+    // 结束行带任务 id（I2）：成功运行同样要能直接从终端复制 id 去查任务
+    assert!(stdout.contains(&format!("· task {task_id}")), "{text}");
+    // 成功运行不该出现失败原因行（`Session::run_task` 只对非成功终态打印）
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("error: "),
+        "{text}"
+    );
     let want = [
         ("shell_run", "allow", "preauthorized"),
         ("fs_edit", "allow", "preauthorized"),

@@ -3,8 +3,8 @@
 //! `shell_run` 是 v0.1 里唯一会 spawn 进程的工具，因此「超时/取消必须真的杀掉进程」也落在
 //! 这里：子进程自成进程组（`process_group(0)`，组号 == 子进程 pid），超时或
 //! [`CancellationToken`] 触发时对整组 SIGKILL，`sh -c` 派生出的后台任务无法逃逸。
-//! 密钥类环境变量（名匹配 `(?i)(_KEY|_TOKEN|_SECRET|_PASSWORD)$`）不进子进程，
-//! 避免 `env`/`echo $…` 把中转密钥写回工具输出与日志。
+//! 密钥类环境变量（名匹配 `(?i)(_KEY|_TOKEN|_SECRET|_PASSWORD)$`，按 lossy 文本判定，
+//! 兼容非 UTF-8 的名字）不进子进程，避免 `env`/`echo $…` 把中转密钥写回工具输出与日志。
 //!
 //! [`CancellationToken`]: tokio_util::sync::CancellationToken
 
@@ -78,8 +78,10 @@ impl Tool for ShellRun {
         // 子进程自成进程组：组号 == 子进程 pid，超时/取消时对整组发信号
         #[cfg(unix)]
         builder.process_group(0);
-        for (name, _) in std::env::vars() {
-            if is_secret_env_name(&name) {
+        for (name, _) in std::env::vars_os() {
+            // `vars()` 会在任何非 UTF-8 变量上 panic（Linux 上合法），`vars_os()` 不会；
+            // 名字的判定用 lossy 文本，剔除用原始 `OsString`（按字节精确匹配）
+            if is_secret_env_name(&name.to_string_lossy()) {
                 builder.env_remove(name);
             }
         }
@@ -410,6 +412,42 @@ mod tests {
         // `_KEY`/`_TOKEN` 后缀（大小写无关）被剔除，普通变量照常传入
         assert_eq!(output, "exit code: 0\n[][][visible]\n");
         assert!(!output.contains("secret"), "{output}");
+    }
+
+    /// 非 UTF-8 的环境变量不得让工具 panic：Linux 上变量名与取值都可以含任意字节，旧实现用
+    /// `std::env::vars()` 遍历，遇到非 Unicode 变量直接 panic 在命令执行路径上（任务随后以
+    /// 「内核事件流未以 done 收尾」记失败，终端还会喷一段 panic）。
+    ///
+    /// 两个变量各钉一条路径：非 UTF-8 的名字（lossy 后以 `_KEY` 结尾）与非 UTF-8 的取值。
+    /// 取值那条是真断言——`sh` 会原样转发合法的变量名（取值里的坏字节照传），只有 `env_remove`
+    /// 真的执行了它才不会出现在子进程环境里；名字那条 `sh` 自己就不认（合法标识符之外的名字
+    /// 不转发），这里只要求遍历不 panic、剔除按原始 `OsString` 生效。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_utf8_env_vars_do_not_panic_and_are_stripped() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let bad_name = OsString::from_vec(b"IGNIS_\xff_KEY".to_vec());
+        let bad_value = OsString::from_vec(b"non-utf8-secret\xfe".to_vec());
+        // SAFETY: 只写本测试自用的两个变量；本 crate 的子进程一律剔除密钥类变量，
+        // 其它测试既不读它们、也不读非 UTF-8 环境，观测不到这次写入。
+        unsafe {
+            std::env::set_var(&bad_name, &bad_value);
+            std::env::set_var("IGNIS_EXTRA_KEY", &bad_value);
+        }
+
+        let env = Env::new();
+        // `env` 不接参数，`sh` 会把环境原样打印出来：正好用来观察子进程拿到了什么
+        let output = env.run(json!({"command": "env"})).await.unwrap();
+
+        // 没有 panic：命令照常执行完
+        assert!(output.starts_with("exit code: 0\n"), "{output}");
+        // lossy 名字（`IGNIS_\u{FFFD}_KEY`）命中密钥黑名单，子进程里看不到它
+        assert!(!output.contains("IGNIS_\u{FFFD}_KEY"), "{output}");
+        // 合法名字 + 非 UTF-8 取值：取值坏掉不影响「按名字剔除」
+        assert!(!output.contains("IGNIS_EXTRA_KEY"), "{output}");
+        assert!(!output.contains("non-utf8-secret"), "{output}");
     }
 
     /// 密钥后缀规则本身：`(?i)(_KEY|_TOKEN|_SECRET|_PASSWORD)$`。

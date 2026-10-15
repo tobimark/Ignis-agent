@@ -181,7 +181,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use ignis_core::config::{load_config, load_config_file};
+    use ignis_core::config::{load_config_file, load_config_with_env};
     use ignis_runtime::ModelConfig;
 
     use super::*;
@@ -290,8 +290,10 @@ mod tests {
         assert!(json.get("workspace_root").is_none(), "{raw}");
         assert!(json.get("default_kernel").is_none(), "{raw}");
 
-        // 生效配置的 workspace_root 仍是默认（进程启动目录），没有被钉死在某个项目
-        let effective = load_config(home.path()).unwrap();
+        // 生效配置的 workspace_root 仍是默认（进程启动目录），没有被钉死在某个项目。
+        // 走 env-free 的 lookup seam（空环境注入）：运行者环境里若有 IGNIS_WORKSPACE，
+        // 直接调 `load_config` 的断言就会被它带偏。
+        let effective = load_config_with_env(home.path(), |_| None).unwrap();
         assert_eq!(effective.workspace_root, std::env::current_dir().unwrap());
         assert_eq!(effective.limits.max_steps, 7);
     }

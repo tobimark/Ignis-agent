@@ -120,7 +120,7 @@ pub fn config_path(home: &Path) -> PathBuf {
 
 /// 加载配置：缺失文件（含 home 目录尚未创建）用默认值，随后应用环境变量覆盖。
 pub fn load_config(home: &Path) -> Result<Config, ConfigError> {
-    load_config_with(home, |key| std::env::var(key).ok())
+    load_config_with_env(home, |key| std::env::var(key).ok())
 }
 
 /// 只读配置文件（加默认值），**不**应用环境变量覆盖。
@@ -131,8 +131,10 @@ pub fn load_config_file(home: &Path) -> Result<Config, ConfigError> {
     load_file(home)
 }
 
-/// 与 [`load_config`] 相同，但环境读取走 `get`，便于单测覆盖而不碰真实环境变量。
-fn load_config_with(
+/// 与 [`load_config`] 相同，但环境读取走 `get`：调用方（与单测）据此在**不受运行者环境
+/// 影响**的前提下断言分层加载的结果——真实环境里的 `IGNIS_WORKSPACE` 之类的变量会改变
+/// 生效值，拿 `load_config` 做的断言因此不可重复。
+pub fn load_config_with_env(
     home: &Path,
     get: impl Fn(&str) -> Option<String>,
 ) -> Result<Config, ConfigError> {
@@ -322,7 +324,7 @@ mod tests {
     #[test]
     fn missing_file_yields_defaults() {
         let home = TempHome::new("missing");
-        let cfg = load_config_with(home.path(), no_env).unwrap();
+        let cfg = load_config_with_env(home.path(), no_env).unwrap();
         assert_eq!(cfg.workspace_root, std::env::current_dir().unwrap());
         assert_eq!(cfg.default_kernel, "native");
         assert_eq!(cfg.model, ModelConfig::default());
@@ -334,7 +336,7 @@ mod tests {
     fn missing_home_dir_yields_defaults() {
         let base = TempHome::new("absent-home");
         let home = base.path().join("not-created");
-        let cfg = load_config_with(&home, no_env).unwrap();
+        let cfg = load_config_with_env(&home, no_env).unwrap();
         assert_eq!(cfg.default_kernel, "native");
         assert_eq!(cfg.workspace_root, std::env::current_dir().unwrap());
     }
@@ -343,7 +345,7 @@ mod tests {
     fn partial_file_only_overrides_written_fields() {
         let home = TempHome::new("partial");
         fs::write(home.config_path(), r#"{"model":{"model":"local-llm"}}"#).unwrap();
-        let cfg = load_config_with(home.path(), no_env).unwrap();
+        let cfg = load_config_with_env(home.path(), no_env).unwrap();
         assert_eq!(cfg.model.model, "local-llm");
         assert_eq!(cfg.model.base_url, ModelConfig::default().base_url);
         assert_eq!(cfg.model.api_key_env, "OPENAI_API_KEY");
@@ -358,7 +360,7 @@ mod tests {
         let raw = r#"{"model":{"model":"a"},"api_key":"file-key"}"#;
         fs::write(home.config_path(), raw).unwrap();
 
-        let cfg = load_config_with(home.path(), |key| {
+        let cfg = load_config_with_env(home.path(), |key| {
             (key == "IGNIS_MODEL").then(|| "b".to_string())
         })
         .unwrap();
@@ -445,7 +447,7 @@ mod tests {
         };
 
         save_config(home.path(), &cfg).unwrap();
-        assert_eq!(load_config_with(home.path(), no_env).unwrap(), cfg);
+        assert_eq!(load_config_with_env(home.path(), no_env).unwrap(), cfg);
     }
 
     #[test]
@@ -497,7 +499,7 @@ mod tests {
         assert!(parsed.get("workspace_root").is_none(), "{raw}");
         // 落到文件的内容仍能按「默认值 + 文件」读回
         assert_eq!(
-            load_config_with(home.path(), no_env)
+            load_config_with_env(home.path(), no_env)
                 .unwrap()
                 .limits
                 .max_steps,
@@ -529,7 +531,7 @@ mod tests {
         let path = home.config_path();
         fs::write(&path, "{oops").unwrap();
 
-        let err = load_config_with(home.path(), no_env).unwrap_err();
+        let err = load_config_with_env(home.path(), no_env).unwrap_err();
         assert!(
             matches!(&err, ConfigError::Parse { path: p, .. } if p == &path),
             "unexpected error: {err:?}"
@@ -543,7 +545,7 @@ mod tests {
         let path = home.config_path();
         fs::create_dir(&path).unwrap(); // 目录冒充配置文件
 
-        let err = load_config_with(home.path(), no_env).unwrap_err();
+        let err = load_config_with_env(home.path(), no_env).unwrap_err();
         assert!(
             matches!(&err, ConfigError::Read { path: p, .. } if p == &path),
             "unexpected error: {err:?}"
@@ -570,7 +572,7 @@ mod tests {
 
         // 文件加载器完全不看环境；同一份文件走分层加载时会被 `IGNIS_MODEL` 覆盖
         let file_cfg = load_config_file(home.path()).unwrap();
-        let effective = load_config_with(home.path(), |key| {
+        let effective = load_config_with_env(home.path(), |key| {
             (key == ENV_MODEL).then(|| "env-model".to_string())
         })
         .unwrap();

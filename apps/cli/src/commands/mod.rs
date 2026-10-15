@@ -17,7 +17,7 @@ use ignis_core::security::{ApprovalMode, Policy};
 use ignis_core::task::{TaskKind, TaskOutcome, TaskRequest, TaskRunner};
 use ignis_runtime::native::NativeRuntime;
 use ignis_runtime::openai::OpenAiClient;
-use ignis_runtime::{ApprovalHandler, ChatMessage, Runtime};
+use ignis_runtime::{ApprovalHandler, ChatMessage, RunStatus, Runtime};
 use ignis_storage::Db;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -42,7 +42,7 @@ impl Session {
     pub fn new(cli: &Cli) -> Result<Self> {
         // 配置里的 api_key 已被 IGNIS_API_KEY 覆盖过，这里只是读出生效值
         let home = ignis_home();
-        let config: Config = load_config(&home)?;
+        let mut config: Config = load_config(&home)?;
 
         let workspace = cli
             .workspace
@@ -68,6 +68,10 @@ impl Session {
                 config.model.api_key_env
             );
         };
+        // 解析出的生效密钥回填进 config：`TaskRunner` 与每轮任务的 `ToolRuntime` 都从
+        // `config.api_key` 取脱敏密钥，只把它交给 HTTP 客户端会让环境变量这条路完全绕过
+        // `Redactor`——工具输出里的密钥会明文进 JSONL、也明文回填给模型。构造函数签名保持原样。
+        config.api_key = Some(api_key.clone());
 
         let client =
             OpenAiClient::new(&config.model, api_key)?.with_max_retries(config.limits.max_retries);
@@ -143,8 +147,20 @@ impl Session {
         let outcome = result?;
         println!(
             "{}",
-            format_task_end(outcome.status, started.elapsed(), &outcome.usage)
+            format_task_end(
+                &outcome.id,
+                outcome.status,
+                started.elapsed(),
+                &outcome.usage
+            )
         );
+        // 非成功终态不能只留一个状态词：原因（内核给出、已过 Redactor）打到 stderr，与
+        // `main` 的错误行同形。任务 id 已在结束行里，随后可直接 `ignis task show {id}`。
+        if outcome.status != RunStatus::Success
+            && let Some(error) = &outcome.error
+        {
+            eprintln!("error: {error}");
+        }
         Ok(outcome)
     }
 }

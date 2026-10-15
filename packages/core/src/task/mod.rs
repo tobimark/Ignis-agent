@@ -68,6 +68,10 @@ pub struct TaskOutcome {
     pub status: RunStatus,
     /// 仅成功时有值，取内核 `Done.summary`。
     pub final_text: Option<String>,
+    /// 内核给出的失败原因（`Done.error`，已过 [`Redactor`]）：命令层把它打到终端，
+    /// `ignis task show` 打印的 `tasks.error` 是同一份文本；成功终态下内核不给原因，
+    /// 值为 `None`。
+    pub error: Option<String>,
     pub usage: Usage,
     pub messages: Vec<ChatMessage>,
 }
@@ -139,7 +143,9 @@ impl TaskRunner {
         self.db.insert_task(&NewTask {
             id: task_id.clone(),
             kind: kind_str(req.kind).to_string(),
-            prompt: req.prompt.clone(),
+            // `tasks.prompt` 是 `ignis task show/list` 直接打印的一列：与 JSONL 同一道脱敏，
+            // 否则用户把密钥粘进提示词就等于把它明文写进了库
+            prompt: self.redactor.redact(&req.prompt),
             kernel: kernel.to_string(),
             workspace: workspace.display().to_string(),
             started_at: now_millis(),
@@ -236,17 +242,22 @@ impl TaskRunner {
             }
         }
 
-        // 收尾：内核没给 `Done`（实现缺陷）也按失败记，任务不得停在 running
+        // 收尾：内核没给 `Done`（实现缺陷，例如内核任务 panic 掉了）也按失败记，任务不得停在 running
         let (status, summary, error) = done.unwrap_or((
             RunStatus::Failed,
             None,
-            Some("内核事件流未以 done 收尾，按失败处理".to_string()),
+            Some("内核事件流未以 done 收尾（内核任务可能 panic），按失败处理".to_string()),
         ));
         // 只有成功才把 `Done.summary` 当最终答复交回调用方
         let final_text = match status {
             RunStatus::Success => summary.clone(),
             _ => None,
         };
+        // 落库与交回调用方的文本先过脱敏：`tasks.summary` / `tasks.error` 会被
+        // `ignis task show` 原样打印，`TaskOutcome::error` 会被命令层直接打到终端。
+        // JSONL 收尾行的整体脱敏不依赖这两份值，但同一份文本两次脱敏是幂等的。
+        let summary = summary.map(|text| self.redactor.redact(&text));
+        let error = error.map(|text| self.redactor.redact(&text));
         self.db.finish_task(
             task_id,
             status_str(status),
@@ -279,6 +290,7 @@ impl TaskRunner {
             id: task_id.to_string(),
             status,
             final_text,
+            error,
             usage: *usage,
             messages,
         })
@@ -289,7 +301,8 @@ impl TaskRunner {
     /// 两步都忽略各自的失败——DB 或磁盘本身就是可能的故障源，调用方要的是原始 `Err`；唯一
     /// 不能接受的结果是任务行停在 `running`。
     fn fail_infrastructure(&self, log: &TaskLog, task_id: &str, error: &CoreError, usage: Usage) {
-        let message = error.to_string();
+        // 与正常收尾同一道脱敏：这条消息会进 `tasks.error`，`ignis task show` 会原样打印
+        let message = self.redactor.redact(&error.to_string());
         let _ = self.db.finish_task(
             task_id,
             status_str(RunStatus::Failed),
@@ -592,6 +605,8 @@ mod tests {
         // TaskOutcome：id 即任务行主键与日志文件名；成功时 final_text 是 Done.summary
         assert_eq!(report.outcome.status, RunStatus::Success);
         assert_eq!(report.outcome.final_text.as_deref(), Some("done"));
+        // 成功没有失败原因可打印（命令层只对非成功状态输出 `error: …`）
+        assert_eq!(report.outcome.error, None);
         assert_eq!(
             report.outcome.messages,
             vec![
@@ -715,6 +730,8 @@ mod tests {
         // 失败不把半截答复当上下文
         assert_eq!(report.outcome.final_text, None);
         assert_eq!(report.outcome.messages, vec![user("break it")]);
+        // 失败原因随结果交回调用方（命令层据此打印 `error: …`），与落库的文本同源
+        assert_eq!(report.outcome.error.as_deref(), Some("boom"));
 
         let row = env.db.get_task(&report.outcome.id).unwrap().unwrap();
         assert_eq!(row.status, "failed");
@@ -815,6 +832,40 @@ mod tests {
         assert_eq!(report.outcome.status, RunStatus::Success);
     }
 
+    /// M1：`tasks` 列与交给命令层的错误同样要脱敏——`ignis task show/list` 直接打印它们，
+    /// 命令层也会把 `TaskOutcome::error` 打到终端，JSONL 脱敏不能替它们兜底。
+    #[tokio::test]
+    async fn task_row_and_outcome_error_are_redacted() {
+        let env = Env::new(
+            "row-redacted",
+            vec![RuntimeEvent::Done {
+                status: RunStatus::Failed,
+                summary: Some("读到 sk-test-secret 后失败".into()),
+                error: Some("鉴权失败：拒绝 sk-test-secret".into()),
+            }],
+            Some("sk-test-secret"),
+        );
+
+        let report = env.run(env.request("把 sk-test-secret 读出来")).await;
+
+        let row = env.db.get_task(&report.outcome.id).unwrap().unwrap();
+        // 提示词列：用户粘进提示词的密钥不落库
+        assert_eq!(row.prompt, "把 *** 读出来");
+        assert_eq!(row.summary.as_deref(), Some("读到 *** 后失败"));
+        assert_eq!(row.error.as_deref(), Some("鉴权失败：拒绝 ***"));
+
+        // 交回调用方的失败原因与落库的文本同源：命令层打印前不必再脱敏一次
+        let error = report.outcome.error.as_deref().unwrap();
+        assert_eq!(error, "鉴权失败：拒绝 ***");
+        // JSONL 收尾行与任务行一致
+        assert_eq!(report.task_end_line()["error"], json!("鉴权失败：拒绝 ***"));
+        assert!(
+            !env.log_raw().contains("sk-test-secret"),
+            "{}",
+            env.log_raw()
+        );
+    }
+
     #[tokio::test]
     async fn terminal_statuses_are_written_verbatim() {
         // `tasks.status` 与 JSONL `done.status` 的字符串是跨模块契约，四个终态逐个钉住
@@ -861,6 +912,8 @@ mod tests {
         assert_eq!(row.status, "failed");
         let error = row.error.as_deref().unwrap();
         assert!(error.contains("done"), "{error}");
+        // 文本要能区分「内核实现缺陷」与「任务真的失败」：无终态事件往往就是内核任务 panic
+        assert!(error.contains("panic"), "{error}");
         assert!(row.ended_at.is_some());
     }
 
@@ -872,6 +925,13 @@ mod tests {
     #[tokio::test]
     async fn unwritable_log_dir_still_fails_the_task_row() {
         use std::os::unix::fs::PermissionsExt;
+
+        // root 无视权限位（CAP_DAC_OVERRIDE），0500 的目录照写：本用例的前提不成立，跳过
+        // SAFETY: `geteuid` 只读进程的有效 uid，不触碰内存、无副作用。
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("跳过 unwritable_log_dir_still_fails_the_task_row：root 不受目录权限位约束");
+            return;
+        }
 
         let env = Env::new("readonly-log", vec![success(Some("unreachable"))], None);
         // 目录先存在再收紧到 0500：`TaskLog::new` 仍能打开（create_dir_all 对已存在目录是

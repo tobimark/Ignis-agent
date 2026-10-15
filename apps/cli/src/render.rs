@@ -77,8 +77,12 @@ fn error_preview(output: &str) -> String {
         .collect()
 }
 
-/// 结束行：`● Finished: success · 1.2s · tokens in=1234 out=567`；`estimated` 时 token 数前加 `~`。
-pub fn format_task_end(status: RunStatus, elapsed: Duration, usage: &Usage) -> String {
+/// 结束行：`● Finished: success · 1.2s · tokens in=1234 out=567 · task 0192…`；
+/// `estimated` 时 token 数前加 `~`。
+///
+/// 任务 id 是结束行的一部分：失败/触限的运行要能直接从终端复制 id 去 `ignis task show`，
+/// 不必再翻 SQLite 或 JSONL。
+pub fn format_task_end(id: &str, status: RunStatus, elapsed: Duration, usage: &Usage) -> String {
     let status = match status {
         RunStatus::Success => "success",
         RunStatus::Failed => "failed",
@@ -90,7 +94,7 @@ pub fn format_task_end(status: RunStatus, elapsed: Duration, usage: &Usage) -> S
     let input = format!("{mark}in={}", usage.input_tokens);
     let output = format!("{mark}out={}", usage.output_tokens);
 
-    format!("● Finished: {status} · {elapsed} · tokens {input} {output}")
+    format!("● Finished: {status} · {elapsed} · tokens {input} {output} · task {id}")
 }
 
 #[cfg(test)]
@@ -103,6 +107,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// 结束行里的任务 id（与真实任务 id 同形，断言直接引用它）。
+    const TASK_ID: &str = "019a1b2c-3d4e-7f00-8000-000000000001";
 
     /// 写入落到共享缓冲区的测试写入器：`Renderer` 持有 `out`，需要从外部读回内容。
     #[derive(Clone, Default)]
@@ -235,8 +242,13 @@ mod tests {
             estimated: false,
         };
         assert_eq!(
-            format_task_end(RunStatus::Success, Duration::from_millis(1234), &exact),
-            "● Finished: success · 1.2s · tokens in=1234 out=567"
+            format_task_end(
+                TASK_ID,
+                RunStatus::Success,
+                Duration::from_millis(1234),
+                &exact
+            ),
+            "● Finished: success · 1.2s · tokens in=1234 out=567 · task 019a1b2c-3d4e-7f00-8000-000000000001"
         );
 
         let estimated = Usage {
@@ -244,7 +256,12 @@ mod tests {
             output_tokens: 567,
             estimated: true,
         };
-        let line = format_task_end(RunStatus::Success, Duration::from_millis(1234), &estimated);
+        let line = format_task_end(
+            TASK_ID,
+            RunStatus::Success,
+            Duration::from_millis(1234),
+            &estimated,
+        );
         assert!(line.contains("~in=1234"), "{line}");
         assert!(line.contains("~out=567"), "{line}");
         assert!(!line.contains(" in="), "{line}");
@@ -263,8 +280,8 @@ mod tests {
 
         for (status, name) in cases {
             assert_eq!(
-                format_task_end(status, Duration::from_secs(2), &usage),
-                format!("● Finished: {name} · 2.0s · tokens in=0 out=0"),
+                format_task_end(TASK_ID, status, Duration::from_secs(2), &usage),
+                format!("● Finished: {name} · 2.0s · tokens in=0 out=0 · task {TASK_ID}"),
                 "{status:?}"
             );
         }
