@@ -14,3 +14,6 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
+# OpenAI 兼容流式客户端（SSE 读流用 `stream` feature）
+reqwest = { workspace = true }
+thiserror = { workspace = true }

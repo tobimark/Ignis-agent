@@ -15,6 +15,10 @@ use crate::{
     RunRequest, Runtime, RuntimeEvent, ToolCall, ToolExecutor, ToolResult, ToolSpec,
 };
 
+pub mod scripted_model;
+
+pub use scripted_model::{ScriptStep, ScriptedModel, ScriptedModelHandle};
+
 /// 脚本化工具执行器：按序弹出预置结果，并记录收到的每次调用。
 pub struct MockExecutor {
     results: Mutex<VecDeque<ToolResult>>,
