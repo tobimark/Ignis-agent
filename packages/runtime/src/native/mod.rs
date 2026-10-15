@@ -107,8 +107,8 @@ async fn drive(
     let mut used = Usage::default();
 
     loop {
-        // 每轮请求前的预检。取消优先：用户主动停止不该报成上限。token 按累计计——超预算只是
-        // 不再发起下一轮请求，已产出的答复照常收下（预算不是「打断回答」的理由）。
+        // 每轮请求前的预检。取消优先：用户主动停止不该报成上限。token 按累计 in+out 计，超预算
+        // 就到此为止（末轮跑完才发现超限的，由下面的轮末复核收口）。
         if cancel.is_cancelled() {
             return Some(done(RunStatus::Aborted, None, None));
         }
@@ -178,6 +178,15 @@ async fn drive(
                     {
                         return None;
                     }
+                }
+                // 轮末复核预算：循环顶部的预检只在「还要发起下一轮」时才走到，末轮的超额用量
+                // 必须在这里收口，否则这一轮的超限会被下面的 `Success` 吞掉（`Usage` 已先发）。
+                if used.input_tokens + used.output_tokens > limits.token_budget {
+                    return Some(done(
+                        RunStatus::LimitReached,
+                        None,
+                        Some(ERR_TOKEN_BUDGET.into()),
+                    ));
                 }
                 // 没有工具调用 = 模型给出最终答复，本轮即终局
                 if calls.is_empty() {
@@ -575,6 +584,135 @@ mod tests {
         );
     }
 
+    /// 一轮里两个工具调用：事件按 index 顺序串行（`ToolExec(a)`→`ToolResult(a)`→`ToolExec(b)`→
+    /// `ToolResult(b)`），下一轮请求带回一条挂两个 id 的 assistant 与两条同序的 `tool` 消息。
+    #[tokio::test]
+    async fn one_round_with_two_tool_calls_executes_serially_and_feeds_back_both() {
+        let model = ScriptedModel::start(vec![
+            ScriptStep::ToolCalls {
+                text: "查两个".into(),
+                calls: vec![
+                    ("fs_list".into(), json!({})),
+                    ("fs_read".into(), json!({"path": "notes.md"})),
+                ],
+            },
+            ScriptStep::Text("done".into()),
+        ]);
+        let mock = MockExecutor::new(vec![
+            ToolResult {
+                ok: true,
+                output: Some("a.txt".into()),
+            },
+            ToolResult {
+                ok: true,
+                output: Some("note".into()),
+            },
+        ]);
+        let executor: Arc<dyn ToolExecutor> = mock.clone();
+
+        let events = collect_events(
+            &NativeRuntime::new(client(&model)),
+            request(&model, executor),
+            CancellationToken::new(),
+        )
+        .await;
+
+        // 事件：两条调用各出一对 ToolExec / ToolResult，严格交替 = 串行（a 收工后 b 才发起）
+        let tools: Vec<&RuntimeEvent> = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::ToolExec { .. } | RuntimeEvent::ToolResult { .. }
+                )
+            })
+            .collect();
+        assert_eq!(tools.len(), 4, "{events:?}");
+        assert_eq!(
+            tools[0],
+            &RuntimeEvent::ToolExec {
+                name: "fs_list".into(),
+                summary: "Listing .".into(),
+                args: json!({}),
+            }
+        );
+        assert_eq!(
+            tools[1],
+            &RuntimeEvent::ToolResult {
+                name: "fs_list".into(),
+                ok: true,
+                output: Some("a.txt".into()),
+            }
+        );
+        assert_eq!(
+            tools[2],
+            &RuntimeEvent::ToolExec {
+                name: "fs_read".into(),
+                summary: "Reading notes.md".into(),
+                args: json!({"path": "notes.md"}),
+            }
+        );
+        assert_eq!(
+            tools[3],
+            &RuntimeEvent::ToolResult {
+                name: "fs_read".into(),
+                ok: true,
+                output: Some("note".into()),
+            }
+        );
+        // executor 按 index 顺序收到两个调用（id 由假模型按 index 生成）
+        assert_eq!(
+            mock.calls(),
+            vec![
+                ToolCall {
+                    id: "call_1".into(),
+                    name: "fs_list".into(),
+                    args: json!({}),
+                },
+                ToolCall {
+                    id: "call_2".into(),
+                    name: "fs_read".into(),
+                    args: json!({"path": "notes.md"}),
+                },
+            ]
+        );
+
+        // 回填：第 2 个请求里 assistant 消息带 BOTH id，其后紧跟两条 `tool` 消息，顺序一致
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        let messages = requests[1]["messages"]
+            .as_array()
+            .expect("messages 应为数组");
+        let assistant = messages
+            .iter()
+            .position(|message| message["role"] == "assistant")
+            .expect("应有 assistant 消息");
+        let tool_calls = messages[assistant]["tool_calls"]
+            .as_array()
+            .expect("assistant 应带 tool_calls");
+        let ids: Vec<&str> = tool_calls
+            .iter()
+            .map(|call| call["id"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(ids, vec!["call_1", "call_2"], "{tool_calls:?}");
+        assert_eq!(messages[assistant + 1]["role"], "tool");
+        assert_eq!(messages[assistant + 1]["tool_call_id"], "call_1");
+        assert_eq!(messages[assistant + 1]["content"], "a.txt");
+        assert_eq!(messages[assistant + 2]["role"], "tool");
+        assert_eq!(messages[assistant + 2]["tool_call_id"], "call_2");
+        assert_eq!(messages[assistant + 2]["content"], "note");
+
+        // 末轮文本收尾 → 恰好一条 Done{Success}
+        assert_eq!(
+            events.last(),
+            Some(&RuntimeEvent::Done {
+                status: RunStatus::Success,
+                summary: Some("done".into()),
+                error: None,
+            })
+        );
+    }
+
     /// brief 钉死：步数用尽 → `LimitReached("max_steps")`，不再执行第 2 轮的工具。
     #[tokio::test]
     async fn step_limit_stops_loop() {
@@ -750,20 +888,14 @@ mod tests {
         assert!(!model.requests().is_empty(), "首轮请求应已发出");
     }
 
-    /// token 预算：本轮用量事件先到，下一轮请求被 `LimitReached("token_budget")` 挡下。
+    /// token 预算在**末轮**被突破（单轮即超）：`Usage` 先到，随后是 `LimitReached("token_budget")`，
+    /// 绝不把超限的一轮报成 `Success`。
+    ///
+    /// 这是「预算只在请求前预检」时漏掉的那条路径：单轮跑完就收工，循环顶部再也走不到。
     #[tokio::test]
-    async fn token_budget_exceeded_stops_loop() {
-        let model = ScriptedModel::start(vec![
-            ScriptStep::ToolCalls {
-                text: String::new(),
-                calls: vec![("fs_list".into(), json!({}))],
-            },
-            ScriptStep::Text("done".into()),
-        ]);
-        let executor: Arc<dyn ToolExecutor> = MockExecutor::new(vec![ToolResult {
-            ok: true,
-            output: Some("a.txt".into()),
-        }]);
+    async fn token_budget_exceeded_in_final_round_is_limit_reached() {
+        let model = ScriptedModel::start(vec![ScriptStep::Text("hello".into())]);
+        let executor: Arc<dyn ToolExecutor> = MockExecutor::new(vec![]);
         let mut req = request(&model, executor);
         req.limits.token_budget = 10; // 假模型每轮上报 12 + 3 = 15
 
@@ -778,19 +910,27 @@ mod tests {
             .iter()
             .position(|event| matches!(event, RuntimeEvent::Usage { .. }))
             .expect("应有 Usage 事件");
-        assert_eq!(
-            events.last(),
-            Some(&RuntimeEvent::Done {
-                status: RunStatus::LimitReached,
-                summary: None,
-                error: Some("token_budget".into()),
-            })
+        let Some(RuntimeEvent::Done {
+            status,
+            summary,
+            error,
+        }) = events.last()
+        else {
+            panic!("末事件应为 Done：{events:?}");
+        };
+        assert_eq!(*status, RunStatus::LimitReached, "{events:?}");
+        assert!(summary.is_none(), "{summary:?}");
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|error| error.contains("token_budget")),
+            "{error:?}"
         );
         assert!(
             usage_index < events.len() - 1,
             "Usage 事件应先于超限 Done：{events:?}"
         );
-        assert_eq!(model.requests().len(), 1, "超预算后不得再请求模型");
+        assert_eq!(model.requests().len(), 1);
     }
 
     /// 模型错误（401）：`Done{Failed}` 带人话错误，不静默、不重试。
