@@ -94,9 +94,9 @@ fn daemon_lifecycle_start_status_stop() {
 
     // 1) start：等 pidfile 就绪，父进程回 `daemon started (pid N)`
     let started = ignis(&home, &["daemon", "start"]);
-    assert!(started.status.success(), "start 应成功：{}", text(&started));
-    // 守护进程可能已经起来了：后面任何一步失败都要把它收掉
+    // 守卫必须装在断言之前：start 可能已经拉起了一个（半）活的守护进程，断言 panic 也不能把它留下
     let _guard = StopDaemon(home.clone());
+    assert!(started.status.success(), "start 应成功：{}", text(&started));
     let pid = started_pid(&started);
     assert!(pid > 0);
     // pidfile / 日志都落在 home 下
@@ -155,6 +155,41 @@ fn daemon_lifecycle_start_status_stop() {
         stdout(&again)
     );
     assert_eq!(status(&home), DaemonStatus::Stopped);
+}
+
+/// 残留 pidfile 里的**活** pid（SIGKILL 之后被复用到的无关进程）不能骗过 `start`：
+/// 它必须等到自己拉起的那个守护进程写下 pid 才算成功，回报的 pid 也绝不是那个无关进程的。
+#[test]
+fn daemon_start_ignores_a_stale_live_pid_in_the_pidfile() {
+    let dir = TempDir::new("stale-pid");
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    // 模拟「上一次守护进程被 SIGKILL → 它的 pid 被复用」：写一个活着的、肯定不是守护进程的 pid
+    // （用测试进程自己最省事，`kill(pid, 0)` 一定说它活着）
+    let reused = std::process::id() as i32;
+    fs::write(home.join("ignis.pid"), format!("{reused}\n")).unwrap();
+
+    let started = ignis(&home, &["daemon", "start"]);
+    // 守卫先装：无论断言怎么失败，都不留下（可能已经起来的）守护进程
+    let _guard = StopDaemon(home.clone());
+
+    assert!(started.status.success(), "start 应成功：{}", text(&started));
+    let pid = started_pid(&started);
+    assert_ne!(
+        pid,
+        reused,
+        "不能拿残留/被复用的 pid 谎报「已启动」：{}",
+        text(&started)
+    );
+    // 真守护进程的 pid 写进了 pidfile，库侧状态也指向它
+    assert_eq!(status(&home), DaemonStatus::Running { pid });
+    let in_file: i32 = fs::read_to_string(home.join("ignis.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("pidfile 应是新守护进程的 pid");
+    assert_eq!(in_file, pid, "pidfile 应被新守护进程换成自己的 pid");
 }
 
 /// 没跑过的时候 `status` 是 Stopped（不创建 pidfile，也不报错）。

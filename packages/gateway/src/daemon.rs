@@ -7,16 +7,23 @@
 //!
 //! `start` 是自守护：以 `setsid` 起一个脱离控制终端的新会话，re-exec 自己
 //! `daemon run --foreground`，stdout/stderr 追加到 `{home}/logs/daemon.log`，环境原样继承
-//! （`IGNIS_*` 覆盖因此跟着过去）；父进程等到 pidfile 里出现活着的 pid 才算成功。
+//! （`IGNIS_*` 覆盖因此跟着过去）；父进程等到 pidfile 里出现**本次拉起的那个子进程自己的 pid**
+//! 才算成功——pidfile 里原有的活 pid 可能是复用来的无关进程，拿它报「已启动」是谎报。超时路径
+//! 会把子进程杀干净（`kill` + `wait`）再报错，绝不留下无人管理的守护进程。
 //!
 //! 停止是幂等的：`stop` 对 SIGTERM 之后的进程最多等 5 秒，仍不退出就升级 SIGKILL；本来就没在
-//! 跑（锁空闲）时直接回 [`StopOutcome::NotRunning`]，不会对可能复用了同一 pid 的无关进程发信号。
+//! 跑（锁空闲）时直接回 [`StopOutcome::NotRunning`]，不会对可能复用了同一 pid 的无关进程发信号；
+//! 收尾只清「仍写着刚停掉那个 pid」的 pidfile，并发 `daemon start` 换上的新 pidfile 不动。
+//!
+//! 「锁被持有但 pid 读不出来」（文件被改坏、刚截断还没写完）只有一种口径：`status` 回
+//! [`DaemonStatus::BadPidfile`]，`start`/`stop`/前台抢锁失败回 [`GatewayError::BadPidfile`]，
+//! 措辞一致地点名 pidfile 不可读——不再各自编出 `Running { pid: 0 }` / `AlreadyRunning { pid: 0 }`。
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -67,8 +74,8 @@ pub enum StopOutcome {
     NotRunning,
 }
 
-/// `status` 的三态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `status` 的四种结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonStatus {
     /// pidfile 的锁被持有 = 守护进程在跑。
     Running { pid: i32 },
@@ -76,6 +83,11 @@ pub enum DaemonStatus {
     Stopped,
     /// pidfile 还在，但锁已经空闲：进程死了没清理（下次 `start` 会覆盖它）。
     StalePidfile,
+    /// 锁被持有，但 pidfile 内容不是合法 pid（被改坏、写入未完成）：认不出是谁在跑。
+    ///
+    /// 这与 `start`/`stop` 的 [`GatewayError::BadPidfile`] 是同一个情形、同一套措辞：宁可说
+    /// 「读不出来」，也不编一个 `pid: 0` 出来。
+    BadPidfile { path: PathBuf },
 }
 
 /// 守护进程 pidfile 路径：`{home}/ignis.pid`。
@@ -92,9 +104,11 @@ fn log_dir(home: &Path) -> PathBuf {
 pub fn status(home: &Path) -> DaemonStatus {
     let path = pid_file(home);
     if !lock_is_free(&path) {
-        // 锁被持有 = 守护进程活着；pid 读不出来只可能是「刚拿到锁、还没写 pid」的窗口
-        return DaemonStatus::Running {
-            pid: read_pid(&path).unwrap_or(0),
+        // 锁被持有 = 守护进程活着；pid 读不出来（刚拿到锁还没写完 / 文件被改坏）时统一报
+        // BadPidfile，而不是谎报一个 `pid: 0`
+        return match locked_pid(&path) {
+            LockedPid::Known(pid) => DaemonStatus::Running { pid },
+            LockedPid::Unreadable => DaemonStatus::BadPidfile { path },
         };
     }
     if path.exists() {
@@ -106,11 +120,14 @@ pub fn status(home: &Path) -> DaemonStatus {
 
 /// 自守护启动：re-exec 自己 `daemon run --foreground`，等 pidfile 就绪后回 pid。
 ///
-/// 已经在跑（pidfile 的锁被持有）时返回 [`GatewayError::AlreadyRunning`]（带 pid），不再起第二个。
+/// 已经在跑时返回 [`GatewayError::AlreadyRunning`]（带 pid，不再起第二个）；锁被持有但 pid 读不
+/// 出来时返回 [`GatewayError::BadPidfile`]——与 `status`/`stop` 同一个口径。
 pub fn start(home: &Path) -> Result<StartOutcome> {
     ensure_home(home)?;
-    if let DaemonStatus::Running { pid } = status(home) {
-        return Err(GatewayError::AlreadyRunning { pid });
+    let pid_path = pid_file(home);
+    // 「锁被持有」的统一判定：pid 可读 → AlreadyRunning{pid}；不可读 → BadPidfile
+    if !lock_is_free(&pid_path) {
+        return Err(locked_pid(&pid_path).into_error(&pid_path));
     }
 
     let log_path = log_dir(home).join(DAEMON_LOG);
@@ -159,33 +176,32 @@ pub fn start(home: &Path) -> Result<StartOutcome> {
         GatewayError::io(format!("拉起守护进程失败（{}）", exe.display()), source)
     })?;
 
-    let pid_path = pid_file(home);
+    // `child.id()` 就是守护进程的 pid：直接 spawn/exec，中间没有包一层。就绪判定必须看到这个
+    // pid——pidfile 里原有的活 pid（SIGKILL 之后被复用到无关进程上的）不是我们起的守护进程。
+    let child_pid = child.id() as i32;
     let deadline = Instant::now() + START_TIMEOUT;
     loop {
-        if let Some(pid) = live_pid(&pid_path) {
+        if is_ready(&pid_path, child_pid) {
             // pidfile 出现之后子进程仍可能因为装配失败（密钥、库、配置）立刻退出：给一个稳定窗口
             std::thread::sleep(SETTLE);
-            if let Some(status) = child
-                .try_wait()
-                .map_err(|source| GatewayError::io("查看守护进程子进程状态失败", source))?
-            {
+            if let Some(status) = poll_child(&mut child)? {
                 return Err(GatewayError::ChildExited {
                     status: status.to_string(),
                     log: log_path,
                 });
             }
-            return Ok(StartOutcome::Started { pid });
+            return Ok(StartOutcome::Started { pid: child_pid });
         }
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|source| GatewayError::io("查看守护进程子进程状态失败", source))?
-        {
+        if let Some(status) = poll_child(&mut child)? {
             return Err(GatewayError::ChildExited {
                 status: status.to_string(),
                 log: log_path,
             });
         }
         if Instant::now() >= deadline {
+            // 超时也要把子进程收干净：`Child` 的 `Drop` 只放手柄，不会杀进程，慢启动的守护进程
+            // 会留在后台无人管理（`start` 已经报失败，谁都不知道它还在跑）
+            reap_child(&mut child);
             return Err(GatewayError::StartTimeout {
                 secs: START_TIMEOUT.as_secs(),
                 path: pid_path,
@@ -198,14 +214,16 @@ pub fn start(home: &Path) -> Result<StartOutcome> {
 /// 停止守护进程：SIGTERM → 最多等 5 秒 → 仍不退就 SIGKILL，最后清掉 pidfile。
 ///
 /// 「在跑」以 pidfile 的锁为准（pid 可能被复用，锁空闲时绝不对无关进程发信号）；本来就没在跑时
-/// 直接回 [`StopOutcome::NotRunning`]，调用方按幂等成功处理。
+/// 直接回 [`StopOutcome::NotRunning`]，调用方按幂等成功处理。锁被持有但 pid 读不出来时回
+/// [`GatewayError::BadPidfile`]（与 `status`/`start` 同一个口径），不会凭猜的 pid 发信号。
 pub fn stop(home: &Path) -> Result<StopOutcome> {
     let path = pid_file(home);
     if lock_is_free(&path) {
         return Ok(StopOutcome::NotRunning);
     }
-    let Some(pid) = read_pid(&path) else {
-        return Err(GatewayError::BadPidfile { path });
+    let pid = match locked_pid(&path) {
+        LockedPid::Known(pid) => pid,
+        LockedPid::Unreadable => return Err(GatewayError::bad_pidfile(&path)),
     };
 
     match signal_process(pid, libc::SIGTERM) {
@@ -224,8 +242,10 @@ pub fn stop(home: &Path) -> Result<StopOutcome> {
             ));
         }
     }
-    // 进程退出时自己会删 pidfile；这里兜底清理（SIGKILL 路径不会跑到 Drop）
-    let _ = fs::remove_file(&path);
+    // 进程退出时自己会删 pidfile；这里兜底清理（SIGKILL 路径不会跑到 Drop），但只删「仍是刚停掉
+    // 那个 pid」的文件——并发 `daemon start` 抢到锁换上的新 pidfile 是它的，抢删会让 `status`
+    // 在守护进程活着时谎报「没在跑」
+    clear_pidfile(&path, pid);
     Ok(StopOutcome::Stopped { pid })
 }
 
@@ -323,6 +343,7 @@ fn build_loop(home: &Path) -> Result<SchedulerLoop> {
 /// 持锁的 pidfile：打开（必要时创建）→ 独占非阻塞 `flock` → 写入自己的 pid；析构删文件。
 ///
 /// 锁随 `_lock` 字段一起释放；先删文件再释放锁也无妨——`status`/`stop` 判定「在跑」看的是锁。
+#[derive(Debug)]
 struct PidFile {
     /// 持有 `flock` 的句柄：本结构体活着期间锁就被它持有（名字带下划线正是因为它只负责「一直
     /// 开着」，没有任何读取点）。
@@ -344,9 +365,8 @@ impl PidFile {
         match flock_exclusive(&file) {
             Ok(()) => {}
             Err(error) if is_would_block(&error) => {
-                return Err(GatewayError::AlreadyRunning {
-                    pid: read_pid(path).unwrap_or(0),
-                });
+                // 锁被持有：与 `start`/`status`/`stop` 同一个口径（pid 可读点名 pid，不可读报坏文件）
+                return Err(locked_pid(path).into_error(path));
             }
             Err(source) => {
                 return Err(GatewayError::io(
@@ -414,6 +434,42 @@ fn read_pid(path: &Path) -> Option<i32> {
     (pid > 0).then_some(pid)
 }
 
+/// 「锁被持有」时 pidfile 的读数：能读出合法 pid，还是不可读（被改坏、刚截断还没写完）。
+enum LockedPid {
+    Known(i32),
+    Unreadable,
+}
+
+impl LockedPid {
+    /// 锁被持有导致的失败原因：pid 可读 → [`GatewayError::AlreadyRunning`]（点名 pid），
+    /// 不可读 → [`GatewayError::BadPidfile`]（说清文件不可读/被改坏）。
+    fn into_error(self, path: &Path) -> GatewayError {
+        match self {
+            LockedPid::Known(pid) => GatewayError::AlreadyRunning { pid },
+            LockedPid::Unreadable => GatewayError::bad_pidfile(path),
+        }
+    }
+}
+
+/// 「锁被持有但 pid 读不出来」的唯一判定。
+///
+/// `status` / `start` / `stop` 以及前台抢锁失败（[`PidFile::acquire`]）都从这里取结论，不再各自
+/// 编一个 `pid: 0` 之类的说法出来。
+fn locked_pid(path: &Path) -> LockedPid {
+    match read_pid(path) {
+        Some(pid) => LockedPid::Known(pid),
+        None => LockedPid::Unreadable,
+    }
+}
+
+/// pidfile 里的活 pid，且必须**正是** `expected`（`start` 刚拉起的那个子进程）。
+///
+/// 只看「有个活 pid」会被 pid 复用骗过：上一次守护进程被 SIGKILL 后，同一 pid 落到无关进程身上，
+/// `start` 就会拿它的 pid 报「已启动」，而守护进程其实没起来。
+fn is_ready(path: &Path, expected: i32) -> bool {
+    live_pid(path) == Some(expected)
+}
+
 /// pidfile 里的 pid，且该 pid 确实是活着的进程。
 fn live_pid(path: &Path) -> Option<i32> {
     let pid = read_pid(path)?;
@@ -451,6 +507,39 @@ fn wait_for_exit(pid: i32, timeout: Duration) -> bool {
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// `stop` 的兜底收尾：只在 pidfile 仍写着「刚停掉的那个 pid」时删它。
+///
+/// 并发 `daemon start` 可能在这段窗口里抢到锁、把文件换成新守护进程的 pid：那已经是它的 pidfile
+/// （它自己退出时会摘），抢删会让 `status` 在新守护进程活着时谎报「没在跑」——它锁着的是一个
+/// 已经不存在的路径，谁也看不见。
+fn clear_pidfile(path: &Path, stopped_pid: i32) {
+    if read_pid(path) == Some(stopped_pid) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// 轮询子进程是否已经退出（`try_wait` 顺带收尸）。
+///
+/// 查询本身失败时也先把子进程收干净再报错：`start` 一旦返回错误，就不能再留一个没人管的守护进程。
+fn poll_child(child: &mut Child) -> Result<Option<ExitStatus>> {
+    match child.try_wait() {
+        Ok(status) => Ok(status),
+        Err(source) => {
+            reap_child(child);
+            Err(GatewayError::io("查看守护进程子进程状态失败", source))
+        }
+    }
+}
+
+/// 收尾一个还没起完的子进程：`kill()` + `wait()`。
+///
+/// `Child` 的 `Drop` 只关句柄、不杀进程，所以超时（以及上面查状态失败）的路径必须显式杀干净并
+/// 收尸：否则「慢启动的守护进程」会留在后台无人管理，而 `start` 已经报了失败。
+fn reap_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[cfg(test)]
@@ -515,12 +604,119 @@ mod tests {
                 pid: std::process::id() as i32
             }
         );
+        // 同一个读数：前台抢锁失败也点名这个 pid（不是编出来的 `pid: 0`）
+        let error = PidFile::acquire(&path).unwrap_err();
+        assert!(
+            matches!(error, GatewayError::AlreadyRunning { pid } if pid == std::process::id() as i32),
+            "{error}"
+        );
 
         // 锁释放（守护进程退出）→ 回到 Stopped/Stale 判定
         drop(holder);
         assert_eq!(status(home.path()), DaemonStatus::StalePidfile);
         fs::remove_file(&path).unwrap();
         assert_eq!(status(home.path()), DaemonStatus::Stopped);
+    }
+
+    /// 「锁被持有但 pid 读不出来」只有一个口径：`status` 报 [`DaemonStatus::BadPidfile`]，
+    /// `stop` 与前台抢锁失败报同一条 [`GatewayError::BadPidfile`]——不再各自编出
+    /// `Running { pid: 0 }` / `AlreadyRunning { pid: 0 }` 与第三种说法。
+    #[test]
+    fn a_locked_but_unreadable_pidfile_is_one_state_everywhere() {
+        let home = TempHome::new("bad-pidfile");
+        let path = pid_file(home.path());
+        // 被改坏（手工清空、写了一半）的 pidfile，同时有人持锁 = 有守护进程在跑但认不出是谁
+        fs::write(&path, "not-a-pid\n").unwrap();
+        let holder = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        flock_exclusive(&holder).unwrap();
+
+        assert_eq!(
+            status(home.path()),
+            DaemonStatus::BadPidfile { path: path.clone() },
+            "status 应报 pidfile 不可读，而不是 Running {{ pid: 0 }}"
+        );
+
+        let error = stop(home.path()).unwrap_err();
+        assert!(
+            matches!(error, GatewayError::BadPidfile { .. }),
+            "stop 应报同一个状态（不猜 pid、不发信号）：{error}"
+        );
+        // 措辞要能指导下一步：点名 pidfile、说清它坏在哪、让人检查/清理后再来
+        let message = error.to_string();
+        assert!(message.contains("pidfile"), "{message}");
+        assert!(message.contains("合法 pid"), "{message}");
+        assert!(
+            message.contains(path.to_string_lossy().as_ref()),
+            "{message}"
+        );
+
+        let error = PidFile::acquire(&path).unwrap_err();
+        assert!(
+            matches!(error, GatewayError::BadPidfile { .. }),
+            "前台抢锁失败也走同一个状态：{error}"
+        );
+        assert_eq!(status(home.path()), DaemonStatus::BadPidfile { path });
+    }
+
+    /// `start` 的就绪判定不能被「pidfile 里有个活 pid」骗过：必须是刚拉起的那个子进程自己的 pid。
+    /// 用 pid 1（一定活着）冒充「SIGKILL 之后复用来的无关进程」。
+    #[test]
+    fn readiness_requires_the_spawned_childs_own_pid() {
+        let home = TempHome::new("readiness");
+        let path = pid_file(home.path());
+        let me = std::process::id() as i32;
+        assert!(process_alive(1), "用例前提：pid 1 是活进程");
+
+        fs::write(&path, "1\n").unwrap();
+        assert!(
+            !is_ready(&path, me),
+            "pidfile 里别人的活 pid 不算就绪（老实现会拿它谎报「已启动」）"
+        );
+
+        fs::write(&path, format!("{me}\n")).unwrap();
+        assert!(is_ready(&path, me), "子进程自己写下的 pid 才算就绪");
+    }
+
+    /// `stop` 的兜底清理不能动「别人的」pidfile：并发 `daemon start` 抢到锁、把文件换成新守护进程
+    /// 的 pid 时，抢删会让 `status` 在新守护进程活着时谎报「没在跑」。
+    #[test]
+    fn stop_cleanup_spares_a_newer_daemons_pidfile() {
+        let home = TempHome::new("stop-cleanup");
+        let path = pid_file(home.path());
+        // 老守护进程（`stop` 刚 SIGTERM 掉的那个）的 pid：用一个「肯定不是本进程」的假 pid，
+        // 才能把「我们停掉的 pid」与「新守护进程的 pid」区分开
+        let stopped = 4242;
+
+        // 并发的 `daemon start` 赢了锁：新守护进程写下自己的 pid 并持有它（真的 PidFile 句柄）
+        let new_daemon = PidFile::acquire(&path).unwrap();
+        clear_pidfile(&path, stopped);
+        assert!(path.exists(), "新守护进程的 pidfile 不能被老 stop 抢删");
+        assert_eq!(read_pid(&path), Some(std::process::id() as i32));
+
+        // 反过来：文件仍是刚停掉的那个 pid（没有新守护进程接手）时，兜底清理照旧
+        drop(new_daemon); // 新守护进程退出时自己摘文件
+        assert!(!path.exists(), "PidFile 的 Drop 会摘掉文件");
+        fs::write(&path, format!("{stopped}\n")).unwrap();
+        clear_pidfile(&path, stopped);
+        assert!(!path.exists(), "仍写着刚停掉的 pid 时兜底删除照旧");
+    }
+
+    /// 超时收尾 `reap_child`：起一个长睡的子进程，收尾之后它必须真的没了（SIGKILL + 收尸）——
+    /// `start` 超时绝不能把慢启动的守护进程留在后台无人管理。僵尸进程在 `kill(pid, 0)` 眼里仍是
+    /// 「活着」，所以这条断言同时证明「杀了」和「收了」。
+    #[test]
+    fn reap_child_kills_and_reaps_the_child() {
+        let mut child = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+        let pid = child.id() as i32;
+        assert!(process_alive(pid), "用例前提：子进程刚起来还活着");
+
+        reap_child(&mut child);
+
+        assert!(!process_alive(pid), "收尾之后不该再有这个进程（含僵尸）");
     }
 
     /// pid 读写的边界：空文件、坏内容、非正整数都不算「活着的 pid」。

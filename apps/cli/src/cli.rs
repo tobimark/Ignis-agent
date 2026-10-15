@@ -211,6 +211,12 @@ async fn run_daemon(command: &DaemonCommand) -> Result<ExitCode> {
             DaemonStatus::Stopped => println!("daemon is not running"),
             // 进程死了没清 pidfile：下一次 start 会覆盖它
             DaemonStatus::StalePidfile => println!("daemon is not running (stale pidfile)"),
+            // 锁被持有但 pid 读不出来（被改坏/写入未完成）：状态无法确认，不拿猜的 pid 冒充
+            // （T6 再统一文案；status 仍只读、退出 0）
+            DaemonStatus::BadPidfile { path } => println!(
+                "daemon state unknown (unreadable pidfile {}): check the file and retry",
+                path.display()
+            ),
         },
         DaemonCommand::Run { .. } => daemon::run_foreground(&home).await?,
     }

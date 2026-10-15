@@ -16,7 +16,7 @@ pub mod r#loop;
 pub mod notify;
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ignis_core::config::ConfigError;
 use ignis_storage::StorageError;
@@ -56,8 +56,13 @@ pub enum GatewayError {
         source: io::Error,
     },
 
-    /// pidfile 存在但内容不是合法 pid（被手工改过、写到一半）。
-    #[error("pidfile 内容不是合法 pid：{path}")]
+    /// pidfile 存在（锁被持有）但内容不是合法 pid：被改坏、写入未完成。
+    ///
+    /// `stop`（没有可信的 pid 可发信号）、`start`（认不出在跑的是谁）与前台抢锁失败共用这一条，
+    /// 与 `status` 的 [`daemon::DaemonStatus::BadPidfile`] 是同一个情形、同一套措辞。
+    #[error(
+        "pidfile 不可读：内容不是合法 pid（{path}）——文件被改坏或写入未完成，先检查（必要时删除）它再重试"
+    )]
     BadPidfile { path: PathBuf },
 
     /// 找不到可用的模型密钥。
@@ -75,6 +80,13 @@ impl GatewayError {
         Self::Io {
             context: context.into(),
             source,
+        }
+    }
+
+    /// 「锁被持有但 pidfile 读不出合法 pid」的唯一构造（`start`/`stop`/前台抢锁共用同一句措辞）。
+    pub(crate) fn bad_pidfile(path: &Path) -> Self {
+        Self::BadPidfile {
+            path: path.to_path_buf(),
         }
     }
 }
