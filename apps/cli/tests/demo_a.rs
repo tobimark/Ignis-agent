@@ -42,24 +42,25 @@ fn demo_a_fixes_broken_project_end_to_end() {
     copy_dir(&fixture_dir(), &project);
 
     let output = ignis_cmd(&home, &project, &model.base_url())
-        // Node ≥21 的默认 reporter 已不再输出 TAP 文案，而断言依赖 `not ok`：显式锁定 tap，
-        // 让「回填了什么」不随 Node 版本漂移。
-        .env("NODE_OPTIONS", "--test-reporter=tap")
         .args(["run", PROMPT, "--yes"])
         .output()
         .expect("ignis 二进制应可执行");
     let text = output_text(&output);
     assert_eq!(output.status.code(), Some(0), "{text}");
 
-    // 终端渲染：两处工具行（DIM 色码在非 tty 下不出现）+ 最终答复
-    assert!(text.contains("→ Reading src/config.js"), "{text}");
-    assert!(text.contains("→ Running: npm test"), "{text}");
+    // 终端渲染：两处工具行（DIM 色码在非 tty 下不出现）+ 最终答复。工具行断言只认 stdout：
+    // stderr 是另一条流，用它替 CLI 的终端渲染背书会把「行没渲染到 stdout」放过去。
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("→ Reading src/config.js"), "{text}");
+    assert!(stdout.contains("→ Running: npm test"), "{text}");
     assert!(text.contains("已修复配置路径，测试通过。"), "{text}");
 
     // 修复真的落在工作区副本上：这份副本自己跑 npm test 也通过
     assert!(run_npm_test(&project).success(), "修复后 npm test 应退出 0");
 
-    // 假模型收到 5 次请求；第 3 次（索引 2）里带着第一次 npm test 的失败输出（工具结果确实回填）
+    // 假模型收到 5 次请求；第 3 次（索引 2）里带着第一次 npm test 的失败输出（工具结果确实回填）。
+    // 失败证据只取 reporter 无关的两个标记：`ENOENT`（Node 报错正文，spec 与 TAP 都照抄）
+    // 与 ignis shell 工具自己的结果头 `exit code: 1`——两者都只在工具结果被回填时才存在。
     let requests = model.requests();
     assert_eq!(requests.len(), 5, "{requests:#?}");
     let messages = requests[2]["messages"]
@@ -68,11 +69,11 @@ fn demo_a_fixes_broken_project_end_to_end() {
     assert!(
         messages.iter().any(|message| {
             message["role"] == "tool"
-                && message["content"]
-                    .as_str()
-                    .is_some_and(|content| content.contains("not ok"))
+                && message["content"].as_str().is_some_and(|content| {
+                    content.contains("ENOENT") && content.contains("exit code: 1")
+                })
         }),
-        "索引 2 的请求应带回失败的测试输出：{messages:#?}"
+        "索引 2 的请求应带回第一次 `npm test` 的失败输出（ENOENT + exit code: 1）：{messages:#?}"
     );
 
     // 审批：只有需要判定的调用留痕（Safe 的 `fs_read` 不记录），全部预授权放行
