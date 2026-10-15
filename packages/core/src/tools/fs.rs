@@ -53,12 +53,11 @@ impl Tool for FsRead {
         let text = String::from_utf8_lossy(&bytes);
         let offset = optional_usize(args, "offset")?;
         let limit = optional_usize(args, "limit")?;
-        let output = if offset.is_none() && limit.is_none() {
-            text.into_owned()
-        } else {
-            line_range(&text, offset.unwrap_or(1), limit, user_path)?
-        };
-        Ok(truncate_output(&output, ctx.limits.tool_output_limit))
+        let output_limit = ctx.limits.tool_output_limit;
+        if offset.is_none() && limit.is_none() {
+            return Ok(truncate_output(&text, output_limit));
+        }
+        line_range(&text, offset.unwrap_or(1), limit, user_path, output_limit)
     }
 }
 
@@ -143,7 +142,7 @@ impl Tool for FsWrite {
                 .map_err(|err| io_failure("创建父目录", user_path, parent, &err))?;
         }
         fs::write(&path, content).map_err(|err| io_failure("写入", user_path, &path, &err))?;
-        Ok(format!("wrote {} bytes to {user_path}", content.len()))
+        Ok(format!("已写入 {} 字节：{user_path}", content.len()))
     }
 }
 
@@ -211,7 +210,7 @@ impl Tool for FsEdit {
             content.replacen(old_string, new_string, 1)
         };
         fs::write(&path, updated).map_err(|err| io_failure("写入", user_path, &path, &err))?;
-        Ok(format!("replaced {matches} occurrence(s) in {user_path}"))
+        Ok(format!("已在 {user_path} 中替换 {matches} 处"))
     }
 }
 
@@ -237,11 +236,14 @@ fn io_failure(action: &str, user_path: &str, path: &Path, err: &io::Error) -> To
 
 /// 截取 `[offset, offset + limit)` 行（1-based）；只展示片段时在尾部提示总行数，
 /// 便于模型继续翻页。
+///
+/// 正文先截断、分页提示后追加：提示必须活过 [`truncate_output`]，否则大页会把总行数吞掉。
 fn line_range(
     text: &str,
     offset: usize,
     limit: Option<usize>,
     user_path: &str,
+    output_limit: usize,
 ) -> Result<String, ToolError> {
     if offset == 0 {
         return Err(ToolError::message(format!(
@@ -258,14 +260,17 @@ fn line_range(
             "offset {offset} 超出文件总行数 {total}：{user_path}"
         )));
     }
-    let end = limit.map_or(total, |limit| (offset - 1 + limit).min(total));
-    let mut output = lines[offset - 1..end].join("\n");
-    if offset > 1 || end < total {
-        output.push_str(&format!(
-            "\n\n[showing lines {offset}-{end} of {total} total]"
-        ));
+    // 模型可给出任意整数（如 limit = u64::MAX）：饱和加法避免 offset - 1 + limit 溢出
+    let end = limit.map_or(total, |limit| (offset - 1).saturating_add(limit).min(total));
+    let body = lines[offset - 1..end].join("\n");
+    if offset == 1 && end == total {
+        // 整页：没有分页提示，正常截断
+        return Ok(truncate_output(&body, output_limit));
     }
-    Ok(output)
+    let footer = format!("\n\n[显示第 {offset}-{end} 行，共 {total} 行]");
+    // 给提示预留配额，保证正文被截断时提示仍然出现
+    let budget = output_limit.saturating_sub(footer.len());
+    Ok(format!("{}{footer}", truncate_output(&body, budget)))
 }
 
 /// 取必填字符串参数；缺失或类型不对都给出可操作的错误。
@@ -418,6 +423,8 @@ mod tests {
             "hi"
         );
         assert!(output.contains("a/b/c.txt"), "{output}");
+        // 工具结果文案为中文（spec description 才用英文）
+        assert!(output.starts_with("已写入 2 字节"), "{output}");
 
         // 覆盖已存在的文件
         env.run(&FsWrite, json!({"path": "a/b/c.txt", "content": "bye"}))
@@ -459,6 +466,7 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "baz bar baz\n");
         assert!(output.contains("a.txt"), "{output}");
+        assert!(output.contains("替换 2 处"), "{output}");
 
         // 0 处匹配同样报错并保持文件原样
         let err = env
@@ -543,7 +551,14 @@ mod tests {
             .run(&FsRead, json!({"path": "a.txt", "offset": 2, "limit": 2}))
             .await
             .unwrap();
-        assert_eq!(output, "l2\nl3\n\n[showing lines 2-3 of 5 total]");
+        assert_eq!(output, "l2\nl3\n\n[显示第 2-3 行，共 5 行]");
+
+        // 只有 offset、读到末尾 → 尾部仍有总行数提示
+        let output = env
+            .run(&FsRead, json!({"path": "a.txt", "offset": 4}))
+            .await
+            .unwrap();
+        assert_eq!(output, "l4\nl5\n\n[显示第 4-5 行，共 5 行]");
 
         // offset 越界 → 错误信息里给出总行数，便于模型改参数
         let err = env
@@ -551,6 +566,60 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains('5'), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fs_read_clamps_extreme_offset_and_limit() {
+        let env = Env::new();
+        std::fs::write(env.path().join("a.txt"), "l1\nl2\nl3\n").unwrap();
+
+        // limit = u64::MAX（模型可给的任意整数）不得触发算术溢出，语义等同「读到末尾」
+        let output = env
+            .run(
+                &FsRead,
+                json!({"path": "a.txt", "offset": 2, "limit": u64::MAX}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output, "l2\nl3\n\n[显示第 2-3 行，共 3 行]");
+
+        // 同样极端的 offset：越界只报错、不 panic
+        let err = env
+            .run(
+                &FsRead,
+                json!({"path": "a.txt", "offset": u64::MAX, "limit": 1}),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains('3'), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fs_read_keeps_the_total_line_footer_on_a_truncated_page() {
+        let env = Env::new();
+        // 60 行 × 4KB ≈ 240KB；请求一页 40 行 ≈ 160KB，远超 tool_output_limit
+        let line = "x".repeat(4096);
+        let content: String = (0..60).map(|_| format!("{line}\n")).collect();
+        std::fs::write(env.path().join("big.txt"), content).unwrap();
+
+        let output = env
+            .run(
+                &FsRead,
+                json!({"path": "big.txt", "offset": 1, "limit": 40}),
+            )
+            .await
+            .unwrap();
+
+        // 正文截断到「上限 - 提示长度」，截断标记之后仍带着总行数提示收尾
+        let footer = "\n\n[显示第 1-40 行，共 60 行]";
+        let budget = env.limits.tool_output_limit - footer.len();
+        let marker = format!("\n… [truncated: output exceeded {budget} bytes]");
+        assert!(
+            output.ends_with(&format!("{marker}{footer}")),
+            "分页提示被截断吞掉，尾部：{}",
+            &output[output.len().saturating_sub(120)..]
+        );
+        assert_eq!(output.len(), budget + marker.len() + footer.len());
     }
 
     #[tokio::test]
