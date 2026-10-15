@@ -3,7 +3,8 @@
 //! [`TaskRunner::run`] 的一次运行：生成 task id → 写 `tasks` 行（`running`）与 JSONL 首行
 //! `task_start` → 用 [`ToolRuntime`] 与 [`prompts::build_system_prompt`] 组装 [`RunRequest`]
 //! → 消费内核事件（每行带 `ts` 且整行过 [`Redactor`] 后落盘，同时转发给 sink、累加用量）
-//! → 终态时 `finish_task` 并补 JSONL `done` 行。
+//! → 终态时 `finish_task` 并补 JSONL 收尾行 `task_end`（与首行 `task_start` 对称；内核自己的
+//! `Done` 事件已落成一行 `done`，收尾行不能与它同名）。
 
 pub mod prompts;
 
@@ -120,6 +121,9 @@ impl TaskRunner {
     ///
     /// 返回 `Err` 只表示记账/落盘这类基础设施失败；内核自身的失败（含取消、触限）都是
     /// `Done` 事件，照常收尾并返回 [`TaskOutcome`]。
+    ///
+    /// 基础设施失败（含事件循环里的落盘失败）也会先把任务行收成 `failed` 再返回 `Err`
+    /// （见 [`TaskRunner::fail_infrastructure`]）：任务行不允许停在 `running`。
     pub async fn run(
         &self,
         req: TaskRequest,
@@ -140,19 +144,50 @@ impl TaskRunner {
             workspace: workspace.display().to_string(),
             started_at: now_millis(),
         })?;
+
+        // 任务行已落库：此后任何基础设施失败（含事件循环里的落盘失败）都要先把这一行收成
+        // 终态，否则 `task list` 会一直显示 running。
+        let mut usage = Usage::default();
+        match self
+            .execute(&log, &task_id, req, sink, cancel, &mut usage)
+            .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => {
+                self.fail_infrastructure(&log, &task_id, &error, usage);
+                Err(error)
+            }
+        }
+    }
+
+    /// 任务行写入之后的一次运行：`task_start` → 消费内核事件（落盘 → 转发 → 记账）→
+    /// `finish_task` + 收尾行 `task_end`。
+    ///
+    /// 与 [`TaskRunner::run`] 分开，是为了让「任务行写入之后的任何 `Err`」都被统一的兜底收尾
+    /// （[`TaskRunner::fail_infrastructure`]）接住：这里每个 `?` 都不会漏掉那一行。
+    async fn execute(
+        &self,
+        log: &TaskLog,
+        task_id: &str,
+        req: TaskRequest,
+        sink: UnboundedSender<RuntimeEvent>,
+        cancel: CancellationToken,
+        usage: &mut Usage,
+    ) -> Result<TaskOutcome, CoreError> {
         self.append_jsonl(
-            &log,
-            &task_id,
+            log,
+            task_id,
             json!({
                 "type": "task_start",
                 "task_id": task_id,
                 "kind": kind_str(req.kind),
-                "kernel": kernel,
-                "workspace": workspace.display().to_string(),
+                "kernel": self.runtime.id(),
+                "workspace": req.workspace.display().to_string(),
             }),
         )?;
 
         // 上下文：历史轮次 + 本轮输入；工具执行器按本次任务（task_id/工作区/上限）装配
+        let workspace = req.workspace.clone();
         let mut messages = req.history;
         messages.push(chat_message(Role::User, req.prompt.clone()));
 
@@ -161,7 +196,7 @@ impl TaskRunner {
             Arc::clone(&self.policy),
             Arc::clone(&self.approvals),
             Arc::clone(&self.db),
-            task_id.clone(),
+            task_id.to_string(),
             workspace.clone(),
             self.config.limits,
             Redactor::new(self.config.api_key.iter().cloned().collect()),
@@ -175,11 +210,10 @@ impl TaskRunner {
         };
 
         // 事件循环：落盘 → 转发给调用方 → 记账，全程保持内核事件顺序
-        let mut usage = Usage::default();
         let mut done = None;
         let mut stream = self.runtime.run(request, cancel).await;
         while let Some(event) = stream.next().await {
-            self.append_jsonl(&log, &task_id, serde_json::to_value(&event)?)?;
+            self.append_jsonl(log, task_id, serde_json::to_value(&event)?)?;
             let _ = sink.send(event.clone());
 
             match &event {
@@ -214,7 +248,7 @@ impl TaskRunner {
             _ => None,
         };
         self.db.finish_task(
-            &task_id,
+            task_id,
             status_str(status),
             summary.as_deref(),
             error.as_deref(),
@@ -223,11 +257,13 @@ impl TaskRunner {
             usage.estimated,
             now_millis(),
         )?;
+        // 收尾行与首行 `task_start` 对称。类型名不能取 `done`：那会与内核 `Done` 事件的落盘行
+        // 同名，回放时被解析成第二个 `RuntimeEvent::Done`，终态与事件无从分辨。
         self.append_jsonl(
-            &log,
-            &task_id,
+            log,
+            task_id,
             json!({
-                "type": "done",
+                "type": "task_end",
                 "task_id": task_id,
                 "status": status_str(status),
                 "summary": summary,
@@ -240,12 +276,41 @@ impl TaskRunner {
             messages.push(chat_message(Role::Assistant, text.clone()));
         }
         Ok(TaskOutcome {
-            id: task_id,
+            id: task_id.to_string(),
             status,
             final_text,
-            usage,
+            usage: *usage,
             messages,
         })
+    }
+
+    /// 基础设施中途失败时的兜底收尾：把已写入的任务行收成 `failed`，再补一条 `task_end`。
+    ///
+    /// 两步都忽略各自的失败——DB 或磁盘本身就是可能的故障源，调用方要的是原始 `Err`；唯一
+    /// 不能接受的结果是任务行停在 `running`。
+    fn fail_infrastructure(&self, log: &TaskLog, task_id: &str, error: &CoreError, usage: Usage) {
+        let message = error.to_string();
+        let _ = self.db.finish_task(
+            task_id,
+            status_str(RunStatus::Failed),
+            None,
+            Some(&message),
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.estimated,
+            now_millis(),
+        );
+        let _ = self.append_jsonl(
+            log,
+            task_id,
+            json!({
+                "type": "task_end",
+                "task_id": task_id,
+                "status": status_str(RunStatus::Failed),
+                "summary": Value::Null,
+                "error": message,
+            }),
+        );
     }
 
     /// 落一行 JSONL。
@@ -384,17 +449,27 @@ mod tests {
 
         /// 跑一次任务，返回结果、sink 转发的事件与落盘行。
         async fn run(&self, req: TaskRequest) -> Report {
-            let (sink, received) = mpsc::unbounded_channel();
-            let outcome = self
-                .runner
-                .run(req, sink, CancellationToken::new())
+            let (outcome, forwarded) = self
+                .run_raw(req)
                 .await
                 .expect("基础设施正常时 run 不应返回 Err");
             Report {
                 outcome,
-                forwarded: drain(received),
+                forwarded,
                 lines: self.log_lines(),
             }
+        }
+
+        /// 跑一次任务，原样透传结果（用于断言基础设施失败路径）。
+        async fn run_raw(
+            &self,
+            req: TaskRequest,
+        ) -> Result<(TaskOutcome, Vec<RuntimeEvent>), CoreError> {
+            let (sink, received) = mpsc::unbounded_channel();
+            self.runner
+                .run(req, sink, CancellationToken::new())
+                .await
+                .map(|outcome| (outcome, drain(received)))
         }
 
         /// 本次运行的日志文件：目录里恰好一个 `.jsonl`。
@@ -440,12 +515,12 @@ mod tests {
                 .collect()
         }
 
-        /// 末行：运行器补的收尾 `done` 行（比内核 `Done` 事件多一个 `task_id`）。
-        fn done_line(&self) -> &Value {
+        /// 末行：运行器补的收尾 `task_end` 行（比内核 `Done` 事件多一个 `task_id`）。
+        fn task_end_line(&self) -> &Value {
             self.lines.last().unwrap()
         }
 
-        /// 倒数第二行：内核 `Done` 事件原样落盘的那一行。
+        /// 倒数第二行：内核 `Done` 事件原样落盘的那一行（`type:"done"`）。
         fn kernel_done_line(&self) -> &Value {
             &self.lines[self.lines.len() - 2]
         }
@@ -560,7 +635,7 @@ mod tests {
         assert!(row.ended_at.unwrap() >= row.started_at);
 
         // JSONL：task_start 打头；中间与内核事件一一对应（含内核的 `Done` 事件）；
-        // 末行是运行器补的收尾 `done`
+        // 末行是运行器补的收尾 `task_end`——不能也叫 `done`，否则会被回放成第二个终态事件
         assert_eq!(
             report.types(),
             [
@@ -571,7 +646,7 @@ mod tests {
                 "tool_result",
                 "usage",
                 "done",
-                "done",
+                "task_end",
             ]
         );
         assert_eq!(report.lines[0]["task_id"], json!(report.outcome.id));
@@ -582,11 +657,14 @@ mod tests {
             json!(env.dir.path().display().to_string())
         );
         assert_eq!(report.lines[1]["text"], json!("Hel"));
+        // 恰好一行 `done`：内核事件原样落盘，不带 `task_id`
+        assert_eq!(report.kernel_done_line()["type"], json!("done"));
         assert_eq!(report.kernel_done_line()["summary"], json!("done"));
         assert!(report.kernel_done_line().get("task_id").is_none());
-        assert_eq!(report.done_line()["task_id"], json!(report.outcome.id));
-        assert_eq!(report.done_line()["status"], json!("success"));
-        assert_eq!(report.done_line()["summary"], json!("done"));
+        assert_eq!(report.task_end_line()["type"], json!("task_end"));
+        assert_eq!(report.task_end_line()["task_id"], json!(report.outcome.id));
+        assert_eq!(report.task_end_line()["status"], json!("success"));
+        assert_eq!(report.task_end_line()["summary"], json!("done"));
         // 每行都带可解析的 RFC 3339 时间戳（`ignis task show` 靠它渲染 HH:MM:SS）
         for line in &report.lines {
             let ts = line["ts"].as_str().unwrap_or_default();
@@ -648,11 +726,14 @@ mod tests {
         assert_eq!(row.summary.as_deref(), Some("half"));
         assert!(row.ended_at.is_some());
 
-        assert_eq!(report.types(), ["task_start", "text_delta", "done", "done"]);
-        assert_eq!(report.done_line()["task_id"], json!(report.outcome.id));
-        assert_eq!(report.done_line()["status"], json!("failed"));
+        assert_eq!(
+            report.types(),
+            ["task_start", "text_delta", "done", "task_end"]
+        );
+        assert_eq!(report.task_end_line()["task_id"], json!(report.outcome.id));
+        assert_eq!(report.task_end_line()["status"], json!("failed"));
         assert!(
-            report.done_line()["error"]
+            report.task_end_line()["error"]
                 .as_str()
                 .unwrap()
                 .contains("boom")
@@ -726,7 +807,7 @@ mod tests {
         // 脱敏只替换密钥，行数与事件序列不受影响
         assert_eq!(
             report.types(),
-            ["task_start", "tool_exec", "tool_result", "done", "done"]
+            ["task_start", "tool_exec", "tool_result", "done", "task_end"]
         );
         assert_eq!(report.lines[1]["summary"], json!("Running: echo ***"));
         assert_eq!(report.lines[1]["args"]["command"], json!("echo ***"));
@@ -758,7 +839,7 @@ mod tests {
             assert_eq!(report.outcome.status, status);
             let row = env.db.get_task(&report.outcome.id).unwrap().unwrap();
             assert_eq!(row.status, name);
-            assert_eq!(report.done_line()["status"], json!(name));
+            assert_eq!(report.task_end_line()["status"], json!(name));
         }
     }
 
@@ -774,12 +855,56 @@ mod tests {
         let report = env.run(env.request("hi")).await;
 
         assert_eq!(report.outcome.status, RunStatus::Failed);
-        assert_eq!(report.types(), ["task_start", "text_delta", "done"]);
-        assert_eq!(report.done_line()["status"], json!("failed"));
+        assert_eq!(report.types(), ["task_start", "text_delta", "task_end"]);
+        assert_eq!(report.task_end_line()["status"], json!("failed"));
         let row = env.db.get_task(&report.outcome.id).unwrap().unwrap();
         assert_eq!(row.status, "failed");
         let error = row.error.as_deref().unwrap();
         assert!(error.contains("done"), "{error}");
         assert!(row.ended_at.is_some());
+    }
+
+    /// 任务行写入之后的基础设施失败（这里：日志目录不可写）也必须把行收成终态。
+    ///
+    /// 首行 `task_start` 就写不进去，正是「`insert_task` 成功、随后 `append_jsonl` 失败」的
+    /// 最小复现：旧实现从这里 `?` 返回，任务行会永远停在 `running`。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unwritable_log_dir_still_fails_the_task_row() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let env = Env::new("readonly-log", vec![success(Some("unreachable"))], None);
+        // 目录先存在再收紧到 0500：`TaskLog::new` 仍能打开（create_dir_all 对已存在目录是
+        // no-op），写第一行时才被拒。
+        fs::create_dir_all(&env.log_dir).unwrap();
+        fs::set_permissions(&env.log_dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = env.run_raw(env.request("write into a read-only dir")).await;
+        // 先恢复权限位，TempDir 析构才能清掉目录（断言失败时也一样）
+        fs::set_permissions(&env.log_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = match result {
+            Ok((outcome, _)) => panic!(
+                "日志目录不可写时 run 必须返回 Err，却成功了：{}",
+                outcome.id
+            ),
+            Err(error) => error,
+        };
+        assert!(matches!(error, CoreError::Storage(_)), "{error}");
+        // 失败点在首行：内核根本没被调用
+        assert!(env.runtime.requests().is_empty());
+        assert_eq!(
+            fs::read_dir(&env.log_dir).unwrap().count(),
+            0,
+            "只读目录里不该落任何日志行"
+        );
+
+        // 任务行绝不能停在 running：状态、错误与结束时间都要落库
+        let rows = env.db.list_tasks(10).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].status, "failed");
+        assert!(rows[0].ended_at.is_some());
+        let message = rows[0].error.as_deref().unwrap();
+        assert!(message.contains("Permission denied"), "{message}");
     }
 }
