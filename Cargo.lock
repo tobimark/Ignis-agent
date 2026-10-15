@@ -581,6 +581,13 @@ dependencies = [
 [[package]]
 name = "ignis-cli"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ignis-core",
+ "ignis-runtime",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "ignis-core"

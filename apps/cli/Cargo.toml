@@ -9,3 +9,8 @@ name = "ignis"
 path = "src/main.rs"
 
 [dependencies]
+ignis-core = { workspace = true }
+ignis-runtime = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
