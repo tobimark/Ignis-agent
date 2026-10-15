@@ -4,5 +4,6 @@ pub mod config;
 pub mod doctor;
 pub mod memory;
 pub mod security;
+pub mod skills;
 pub mod task;
 pub mod tools;
