@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["apps/cli", "packages/core", "packages/runtime", "packages/storage"]
+members = [
+    "apps/cli",
+    "packages/core",
+    "packages/gateway",
+    "packages/runtime",
+    "packages/storage",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,6 +16,7 @@ rust-version = "1.98"
 [workspace.dependencies]
 # 内部 crate 用 path 依赖，成员 crate 以 `{ workspace = true }` 引入
 ignis-core = { path = "packages/core" }
+ignis-gateway = { path = "packages/gateway" }
 ignis-runtime = { path = "packages/runtime" }
 ignis-storage = { path = "packages/storage" }
 clap = { version = "4", features = ["derive"] }

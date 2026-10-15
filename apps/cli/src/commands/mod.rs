@@ -122,6 +122,8 @@ impl Session {
             // 告警投递渠道：CLI 侧先留空组合——告警照常落库与去重（`ignis alerts` 的未读收件箱
             // 就是渠道①），真实渠道（notify-send / 日志 / IM）由 T5 的 gateway 在这里注入
             Arc::new(MultiNotifier::new(Vec::new())),
+            // CLI 交互运行没有 job profile：执行器不包白名单（调度运行由守护进程注入）
+            None,
         );
 
         Ok(Self {
@@ -186,6 +188,8 @@ impl Session {
                     history,
                     kind,
                     workspace: self.workspace.clone(),
+                    // 交互运行没有来源 job（调度运行由守护进程填 job.id）
+                    job_id: None,
                 },
                 sink,
                 cancel,

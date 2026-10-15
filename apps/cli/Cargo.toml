@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 ignis-core = { workspace = true }
+ignis-gateway = { workspace = true }
 ignis-runtime = { workspace = true }
 ignis-storage = { workspace = true }
 anyhow = { workspace = true }

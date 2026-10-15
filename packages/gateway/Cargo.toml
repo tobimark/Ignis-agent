@@ -1,0 +1,19 @@
+[package]
+name = "ignis-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ignis-core = { workspace = true }
+ignis-runtime = { workspace = true }
+ignis-storage = { workspace = true }
+async-trait = { workspace = true }
+libc = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+# 调度循环的单测用 `MockRuntime`（慢内核包在它外面）回放内核事件
+ignis-runtime = { workspace = true, features = ["test-support"] }

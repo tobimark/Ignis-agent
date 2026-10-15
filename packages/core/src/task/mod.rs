@@ -26,17 +26,20 @@ use tokio_util::sync::CancellationToken;
 use crate::alerts::{AlertSink, Notifier};
 use crate::config::Config;
 use crate::memory::MemoryStore;
+use crate::scheduler::JobProfile;
 use crate::security::{Policy, Redactor};
 use crate::skills::SkillCatalog;
 use crate::tools::{
-    SchedulerDeps, ToolRuntime, available_tool_names, default_registry, meta_tools,
+    ProfileExecutor, SchedulerDeps, ToolRuntime, available_tool_names, default_registry, meta_tools,
 };
 
-/// 任务来源：`ignis run` 的一次性运行，或 REPL 的一轮输入。
+/// 任务来源：`ignis run` 的一次性运行、REPL 的一轮输入，或守护进程的调度运行。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskKind {
     Run,
     Repl,
+    /// 调度任务到期后由 `ignis-gateway` 的守护进程发起（T5）。
+    Schedule,
 }
 
 /// `tasks.kind` 与 JSONL `task_start.kind` 的取值。
@@ -44,6 +47,7 @@ fn kind_str(kind: TaskKind) -> &'static str {
     match kind {
         TaskKind::Run => "run",
         TaskKind::Repl => "repl",
+        TaskKind::Schedule => "schedule",
     }
 }
 
@@ -66,6 +70,9 @@ pub struct TaskRequest {
     pub kind: TaskKind,
     /// 工具操作的项目根目录。
     pub workspace: PathBuf,
+    /// 来源调度任务 id：守护进程的调度运行填 `job.id`（透传给本轮工具的
+    /// [`crate::tools::ToolCtx::job_id`]，`notify_user` 的 provenance 靠它）；交互运行为 `None`。
+    pub job_id: Option<String>,
 }
 
 /// 一次任务的结果；`messages` 即下一轮应当带上的上下文。
@@ -114,13 +121,17 @@ pub struct TaskRunner {
     /// 告警投递渠道：每轮任务的 `AlertSink` 用它投递，元工具 `notify_user` 的告警因此真的
     /// 送得出去（真实渠道由 T5 的 gateway 注入；CLI 侧暂时是空组合）。
     notifier: Arc<dyn Notifier>,
+    /// job profile：`Some` 表示这是调度运行（P3 Task 5），本轮执行器会包一层
+    /// [`ProfileExecutor`]，白名单外的工具对模型不可见、调用被拒；`None`（`ignis run` / REPL）
+    /// 时行为与扩展前完全一致。
+    profile: Option<JobProfile>,
 }
 
 impl TaskRunner {
     /// 装配运行器：依赖全部由调用方注入，便于替换内核与审批方。
     ///
     /// 参数较多是计划钉死的构造签名（P2 Task 5 在末尾追加了记忆与技能目录，P3 Task 3 追加了
-    /// 告警渠道），不做参数对象包装。
+    /// 告警渠道，P3 Task 5 追加了 job profile），不做参数对象包装。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: Arc<Db>,
@@ -132,6 +143,7 @@ impl TaskRunner {
         memory: Arc<MemoryStore>,
         skills: Arc<SkillCatalog>,
         notifier: Arc<dyn Notifier>,
+        profile: Option<JobProfile>,
     ) -> Self {
         Self {
             db,
@@ -144,6 +156,7 @@ impl TaskRunner {
             memory,
             skills,
             notifier,
+            profile,
         }
     }
 
@@ -259,7 +272,7 @@ impl TaskRunner {
         ) {
             registry.register(tool);
         }
-        let executor = Arc::new(ToolRuntime::new(
+        let tool_runtime = Arc::new(ToolRuntime::new(
             registry,
             Arc::clone(&self.policy),
             Arc::clone(&self.approvals),
@@ -268,9 +281,21 @@ impl TaskRunner {
             workspace.clone(),
             self.config.limits,
             Redactor::new(self.config.api_key.iter().cloned().collect()),
-            // 来源 job id 由 T5 的调度循环经 `TaskRequest` 透传；交互运行没有 job
-            None,
+            // 来源 job id 由守护进程的调度循环经 `TaskRequest` 透传；交互运行没有 job
+            req.job_id.clone(),
         ));
+        // 调度运行（`Some(profile)`）：job 的 profile 白名单是执行边界，包在真实执行器外面——
+        // `executor.specs()`（工具表与 system prompt）已经过滤，白名单外的调用在本轮到达内层之前
+        // 就被拒并留痕；`None`（`ignis run` / REPL）原样交给内核，行为与扩展前一致。
+        let executor: Arc<dyn ToolExecutor> = match &self.profile {
+            Some(profile) => Arc::new(ProfileExecutor::new(
+                tool_runtime,
+                profile.tools.iter().cloned().collect(),
+                Arc::clone(&self.db),
+                task_id.to_string(),
+            )),
+            None => tool_runtime,
+        };
         let request = RunRequest {
             messages: messages.clone(),
             system_prompt: prompts::build_system_prompt(
@@ -467,6 +492,7 @@ mod tests {
     use super::*;
     use crate::alerts::test_support::RecordingNotifier;
     use crate::memory::FactScope;
+    use crate::scheduler::parse_profile;
     use crate::security::ApprovalMode;
 
     /// 单个测试独占的临时目录：工作区、日志与真实 DB 文件都在里面，析构时清理。
@@ -510,6 +536,16 @@ mod tests {
 
     impl Env {
         fn new(label: &str, events: Vec<RuntimeEvent>, api_key: Option<&str>) -> Self {
+            Self::with_profile(label, events, api_key, None)
+        }
+
+        /// 带 job profile 的环境：调度运行的 profile 白名单执行器靠它。
+        fn with_profile(
+            label: &str,
+            events: Vec<RuntimeEvent>,
+            api_key: Option<&str>,
+            profile: Option<JobProfile>,
+        ) -> Self {
             let dir = TempDir::new(label);
             let log_dir = dir.path().join("logs");
             let db = Arc::new(Db::open(&dir.path().join("ignis.db")).unwrap());
@@ -546,6 +582,7 @@ mod tests {
                 // 投递链路本身由 `notify_user_delivers_through_the_runner_injected_channel`
                 // 用真内核 + 假模型端到端钉住
                 Arc::new(RecordingNotifier::new()),
+                profile,
             );
             Self {
                 dir,
@@ -570,6 +607,7 @@ mod tests {
                 history: Vec::new(),
                 kind: TaskKind::Run,
                 workspace: workspace.to_path_buf(),
+                job_id: None,
             }
         }
 
@@ -1153,6 +1191,51 @@ mod tests {
         );
     }
 
+    /// 调度运行（`TaskRunner::new` 收 `Some(profile)`）：job 的 profile 白名单是执行边界——
+    /// 白名单外的工具不该出现在内核看到的工具表里（system prompt 的工具清单由
+    /// `executor.specs()` 组装），`ignis run` / REPL（`None`）则保持原样。
+    #[tokio::test]
+    async fn a_job_profile_limits_the_tools_the_kernel_sees() {
+        let profile = parse_profile(r#"{"tools":["fs_read"],"risk":"elevated"}"#).unwrap();
+        let env = Env::with_profile("profile", vec![success(Some("done"))], None, Some(profile));
+
+        let report = env.run(env.request("读一下配置")).await;
+
+        assert_eq!(report.outcome.status, RunStatus::Success);
+        let prompts = env.system_prompts();
+        assert_eq!(prompts.len(), 1);
+        let prompt = &prompts[0];
+        // 工具表由 `executor.specs()` 组装：白名单外的一个都不出现
+        let tools_line = prompt
+            .lines()
+            .find(|line| line.starts_with("Available tools: "))
+            .unwrap_or_else(|| panic!("工具表缺失：{prompt}"));
+        assert_eq!(tools_line, "Available tools: fs_read");
+        for hidden in [
+            "fs_list",
+            "fs_write",
+            "fs_edit",
+            "shell_run",
+            "http_fetch",
+            "notify_user",
+            "schedule_create",
+        ] {
+            assert!(
+                !prompt.contains(hidden),
+                "白名单外的 {hidden} 不该可见：{prompt}"
+            );
+        }
+
+        // 无 profile 的交互运行仍是全部工具：扩展不改旧行为
+        let plain = Env::new("no-profile", vec![success(Some("done"))], None);
+        let report = plain.run(plain.request("读一下配置")).await;
+        assert_eq!(report.outcome.status, RunStatus::Success);
+        let prompt = &plain.system_prompts()[0];
+        assert!(prompt.contains("fs_write"), "{prompt}");
+        assert!(prompt.contains("shell_run"), "{prompt}");
+        assert!(prompt.contains("notify_user"), "{prompt}");
+    }
+
     /// A/B 工作区隔离经完整注入链再验一遍：B 的 project 事实不会出现在 A 的 system prompt 里。
     #[tokio::test]
     async fn workspace_isolation_holds_through_the_runner() {
@@ -1240,7 +1323,8 @@ mod tests {
         assert_eq!(report.outcome.skills_used, ["server-health"]);
     }
 
-    /// 端到端：`TaskRunner` 构造期注入的记录型渠道必须真的收到 `notify_user` 的投递。
+    /// 端到端：`TaskRunner` 构造期注入的记录型渠道必须真的收到 `notify_user` 的投递；
+    /// 调度运行（`TaskRequest.job_id`）的来源 job id 一路透传到 `ToolCtx` 与告警来源。
     ///
     /// 只把模型换成脚本化假模型（[`ScriptedModel`]）：任务编排、native 内核、工具执行器、告警
     /// 落库与投递全是生产代码。内核必须是真内核——[`MockRuntime`] 只回放事件、不会真的执行
@@ -1286,6 +1370,8 @@ mod tests {
             MemoryStore::new(Arc::clone(&db), dir.path().join("memory")),
             SkillCatalog::load(&dir.path().join("skills")),
             channel,
+            // 本次按调度运行的形状发起：job id 由守护进程透传
+            None,
         );
 
         let (sink, _received) = mpsc::unbounded_channel();
@@ -1294,8 +1380,9 @@ mod tests {
                 TaskRequest {
                     prompt: "检查磁盘".into(),
                     history: Vec::new(),
-                    kind: TaskKind::Run,
+                    kind: TaskKind::Schedule,
                     workspace: dir.path().to_path_buf(),
+                    job_id: Some("job-7".into()),
                 },
                 sink,
                 CancellationToken::new(),
@@ -1303,8 +1390,11 @@ mod tests {
             .await
             .expect("端到端运行不应返回 Err");
         assert_eq!(outcome.status, RunStatus::Success);
+        // 调度运行的 tasks.kind 是 `schedule`
+        let task_row = db.get_task(&outcome.id).unwrap().expect("任务行");
+        assert_eq!(task_row.kind, "schedule");
 
-        // 渠道收到的就是落库的那一行，来源是本次运行的任务
+        // 渠道收到的就是落库的那一行，来源是本次运行的任务 + 透传进来的 job
         let delivered = notifier.alerts();
         assert_eq!(delivered.len(), 1, "注入的渠道应恰好收到一次投递");
         let rows = db.list_alerts(true, 10).unwrap();
@@ -1317,13 +1407,19 @@ mod tests {
                 delivered[0].body.as_deref(),
                 delivered[0].source_job_id.as_deref(),
             ),
-            ("warning", "磁盘 92%", Some("根分区 92%（阈值 85%）"), None)
+            (
+                "warning",
+                "磁盘 92%",
+                Some("根分区 92%（阈值 85%）"),
+                Some("job-7")
+            )
         );
         assert_eq!(
             delivered[0].source_task_id.as_deref(),
             Some(outcome.id.as_str())
         );
-        assert_eq!(delivered[0].dedup_key, format!("{}:磁盘 92%", outcome.id));
+        // 去重键的来源以 job 为准：同一次调度运行的 notify_user 与失败告警共用一把键
+        assert_eq!(delivered[0].dedup_key, "job-7:磁盘 92%");
 
         // 工具结果也回到了模型手里：native 内核第二次请求带 `tool` 消息，回执逐字
         let requests = model.requests();

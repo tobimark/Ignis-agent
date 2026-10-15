@@ -694,6 +694,7 @@ dependencies = [
  "async-trait",
  "clap",
  "ignis-core",
+ "ignis-gateway",
  "ignis-runtime",
  "ignis-storage",
  "rusqlite",
@@ -721,6 +722,20 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
+]
+
+[[package]]
+name = "ignis-gateway"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ignis-core",
+ "ignis-runtime",
+ "ignis-storage",
+ "libc",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
