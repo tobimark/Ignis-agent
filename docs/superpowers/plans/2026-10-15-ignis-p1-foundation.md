@@ -706,7 +706,7 @@ git commit -m "feat(runtime): 实现 native 执行循环（工具回填、上限
   - `async fn run(&self, req: TaskRequest, sink: UnboundedSender<RuntimeEvent>, cancel: CancellationToken) -> Result<TaskOutcome, CoreError>`
   - `TaskRequest { prompt: String, history: Vec<ChatMessage>, kind: TaskKind /*Run|Repl*/, workspace: PathBuf }`；`TaskOutcome { id: String, status: RunStatus, final_text: Option<String>, usage: Usage, messages: Vec<ChatMessage> }`
   - `prompts::build_system_prompt(workspace: &Path, tools: &[ToolSpec]) -> String`（英文、简洁：人格一行 + 工作区路径 + 工具使用要求 + “用用户的语言回答”）
-  - 行为：任务开始写 `tasks` 行（status=running）+ JSONL 首行 `{"type":"task_start",...}`；每个 `RuntimeEvent` 序列化为 JSONL 行（`redactor.redact` 后写入）并转发给 sink；`Usage` 累加；结束时 `finish_task` + JSONL `done` 行。
+  - 行为：任务开始写 `tasks` 行（status=running）+ JSONL 首行 `{"type":"task_start",...}`；每个 `RuntimeEvent` 序列化为 JSONL 行（`redactor.redact` 后写入）并转发给 sink；`Usage` 累加；结束时 `finish_task` + JSONL `task_end` 收尾行（内核自己的 `Done` 行保持不变；任何中途 Err 须先 best-effort 把行收成 failed 再上抛）。
 
 - [ ] **Step 1: 写失败测试（MockRuntime + 临时目录）**
 
@@ -906,7 +906,7 @@ module.exports = { loadConfig };
 - [ ] **Step 2: 写 `demo_a.rs`（Demo A 端到端）**
 
 脚本（假模型 5 步）：① `ToolCalls(fs_read{path:"src/config.js"})` ② `ToolCalls(shell_run{command:"npm test"})` ③ `ToolCalls(fs_edit{path:"src/config.js", old_string:"'..', '..'", new_string:"'..'"})` ④ `ToolCalls(shell_run{command:"npm test"})` ⑤ `Text("已修复配置路径，测试通过。")`。
-断言：二进制退出码 0；stdout 含 `→ Reading src/config.js` 与 `→ Running: npm test`；复制出的临时工作区里 `npm test` 退出码 0；`requests().len()==5` 且第 3 个请求（索引 2）的消息里含 `role=="tool"` 且内容含 `"not ok"`（工具结果确实回填）；`approvals` 中该任务恰有 3 条 `allow/preauthorized`（fs_edit + 两次 shell_run，fs_read 为 Safe 不记录）；JSONL 存在且 `!contains("test-key")`。
+断言：二进制退出码 0；stdout 含 `→ Reading src/config.js` 与 `→ Running: npm test`；复制出的临时工作区里 `npm test` 退出码 0；`requests().len()==5` 且第 3 个请求（索引 2）的消息里含 `role=="tool"` 且内容含 `ENOENT` 与 `exit code: 1`（reporter 无关的失败证据；Node ≥21 默认 spec reporter 下不再出现 `not ok`）（工具结果确实回填）；`approvals` 中该任务恰有 3 条 `allow/preauthorized`（fs_edit + 两次 shell_run，fs_read 为 Safe 不记录）；JSONL 存在且 `!contains("test-key")`。
 
 - [ ] **Step 3: 写 `approval_modes.rs`（fail-closed 与危险命令阶梯）**
 
