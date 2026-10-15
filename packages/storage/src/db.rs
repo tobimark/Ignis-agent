@@ -20,6 +20,14 @@ pub enum StorageError {
     /// 试图收尾一个不存在的任务行。
     #[error("task not found: {0}")]
     TaskNotFound(String),
+    /// 试图读改一条不存在的事实行。
+    #[error("fact not found: {0}")]
+    FactNotFound(i64),
+    /// 数据库的 schema 版本高于本程序已知的迁移数（被更新版本的 ignis 升级过）。
+    #[error(
+        "数据库版本过新：user_version={found}，本程序只支持 {supported} 个迁移（请升级 ignis）"
+    )]
+    SchemaTooNew { found: i64, supported: usize },
 }
 
 pub(crate) type Result<T> = std::result::Result<T, StorageError>;
@@ -47,7 +55,10 @@ impl Db {
 
     /// 设置连接级 PRAGMA 并应用迁移。
     fn prepare(conn: Connection) -> Result<Db> {
-        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
+        // busy_timeout：CLI 与 daemon 共库时，写锁冲突等 5s 再报错，而不是立刻失败
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;",
+        )?;
         migrate(&conn)?;
         Ok(Db {
             conn: Mutex::new(conn),
@@ -111,7 +122,9 @@ mod tests {
         let db = Db::open(&path).unwrap();
         assert!(table_exists(&db, "tasks"));
         assert!(table_exists(&db, "approvals"));
-        assert_eq!(user_version(&db), 1);
+        assert!(table_exists(&db, "facts"));
+        assert!(table_exists(&db, "facts_fts"));
+        assert_eq!(user_version(&db), 2);
         drop(db);
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -136,7 +149,7 @@ mod tests {
 
         // 第二次打开同一路径：迁移已是 no-op，既有数据仍在。
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 1);
+        assert_eq!(user_version(&db), 2);
         assert!(db.get_task("01").unwrap().is_some());
         drop(db);
 
@@ -180,7 +193,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         assert!(table_exists(&db, "tasks"));
         assert!(table_exists(&db, "approvals"));
-        assert_eq!(user_version(&db), 1);
+        assert_eq!(user_version(&db), 2);
         assert!(db.list_tasks(10).unwrap().is_empty());
     }
 }

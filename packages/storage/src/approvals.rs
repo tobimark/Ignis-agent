@@ -51,19 +51,19 @@ impl Db {
     /// 追加一条审批记录（无论放行还是拒绝都要留痕）。
     pub fn insert_approval(&self, a: &NewApproval) -> Result<()> {
         self.with_conn(|c| {
-            c.execute(
+            c.prepare_cached(
                 "INSERT INTO approvals (task_id, tool, summary, risk, decision, mode, decided_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    a.task_id,
-                    a.tool,
-                    a.summary,
-                    a.risk,
-                    a.decision,
-                    a.mode,
-                    a.decided_at
-                ],
-            )?;
+            )?
+            .execute(params![
+                a.task_id,
+                a.tool,
+                a.summary,
+                a.risk,
+                a.decision,
+                a.mode,
+                a.decided_at
+            ])?;
             Ok(())
         })
     }
@@ -73,7 +73,7 @@ impl Db {
         let sql =
             format!("SELECT {APPROVAL_COLUMNS} FROM approvals WHERE task_id = ?1 ORDER BY id ASC");
         self.with_conn(|c| {
-            let mut stmt = c.prepare(&sql)?;
+            let mut stmt = c.prepare_cached(&sql)?;
             let rows = stmt.query_map(params![task_id], row_to_approval)?;
             rows.collect()
         })

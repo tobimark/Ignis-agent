@@ -2,8 +2,9 @@
 //!
 //! 出网请求必须可预期：只允许 `http`/`https`，重定向至多 3 跳，单次请求（建连 + 读完响应体）
 //! 有总时限（默认 30s，测试用 `HttpFetch::with_timeout` 收窄）。响应体流式读取：读满
-//! `limits.http_max_bytes` 就停下，余量既不进内存也不落盘，输出里以截断标记标明；字节一律
-//! 按 lossy UTF-8 解码，二进制响应不会 panic。
+//! `limits.http_max_bytes` 就停下，余量既不进内存也不落盘；组装好的输出再按
+//! `limits.tool_output_limit` 收口，单次抓取因此不会撑爆上下文预算。字节一律按 lossy UTF-8
+//! 解码，二进制响应不会 panic。
 
 use std::time::Duration;
 
@@ -14,7 +15,7 @@ use reqwest::redirect::Policy;
 use reqwest::{Client, Method, Request, Response, StatusCode, Url};
 use serde_json::{Value, json};
 
-use super::util::{optional_str, required_str};
+use super::util::{optional_str, required_str, truncate_output};
 use super::{Tool, ToolCtx, ToolError};
 
 /// 建连超时（brief 钉死 10s）。
@@ -102,7 +103,11 @@ impl Tool for HttpFetch {
                 self.timeout
             ))),
             Ok(Err(err)) => Err(ToolError::message(format!("请求失败：{url}：{err}"))),
-            Ok(Ok(fetched)) => Ok(render_output(&fetched, max_bytes)),
+            Ok(Ok(fetched)) => Ok(render_output(
+                &fetched,
+                max_bytes,
+                ctx.limits.tool_output_limit,
+            )),
         }
     }
 }
@@ -188,11 +193,13 @@ async fn read_body(
     Ok((body, truncated))
 }
 
-/// 组装输出：`status: {n}\ncontent-type: {t}\n{body 截断至 http_max_bytes}`。
+/// 组装输出：`status: {n}\ncontent-type: {t}\n{body}`。
 ///
-/// lossy 解码可能让文本长于原始字节（非法字节 → 3 字节的 U+FFFD），所以这里也按上限裁到
-/// 字符边界；读取时被截断、或解码后仍超出上限，都在尾部留截断标记。
-fn render_output(fetched: &Fetched, max_bytes: usize) -> String {
+/// 两层上限各管一件事：读体在 `http_max_bytes` 处停手（内存上限，超出时留一句读截断标记），
+/// 组装好的整段再经 [`truncate_output`] 收到 `output_limit` 以内（上下文预算，用标准截断
+/// 标记）。读上限的标记本身也会被输出上限裁掉，那是预期：对调用方而言有用的信息只有「还有
+/// 更多内容」。
+fn render_output(fetched: &Fetched, max_bytes: usize, output_limit: usize) -> String {
     let content_type = fetched.content_type.as_deref().unwrap_or("unknown");
     let mut output = format!(
         "status: {}\ncontent-type: {content_type}\n",
@@ -207,7 +214,7 @@ fn render_output(fetched: &Fetched, max_bytes: usize) -> String {
     if fetched.truncated || end < text.len() {
         output.push_str(&format!("\n… [truncated: body exceeded {max_bytes} bytes]"));
     }
-    output
+    truncate_output(&output, output_limit)
 }
 
 #[cfg(test)]
@@ -388,7 +395,8 @@ mod tests {
         output[start..].to_string()
     }
 
-    /// 5MB 响应：只读到上限就停，输出带上截断标记，绝不把余量拉进内存。
+    /// 5MB 响应：读体只到 `http_max_bytes` 就停下（内存上限），渲染结果再经
+    /// `tool_output_limit` 截断——单次抓取永远攒不出超过上下文的输出。
     #[tokio::test]
     async fn fetches_and_caps_body() {
         let server = FakeServer::start(|_| {
@@ -403,16 +411,49 @@ mod tests {
         let header = "status: 200\ncontent-type: text/plain\n";
         assert!(output.starts_with(header), "输出头不对：{}", head(&output));
         assert!(output.contains("[truncated"), "输出应带截断标记");
-        let body = &output[header.len()..];
-        let cap = limits.http_max_bytes;
-        let marker = format!("\n… [truncated: body exceeded {cap} bytes]");
+        let limit = limits.tool_output_limit;
+        let marker = format!("\n… [truncated: output exceeded {limit} bytes]");
         assert!(
-            body.ends_with(&marker),
+            output.ends_with(&marker),
             "截断标记缺失，尾部：{}",
-            tail(body)
+            tail(&output)
         );
-        // 上限 + 标记，多一个字节都说明把 5MB 全读了
-        assert_eq!(body.len(), cap + marker.len());
+        // 整段输出（含头部）收在上限 + 标记之内：1MB 的读缓冲进不了上下文
+        assert_eq!(output.len(), limit + marker.len());
+        let body = &output[header.len()..];
+        assert_eq!(
+            body,
+            format!("{}{marker}", "x".repeat(limit - header.len()))
+        );
+    }
+
+    /// 响应体没到 `http_max_bytes`、但渲染结果超过 `tool_output_limit`：
+    /// 走标准截断标记，且不带读上限的专用标记。
+    #[tokio::test]
+    async fn output_is_capped_at_tool_output_limit() {
+        let server = FakeServer::start(|_| raw_response("200 OK", "text/plain", &vec![b'y'; 4096]));
+        let limits = Limits {
+            tool_output_limit: 128,
+            http_max_bytes: 4096,
+            ..Limits::default()
+        };
+
+        let output = run(&HttpFetch::new(), &server.url("/mid"), json!({}), &limits)
+            .await
+            .unwrap();
+
+        let header = "status: 200\ncontent-type: text/plain\n";
+        let limit = limits.tool_output_limit;
+        let marker = format!("\n… [truncated: output exceeded {limit} bytes]");
+        assert_eq!(
+            output,
+            format!("{header}{}{marker}", "y".repeat(limit - header.len()))
+        );
+        assert!(
+            !output.contains("body exceeded"),
+            "读上限没触发，不该出现读截断标记：{}",
+            tail(&output)
+        );
     }
 
     /// 非 UTF-8 响应体：lossy 解码，不 panic。

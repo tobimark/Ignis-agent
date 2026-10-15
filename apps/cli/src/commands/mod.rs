@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
-use ignis_core::config::{Config, ignis_home, load_config};
+use ignis_core::config::{Config, ensure_home, ignis_home, load_config};
 use ignis_core::security::{ApprovalMode, Policy};
 use ignis_core::task::{TaskKind, TaskOutcome, TaskRequest, TaskRunner};
 use ignis_runtime::native::NativeRuntime;
@@ -42,6 +42,8 @@ impl Session {
     pub fn new(cli: &Cli) -> Result<Self> {
         // 配置里的 api_key 已被 IGNIS_API_KEY 覆盖过，这里只是读出生效值
         let home = ignis_home();
+        // 数据目录先落地（新建时 0700）：密钥、任务库与日志都在它下面
+        ensure_home(&home)?;
         let mut config: Config = load_config(&home)?;
 
         let workspace = cli

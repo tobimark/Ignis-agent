@@ -89,6 +89,13 @@ pub enum ConfigError {
         #[source]
         source: io::Error,
     },
+    /// 创建数据目录（`IGNIS_HOME` 或 `~/.ignis`）失败，例如同名路径是个文件。
+    #[error("创建数据目录失败：{}：{source}", .path.display())]
+    Home {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     /// 配置序列化失败（例如路径含无法编码的字节）。
     #[error("配置序列化失败：{source}")]
     Serialize {
@@ -116,6 +123,32 @@ fn home_from(get: impl Fn(&str) -> Option<String>) -> PathBuf {
 /// 配置文件路径：`{home}/{config.json}`。
 pub fn config_path(home: &Path) -> PathBuf {
     home.join(CONFIG_FILE)
+}
+
+/// 确保数据目录存在：缺失时创建（unix 下落到 0700），已存在时**不动**它的权限。
+///
+/// 目录里会同时放密钥（`config.json`）、任务库与日志，所以新建时按 0700 落地；已存在的
+/// 目录不收紧——用户自己给过什么权限就保持什么，升级不改变既有安装的行为。
+pub fn ensure_home(home: &Path) -> Result<(), ConfigError> {
+    if home.is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(home).map_err(|source| ConfigError::Home {
+        path: home.to_path_buf(),
+        source,
+    })?;
+    // umask 只会收窄 mode，这里显式再落一次，保证新建目录就是 0700
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(home, fs::Permissions::from_mode(0o700)).map_err(|source| {
+            ConfigError::Home {
+                path: home.to_path_buf(),
+                source,
+            }
+        })?;
+    }
+    Ok(())
 }
 
 /// 加载配置：缺失文件（含 home 目录尚未创建）用默认值，随后应用环境变量覆盖。
@@ -458,6 +491,55 @@ mod tests {
 
         save_config(&home, &Config::default()).unwrap();
         assert!(home.join(CONFIG_JSON).is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_home_creates_a_missing_dir_with_0700() {
+        let base = TempHome::new("ensure-missing");
+        let home = base.path().join("nested/ignis-home");
+        assert!(!home.exists());
+
+        ensure_home(&home).unwrap();
+
+        assert!(home.is_dir());
+        // 数据目录里有密钥与任务日志：新建时必须是 0700
+        assert_eq!(mode(&home), 0o700);
+    }
+
+    #[test]
+    fn ensure_home_is_idempotent() {
+        let home = TempHome::new("ensure-twice");
+        ensure_home(home.path()).unwrap();
+        // 已存在时是 no-op：再调一次仍 Ok，目录还在
+        ensure_home(home.path()).unwrap();
+        assert!(home.path().is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_home_leaves_an_existing_dir_permission_alone() {
+        let home = TempHome::new("ensure-existing");
+        set_mode(home.path(), 0o755);
+
+        ensure_home(home.path()).unwrap();
+
+        // 不收紧既有目录：用户自己给过什么权限就保持什么
+        assert_eq!(mode(home.path()), 0o755);
+    }
+
+    #[test]
+    fn ensure_home_reports_something_in_the_way() {
+        let base = TempHome::new("ensure-blocked");
+        let home = base.path().join("ignis");
+        fs::write(&home, "not a directory").unwrap();
+
+        let err = ensure_home(&home).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::Home { path, .. } if path == &home),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("ignis"), "err: {err}");
     }
 
     #[test]

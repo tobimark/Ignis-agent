@@ -84,21 +84,21 @@ impl Db {
         ended_at: i64,
     ) -> Result<()> {
         let updated = self.with_conn(|c| {
-            c.execute(
+            c.prepare_cached(
                 "UPDATE tasks SET status = ?1, summary = ?2, error = ?3, input_tokens = ?4,
                  output_tokens = ?5, usage_estimated = ?6, ended_at = ?7
                  WHERE id = ?8",
-                params![
-                    status,
-                    summary,
-                    error,
-                    input_tokens as i64,
-                    output_tokens as i64,
-                    usage_estimated,
-                    ended_at,
-                    id,
-                ],
-            )
+            )?
+            .execute(params![
+                status,
+                summary,
+                error,
+                input_tokens as i64,
+                output_tokens as i64,
+                usage_estimated,
+                ended_at,
+                id,
+            ])
         })?;
         if updated == 0 {
             return Err(StorageError::TaskNotFound(id.to_string()));
@@ -109,7 +109,10 @@ impl Db {
     /// 按 id 读取任务行。
     pub fn get_task(&self, id: &str) -> Result<Option<TaskRecord>> {
         let sql = format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1");
-        self.with_conn(|c| c.query_row(&sql, params![id], row_to_task).optional())
+        self.with_conn(|c| {
+            let mut stmt = c.prepare_cached(&sql)?;
+            stmt.query_row(params![id], row_to_task).optional()
+        })
     }
 
     /// 最近的任务行：按 `started_at` 倒序，最多 `limit` 条。
@@ -117,7 +120,7 @@ impl Db {
         let sql =
             format!("SELECT {TASK_COLUMNS} FROM tasks ORDER BY started_at DESC, id DESC LIMIT ?1");
         self.with_conn(|c| {
-            let mut stmt = c.prepare(&sql)?;
+            let mut stmt = c.prepare_cached(&sql)?;
             let rows = stmt.query_map(params![limit as i64], row_to_task)?;
             rows.collect()
         })
