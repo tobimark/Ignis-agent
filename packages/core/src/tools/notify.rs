@@ -231,6 +231,31 @@ mod tests {
         assert_eq!(env.notifier.calls(), 1);
     }
 
+    /// 标题的首尾空白不进库、不进键、也不进回执：`"  磁盘满了  "` 与 `"磁盘满了"` 是同一条告警。
+    #[tokio::test]
+    async fn a_padded_title_is_trimmed_in_the_result_and_the_row() {
+        let env = Env::new();
+
+        let first = env
+            .call(json!({"severity": "warning", "title": "  磁盘满了  "}))
+            .await
+            .unwrap();
+        assert_eq!(first, "已发送告警（warning）：磁盘满了");
+        let rows = env.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "磁盘满了");
+        assert_eq!(rows[0].dedup_key, "task-1:磁盘满了");
+
+        // 换一种写法（不带空白）再报一次：同键 → 去重，回执里也是裁过的标题
+        let second = env
+            .call(json!({"severity": "warning", "title": "磁盘满了"}))
+            .await
+            .unwrap();
+        assert_eq!(second, "告警已去重（磁盘满了，冷却中）");
+        assert_eq!(env.rows().len(), 1);
+        assert_eq!(env.notifier.calls(), 1);
+    }
+
     /// 渠道失败不改结果文案：告警已经落进收件箱，模型看到的就是「已发送」。
     #[tokio::test]
     async fn a_failing_channel_still_reports_the_alert_as_sent() {

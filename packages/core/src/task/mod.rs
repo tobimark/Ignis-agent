@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
-use crate::alerts::{AlertSink, MultiNotifier};
+use crate::alerts::{AlertSink, Notifier};
 use crate::config::Config;
 use crate::memory::MemoryStore;
 use crate::security::{Policy, Redactor};
@@ -109,12 +109,16 @@ pub struct TaskRunner {
     memory: Arc<MemoryStore>,
     /// 技能目录：组装期注入目录（渐进披露第一步），元工具 `load_skill` 读正文。
     skills: Arc<SkillCatalog>,
+    /// 告警投递渠道：每轮任务的 `AlertSink` 用它投递，元工具 `notify_user` 的告警因此真的
+    /// 送得出去（真实渠道由 T5 的 gateway 注入；CLI 侧暂时是空组合）。
+    notifier: Arc<dyn Notifier>,
 }
 
 impl TaskRunner {
     /// 装配运行器：依赖全部由调用方注入，便于替换内核与审批方。
     ///
-    /// 参数较多是计划钉死的构造签名（P2 Task 5 在末尾追加了记忆与技能目录），不做参数对象包装。
+    /// 参数较多是计划钉死的构造签名（P2 Task 5 在末尾追加了记忆与技能目录，P3 Task 3 追加了
+    /// 告警渠道），不做参数对象包装。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: Arc<Db>,
@@ -125,6 +129,7 @@ impl TaskRunner {
         log_dir: PathBuf,
         memory: Arc<MemoryStore>,
         skills: Arc<SkillCatalog>,
+        notifier: Arc<dyn Notifier>,
     ) -> Self {
         Self {
             db,
@@ -136,6 +141,7 @@ impl TaskRunner {
             log_dir,
             memory,
             skills,
+            notifier,
         }
     }
 
@@ -231,11 +237,11 @@ impl TaskRunner {
         // 注册表 = 内置工具 + 元工具（remember 写记忆、load_skill 取技能正文、notify_user 升告警）；
         // 顺序即模型看到的工具表顺序，元工具排在末尾
         let mut registry = default_registry();
-        // 告警出口：告警行落库（CLI 未读收件箱即渠道①），推送渠道由 T5 的 gateway 注入——
-        // 交互运行这一侧先留空组合（落库与去重照样生效）
+        // 告警出口：告警行落库（CLI 未读收件箱即渠道①），投递走构造期注入的渠道组合——
+        // 真实渠道由 T5 的 gateway 注入，这一层只管把渠道接上
         let alerts = Arc::new(AlertSink::new(
             Arc::clone(&self.db),
-            Arc::new(MultiNotifier::new(Vec::new())),
+            Arc::clone(&self.notifier),
         ));
         for tool in meta_tools(Arc::clone(&self.memory), Arc::clone(&self.skills), alerts) {
             registry.register(tool);
@@ -436,14 +442,17 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use ignis_runtime::test_support::{MockRuntime, ScriptedApproval};
-    use ignis_runtime::{ChatMessage, Role, RunStatus, RuntimeEvent, Usage};
+    use ignis_runtime::native::NativeRuntime;
+    use ignis_runtime::openai::OpenAiClient;
+    use ignis_runtime::test_support::{MockRuntime, ScriptStep, ScriptedApproval, ScriptedModel};
+    use ignis_runtime::{ChatMessage, ModelConfig, Role, RunStatus, RuntimeEvent, Usage};
     use ignis_storage::Db;
     use serde_json::{Value, json};
     use tokio::sync::mpsc::{self, UnboundedReceiver};
     use tokio_util::sync::CancellationToken;
 
     use super::*;
+    use crate::alerts::test_support::RecordingNotifier;
     use crate::memory::FactScope;
     use crate::security::ApprovalMode;
 
@@ -520,6 +529,10 @@ mod tests {
                 log_dir.clone(),
                 Arc::clone(&memory),
                 Arc::clone(&skills),
+                // `MockRuntime` 只回放事件、不执行工具调用，这些用例不会真的投递告警；
+                // 投递链路本身由 `notify_user_delivers_through_the_runner_injected_channel`
+                // 用真内核 + 假模型端到端钉住
+                Arc::new(RecordingNotifier::new()),
             );
             Self {
                 dir,
@@ -1212,6 +1225,106 @@ mod tests {
 
         assert_eq!(report.outcome.status, RunStatus::Failed);
         assert_eq!(report.outcome.skills_used, ["server-health"]);
+    }
+
+    /// 端到端：`TaskRunner` 构造期注入的记录型渠道必须真的收到 `notify_user` 的投递。
+    ///
+    /// 只把模型换成脚本化假模型（[`ScriptedModel`]）：任务编排、native 内核、工具执行器、告警
+    /// 落库与投递全是生产代码。内核必须是真内核——[`MockRuntime`] 只回放事件、不会真的执行
+    /// 工具调用，投递链路在那里无从观察。
+    #[tokio::test]
+    async fn notify_user_delivers_through_the_runner_injected_channel() {
+        let dir = TempDir::new("notify-e2e");
+        let db = Arc::new(Db::open(&dir.path().join("ignis.db")).unwrap());
+        let model = ScriptedModel::start(vec![
+            ScriptStep::ToolCalls {
+                text: String::new(),
+                calls: vec![(
+                    "notify_user".into(),
+                    json!({"severity": "warning", "title": "磁盘 92%", "body": "根分区 92%（阈值 85%）"}),
+                )],
+            },
+            ScriptStep::Text("已通知用户。".into()),
+        ]);
+        let config = Arc::new(Config {
+            workspace_root: dir.path().to_path_buf(),
+            model: ModelConfig {
+                base_url: model.base_url(),
+                model: "test-model".into(),
+                ..ModelConfig::default()
+            },
+            ..Config::default()
+        });
+        let runtime: Arc<dyn Runtime> = Arc::new(NativeRuntime::new(
+            OpenAiClient::new(&config.model, "test-key".into()).unwrap(),
+        ));
+        // 记录型渠道经 TaskRunner::new 注入：投递真的流经运行器
+        let notifier = Arc::new(RecordingNotifier::new());
+        let channel: Arc<dyn Notifier> = notifier.clone();
+        let runner = TaskRunner::new(
+            Arc::clone(&db),
+            Arc::clone(&config),
+            runtime,
+            Arc::new(Policy::new(ApprovalMode::Preauthorized {
+                unsafe_ops: false,
+            })),
+            ScriptedApproval::new(Vec::new()),
+            dir.path().join("logs"),
+            MemoryStore::new(Arc::clone(&db), dir.path().join("memory")),
+            SkillCatalog::load(&dir.path().join("skills")),
+            channel,
+        );
+
+        let (sink, _received) = mpsc::unbounded_channel();
+        let outcome = runner
+            .run(
+                TaskRequest {
+                    prompt: "检查磁盘".into(),
+                    history: Vec::new(),
+                    kind: TaskKind::Run,
+                    workspace: dir.path().to_path_buf(),
+                },
+                sink,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("端到端运行不应返回 Err");
+        assert_eq!(outcome.status, RunStatus::Success);
+
+        // 渠道收到的就是落库的那一行，来源是本次运行的任务
+        let delivered = notifier.alerts();
+        assert_eq!(delivered.len(), 1, "注入的渠道应恰好收到一次投递");
+        let rows = db.list_alerts(true, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(delivered[0], rows[0]);
+        assert_eq!(
+            (
+                delivered[0].severity.as_str(),
+                delivered[0].title.as_str(),
+                delivered[0].body.as_deref(),
+                delivered[0].source_job_id.as_deref(),
+            ),
+            ("warning", "磁盘 92%", Some("根分区 92%（阈值 85%）"), None)
+        );
+        assert_eq!(
+            delivered[0].source_task_id.as_deref(),
+            Some(outcome.id.as_str())
+        );
+        assert_eq!(delivered[0].dedup_key, format!("{}:磁盘 92%", outcome.id));
+
+        // 工具结果也回到了模型手里：native 内核第二次请求带 `tool` 消息，回执逐字
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2, "{requests:#?}");
+        let messages = requests[1]["messages"].as_array().unwrap();
+        assert!(
+            messages.iter().any(|message| {
+                message["role"] == "tool"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|content| content == "已发送告警（warning）：磁盘 92%")
+            }),
+            "{messages:#?}"
+        );
     }
 
     /// 子进程专用：真正跑 `facts` 表不可用时的 fail-soft 场景，让警告落到 stderr。

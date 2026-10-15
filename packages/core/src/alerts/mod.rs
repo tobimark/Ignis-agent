@@ -6,6 +6,11 @@
 //! 投递是 best-effort：渠道失败只往 stderr 打一行警告，告警行照常落库——`alerts` 表的未读
 //! 收件箱（`ignis alerts`）始终是兜底渠道。
 //!
+//! 标题与正文都是模型可控文本：标题先裁掉首尾空白、再按 [`MAX_TITLE_CHARS`] 截断，去重键与
+//! 落库标题都取这一份（`"磁盘满了 "` 与 `"磁盘满了"` 因此是同一条告警，不会因为空格多落一行）；
+//! 正文按 [`MAX_BODY_CHARS`] 截断。超长文本静默截断（截断点落在字符边界，末尾补 `…`），与记忆
+//! 层事实字段的收口同一口径。
+//!
 //! 校验错误（级别不在册、标题为空）与存储错误都是中文，调用方原样回填给模型。
 
 mod notifier;
@@ -19,6 +24,12 @@ pub use notifier::{MultiNotifier, Notifier, NotifyError};
 
 /// 去重冷却窗口：900 秒（brief 钉死的 15 分钟）。
 pub const DEDUP_WINDOW_SECS: i64 = 900;
+
+/// 标题的字符上限：标题会进收件箱列表、去重键与工具回执（模型看得到），落库前静默截断到
+/// 前 200 个字符 + `…`（截断点落在字符边界）。
+const MAX_TITLE_CHARS: usize = 200;
+/// 正文的字符上限：正文只进收件箱，同样在落库前截断——前 2000 个字符 + `…`。
+const MAX_BODY_CHARS: usize = 2000;
 
 /// 告警层的错误：入参校验（级别、标题）与 `alerts` 表的读写。
 #[derive(Debug, thiserror::Error)]
@@ -57,7 +68,10 @@ impl AlertSink {
     }
 
     /// 指定去重窗口（秒）；测试用它把冷却期收到秒级。
+    ///
+    /// 非正窗口没有意义（窗口内永远命中不了），构造期就在 debug 构建里拦下。
     pub fn with_window_secs(db: Arc<Db>, notifier: Arc<dyn Notifier>, window_secs: i64) -> Self {
+        debug_assert!(window_secs > 0);
         Self {
             db,
             notifier,
@@ -68,8 +82,10 @@ impl AlertSink {
     /// 升一条告警。
     ///
     /// `severity` 只认 `info` / `warning` / `critical`，标题不能为空——两者都是模型递进来的
-    /// 输入，一律在落库前以中文拒绝。去重键 = `(job 或 task 或 "cli", title)`；来源两者都有
-    /// 时以 job 为准（同一次调度运行里的 `notify_user` 与失败告警因此共用一把键）。
+    /// 输入，一律在落库前以中文拒绝。标题先 `trim()` 再截到 [`MAX_TITLE_CHARS`]，去重键、落库
+    /// 标题与工具回执取的是同一份（键 = `(job 或 task 或 "cli", 裁过的标题)`；来源两者都有时
+    /// 以 job 为准，同一次调度运行里的 `notify_user` 与失败告警因此共用一把键）；正文截到
+    /// [`MAX_BODY_CHARS`]。
     pub async fn raise(
         &self,
         severity: &str,
@@ -81,9 +97,12 @@ impl AlertSink {
         if !matches!(severity, "info" | "warning" | "critical") {
             return Err(AlertError::UnknownSeverity(severity.to_string()));
         }
-        if title.trim().is_empty() {
+        // 标题只在这一处收口：裁空白 → 按上限截断 → 空值拒绝；后面的键、落库与回执都用它
+        let title = truncate_chars(title.trim(), MAX_TITLE_CHARS);
+        if title.is_empty() {
             return Err(AlertError::EmptyTitle);
         }
+        let body = body.map(|text| truncate_chars(text, MAX_BODY_CHARS));
         let owner = source_job_id.or(source_task_id).unwrap_or("cli");
         let dedup_key = format!("{owner}:{title}");
         let now = now_millis();
@@ -96,8 +115,8 @@ impl AlertSink {
         }
         let record = self.db.insert_alert(&NewAlert {
             severity: severity.to_string(),
-            title: title.to_string(),
-            body: body.map(str::to_owned),
+            title,
+            body,
             source_job_id: source_job_id.map(str::to_owned),
             source_task_id: source_task_id.map(str::to_owned),
             dedup_key,
@@ -116,6 +135,19 @@ fn now_millis() -> i64 {
         Ok(elapsed) => i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
         Err(_) => 0,
     }
+}
+
+/// 把模型递进来的文本截到 `max_chars` 个字符：截断点落在字符边界，末尾补一个 `…`。
+///
+/// 与记忆层事实字段的收口同一口径（前 `max_chars` 个字符 + `…`，不改动中段内容）。
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let Some((end, _)) = value.char_indices().nth(max_chars) else {
+        return value.to_owned();
+    };
+    let mut truncated = String::with_capacity(end + '…'.len_utf8());
+    truncated.push_str(&value[..end]);
+    truncated.push('…');
+    truncated
 }
 
 /// 测试用的记录型渠道；`tools::notify` 的用例也复用它。
@@ -181,7 +213,10 @@ mod tests {
     use ignis_storage::{AlertRecord, Db};
 
     use super::test_support::RecordingNotifier;
-    use super::{AlertError, AlertSink, DEDUP_WINDOW_SECS, Notifier, RaiseOutcome};
+    use super::{
+        AlertError, AlertSink, DEDUP_WINDOW_SECS, MAX_BODY_CHARS, MAX_TITLE_CHARS, Notifier,
+        RaiseOutcome,
+    };
 
     /// 观察环境：真实内存库 + 记录型渠道。
     struct Env {
@@ -439,5 +474,113 @@ mod tests {
         // 标题不同就是不同的键：两条都落行、都投递
         assert_eq!(env.rows().len(), 2);
         assert_eq!(env.notifier.calls(), 2);
+    }
+
+    /// 标题先裁掉首尾空白：去重键、落库标题与投递内容都取裁过的那一份。
+    #[tokio::test]
+    async fn a_padded_title_is_trimmed_before_the_key_and_the_row() {
+        let env = Env::new();
+
+        let first = env
+            .sink
+            .raise("warning", "  磁盘满了  ", None, Some("job-1"), None)
+            .await
+            .unwrap();
+        let RaiseOutcome::Sent(sent) = first else {
+            panic!("首次应落库：{first:?}")
+        };
+        assert_eq!(sent.title, "磁盘满了", "落库/投递的是裁过空白的标题");
+        assert_eq!(sent.dedup_key, "job-1:磁盘满了", "键也取裁过的标题");
+        assert_eq!(env.notifier.alerts()[0], sent);
+
+        // 同一条告警换个写法（这次不带空白）：同键 → 去重，不给空格多落一行
+        let second = env
+            .sink
+            .raise("warning", "磁盘满了", None, Some("job-1"), None)
+            .await
+            .unwrap();
+        assert!(matches!(second, RaiseOutcome::Deduped(_)), "{second:?}");
+        assert_eq!(env.rows().len(), 1);
+        assert_eq!(env.notifier.calls(), 1);
+
+        // 只有空白的标题仍是空标题（裁完就没了）
+        assert!(matches!(
+            env.sink
+                .raise("info", " \n ", None, Some("job-1"), None)
+                .await,
+            Err(AlertError::EmptyTitle)
+        ));
+    }
+
+    /// 标题与正文都有字符上限：超长静默截断（前 N 个字符 + `…`，落在字符边界），不多不少。
+    #[tokio::test]
+    async fn long_titles_and_bodies_are_capped_on_a_char_boundary() {
+        let env = Env::new();
+
+        // 超长标题（多字节字符）：前 MAX_TITLE_CHARS 个字符 + `…`
+        let long_title = "磁".repeat(MAX_TITLE_CHARS + 50);
+        let long_body = "好".repeat(MAX_BODY_CHARS + 500);
+        let capped_title = format!("{}…", "磁".repeat(MAX_TITLE_CHARS));
+        let capped_body = format!("{}…", "好".repeat(MAX_BODY_CHARS));
+
+        let first = env
+            .sink
+            .raise(
+                "critical",
+                &long_title,
+                Some(&long_body),
+                Some("job-1"),
+                None,
+            )
+            .await
+            .unwrap();
+        let RaiseOutcome::Sent(sent) = first else {
+            panic!("首次应落库：{first:?}")
+        };
+        assert_eq!(sent.title, capped_title);
+        assert_eq!(sent.title.chars().count(), MAX_TITLE_CHARS + 1);
+        assert_eq!(sent.dedup_key, format!("job-1:{capped_title}"));
+        assert_eq!(sent.body.as_deref(), Some(capped_body.as_str()));
+        assert_eq!(
+            sent.body.as_deref().unwrap().chars().count(),
+            MAX_BODY_CHARS + 1
+        );
+        // 落库与投递的就是截断后的那一份
+        assert_eq!(env.rows()[0], sent);
+        assert_eq!(env.notifier.alerts()[0], sent);
+
+        // 同一把（截断后的）键仍然认得出重复
+        let repeat = env
+            .sink
+            .raise("critical", &long_title, None, Some("job-1"), None)
+            .await
+            .unwrap();
+        assert!(matches!(repeat, RaiseOutcome::Deduped(_)), "{repeat:?}");
+        assert_eq!(env.rows().len(), 1);
+        assert_eq!(env.notifier.calls(), 1);
+
+        // 边界：恰好等于上限的标题不截断、不补 `…`
+        let exact = "滿".repeat(MAX_TITLE_CHARS);
+        let boundary = env
+            .sink
+            .raise("info", &exact, None, Some("job-2"), None)
+            .await
+            .unwrap();
+        let RaiseOutcome::Sent(boundary) = boundary else {
+            panic!("窗口内不存在同键告警：{boundary:?}")
+        };
+        assert_eq!(boundary.title, exact);
+        assert_eq!(boundary.title.chars().count(), MAX_TITLE_CHARS);
+    }
+
+    /// 非正窗口是构造期错误：debug 构建直接 panic（release 里断言被编译掉）。
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "window_secs > 0")]
+    fn a_non_positive_dedup_window_is_rejected_in_debug_builds() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let channel: Arc<dyn Notifier> = Arc::new(RecordingNotifier::new());
+
+        let _ = AlertSink::with_window_secs(db, channel, 0);
     }
 }

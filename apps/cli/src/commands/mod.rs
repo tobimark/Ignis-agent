@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
+use ignis_core::alerts::MultiNotifier;
 use ignis_core::config::{Config, ensure_home, ignis_home, load_config};
 use ignis_core::memory::MemoryStore;
 use ignis_core::security::{ApprovalMode, Policy};
@@ -118,6 +119,9 @@ impl Session {
             home.join("logs"),
             Arc::clone(&memory),
             Arc::clone(&skills),
+            // 告警投递渠道：CLI 侧先留空组合——告警照常落库与去重（`ignis alerts` 的未读收件箱
+            // 就是渠道①），真实渠道（notify-send / 日志 / IM）由 T5 的 gateway 在这里注入
+            Arc::new(MultiNotifier::new(Vec::new())),
         );
 
         Ok(Self {
