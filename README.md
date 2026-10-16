@@ -244,7 +244,7 @@ ignis daemon stop            # 幂等：没在跑也算成功
 8. **调度重扫窗口 30s**：新建 / 暂停 / 恢复的调度任务最迟 30s 生效（守护进程每轮最多睡 30s 重读 active job；无到期任务时也一样）。
 9. **`/kernel` 不共享外置会话**：每轮任务都把 Ignis 的 canonical 历史渲染进 prompt 交给一个新的 CLI 进程，不依赖也不复用 codex / claude 自己的 `--resume` 会话（切换内核不会带过来外置 CLI 的会话状态）。
 10. **relay spike 结论（已关闭）**：原生中转（`opencode.ai/zen/go`）两轮「不可得」为套餐额度 / 端点配置问题，**不是协议不兼容**；随后以一个可用的 OpenAI 兼容端点（`https://api.minimax.cn/v1`，模型 `MiniMax-M2`）复验，流式工具调用、`usage` 记账与审批链路全部通过（该端点不发 `[DONE]`，流以 EOF 收尾，native 客户端按 EOF 正常结束）。降级路径（`stream:false` / Anthropic 协议）无需启用。详见 [`docs/spikes/2026-10-15-relay-streaming-toolcalls.md`](docs/spikes/2026-10-15-relay-streaming-toolcalls.md)。
-11. **调度策略**：失败即记录 + 告警、不无限重试；上一次运行未结束时再次到期只跳过并记日志；停机期间错过的时点不补跑（防重启后重复执行危险操作）。
+11. **调度策略**：失败即记录 + 告警、不无限重试；上一次运行未结束时再次到期只跳过并记日志；停机期间错过的时点不补跑（防重启后重复执行危险操作）；过期作业（间隔长于重扫窗口）按「首次观察 + 间隔」触发一次、不补跑。多作业并存时，短间隔作业若始终被更早到期的作业先唤醒，可能被反复推后（P3 既有行为；单作业场景含 Demo C 不受影响，见 [`docs/acceptance.md`](docs/acceptance.md) §5）。
 
 ## 已知偏差
 
