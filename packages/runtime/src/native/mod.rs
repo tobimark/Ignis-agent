@@ -24,8 +24,10 @@ use crate::{
 const EVENT_CHANNEL: usize = 64;
 /// 步数耗尽（`Limits::max_steps`）。
 const ERR_MAX_STEPS: &str = "max_steps";
-/// 任务墙钟到期（`Limits::task_timeout_secs`）。
-const ERR_TASK_TIMEOUT: &str = "task_timeout";
+/// 任务墙钟到期（`Limits::task_timeout_secs`）。**跨内核的契约字符串**：codex 等外置内核适配器
+/// 与验收脚本按逐字比较判定超时，改字即改协议（故与 `MAX_TASK_TIMEOUT` 一样提为 `pub(crate)`
+/// 供各内核复用，不许各自复制字面量）。
+pub(crate) const ERR_TASK_TIMEOUT: &str = "task_timeout";
 /// token 预算耗尽（`Limits::token_budget`，按累计 in+out 计）。
 const ERR_TOKEN_BUDGET: &str = "token_budget";
 /// 墙钟上限的兜底：`Instant + Duration` 溢出会 panic，而 panic 会吞掉唯一的 `Done`；

@@ -11,7 +11,9 @@
 //!
 //! 所有异常路径都收束成恰好一条 [`RuntimeEvent::Done`]：非零退出 / 流结束而未见成功终局 →
 //! `Failed` + 人话；取消 → `Aborted`；墙钟到点 → `LimitReached` + `task_timeout`（与 native
-//! 同一枚标记字符串）。未知行静默跳过，容忍 CLI 的 schema 漂移。
+//! 同一枚标记字符串）。`turn.completed` / `turn.failed` 一到手就停止读流——之后只给进程 2s
+//! （`TERMINAL_REAP_GRACE`）的退出收尾时间，免得「已完成却不退出」被拖成超时、真实失败原因被丢掉。
+//! 未知行静默跳过，容忍 CLI 的 schema 漂移。
 
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -24,7 +26,7 @@ use tokio::sync::mpsc::{Sender, channel};
 use tokio::time::{sleep_until, timeout};
 use tokio_util::sync::CancellationToken;
 
-use crate::native::MAX_TASK_TIMEOUT;
+use crate::native::{ERR_TASK_TIMEOUT, MAX_TASK_TIMEOUT};
 use crate::{
     BoxStream, Capabilities, ChatMessage, Limits, Role, RunRequest, RunStatus, Runtime,
     RuntimeEvent,
@@ -32,8 +34,6 @@ use crate::{
 
 /// 事件通道容量（与 native 一致）：消费者慢只会让循环在发送处等待，不会无界缓冲。
 const EVENT_CHANNEL: usize = 64;
-/// 墙钟上限标记：与 native 的 `ERR_TASK_TIMEOUT` 逐字相同（跨内核共用的上限标记，勿改）。
-const ERR_TASK_TIMEOUT: &str = "task_timeout";
 /// 沙箱档位（任务书钉死）：`--help` 的可选值只有 `read-only` / `workspace-write` /
 /// `danger-full-access`，这里取「能干活、又不出工作区」的那档，适配器不自行放宽。
 const SANDBOX_MODE: &str = "workspace-write";
@@ -42,6 +42,10 @@ const STDERR_HEAD_CHARS: usize = 200;
 /// 收尸上限：进程组已被 SIGKILL，但管道写端可能还攥在逃逸的孙进程手里（同 `shell_run` 的
 /// 教训：无上限地等会把事件流拖住）。
 const REAP_GRACE: Duration = Duration::from_secs(5);
+/// 拿到终局事件之后的收尸上限：终局已经把答案给了，进程只剩退出收尾；给一段短限度的等待就
+/// 按已得的终局判定——等满 [`REAP_GRACE`]（更别说 `task_timeout`）会把「已完成却不退出」的
+/// CLI 拖成超时，并丢掉真实的 `turn.failed` 原因。
+const TERMINAL_REAP_GRACE: Duration = Duration::from_secs(2);
 /// `command_execution` 条目映射成 `ToolExec` 时的名字（探测记录里的条目类型名）。
 const COMMAND_ITEM: &str = "command_execution";
 
@@ -193,9 +197,8 @@ async fn drive(
     let deadline =
         Instant::now() + Duration::from_secs(limits.task_timeout_secs).min(MAX_TASK_TIMEOUT);
     let mut lines = BufReader::new(stdout).lines();
-    // 终局标记：`turn.completed` 到达即成功；`turn.failed` 带失败原因
-    let mut completed = false;
-    let mut failure: Option<String> = None;
+    // 本轮终局：`turn.completed` 成功；`turn.failed` 失败（原因可能缺失）
+    let mut turn_end: Option<TurnEnd> = None;
     // 最后一段助手文本：成功终局的 summary（与 native 的 summary 语义一致）
     let mut last_text: Option<String> = None;
     let mut read_error: Option<String> = None;
@@ -240,8 +243,16 @@ async fn drive(
                         return None;
                     }
                 }
-                Some(CodexEvent::TurnCompleted) => completed = true,
-                Some(CodexEvent::TurnFailed { message }) => failure = Some(message),
+                // 终局事件到手即停止读流：CLI 可能在终局行之后赖着不退出，继续读到 EOF 会把
+                // 已完成的轮次（或已给出的失败原因）拖成 `task_timeout`
+                Some(CodexEvent::TurnCompleted) => {
+                    turn_end = Some(TurnEnd::Completed);
+                    break;
+                }
+                Some(CodexEvent::TurnFailed { message }) => {
+                    turn_end = Some(TurnEnd::Failed(message));
+                    break;
+                }
                 // 未知事件类型 / 未知条目类型 / 非 JSON 行：静默跳过（容忍 schema 漂移）
                 None => {}
             },
@@ -254,8 +265,14 @@ async fn drive(
         }
     }
 
-    // 收尾：等子进程退出，带上限（stdout 关了不代表进程退了，fd 也可能还攥在孙进程手里）
-    let status = match timeout(REAP_GRACE, child.wait()).await {
+    // 收尾：等子进程退出，带上限（stdout 关了不代表进程退了，fd 也可能还攥在孙进程手里）。
+    // 已经拿到终局事件时只等一小段：终局已给出答案，别为了等一个赖着不走的进程丢掉它。
+    let grace = if turn_end.is_some() {
+        TERMINAL_REAP_GRACE
+    } else {
+        REAP_GRACE
+    };
+    let status = match timeout(grace, child.wait()).await {
         Ok(result) => result.ok(),
         Err(_) => None,
     };
@@ -265,35 +282,39 @@ async fn drive(
     }
     let stderr_head = stderr_task.await.ok().flatten();
 
-    match (completed, status, failure) {
-        // 终局失败事件：CLI 自己给了原因，优先用它
-        (_, _, Some(message)) => Some(done(
+    match (turn_end, status) {
+        // 终局失败事件：CLI 自己给了原因，优先用它；连原因都没给（schema 漂移）也照样是失败，
+        // 只换成通用人话——终局确实到了，不能退回「流结束但未见终局」那套说辞
+        (Some(TurnEnd::Failed(message)), _) => Some(done(
             RunStatus::Failed,
             None,
-            Some(format!("codex 报告失败：{message}")),
+            Some(match message {
+                Some(message) => format!("codex 报告失败：{message}"),
+                None => ERR_TURN_FAILED_NO_REASON.into(),
+            }),
         )),
         // 见过 `turn.completed` 但退出码非零：进程自己都说不正常，按失败收
-        (true, Some(status), None) if !status.success() => Some(done(
+        (Some(TurnEnd::Completed), Some(status)) if !status.success() => Some(done(
             RunStatus::Failed,
             None,
             Some(exit_text(&status, stderr_head.as_deref())),
         )),
         // 见过 `turn.completed` 即成功；收尸没跟上（`status` 为 `None`）也不改变这个结论
-        (true, _, None) => Some(done(RunStatus::Success, last_text, None)),
+        (Some(TurnEnd::Completed), _) => Some(done(RunStatus::Success, last_text, None)),
         // 流结束却没见到成功终局（非零退出、被信号终止、或干脆没来得及收尸）
-        (false, Some(status), None) if status.success() => Some(done(
+        (None, Some(status)) if status.success() => Some(done(
             RunStatus::Failed,
             None,
             Some(read_error.unwrap_or_else(|| {
                 "codex 事件流结束但未见 turn.completed（事件 schema 可能已变更）".into()
             })),
         )),
-        (false, Some(status), None) => Some(done(
+        (None, Some(status)) => Some(done(
             RunStatus::Failed,
             None,
             Some(exit_text(&status, stderr_head.as_deref())),
         )),
-        (false, None, None) => Some(done(
+        (None, None) => Some(done(
             RunStatus::Failed,
             None,
             Some("codex 子进程未在收尾上限内退出（已终止整个进程组）".into()),
@@ -314,11 +335,27 @@ enum CodexEvent {
     },
     /// `turn.completed`：本轮成功收束。
     TurnCompleted,
-    /// `turn.failed`：本轮失败收束，`error.message` 是原因。
-    TurnFailed { message: String },
+    /// `turn.failed`：本轮失败收束。`error.message` 是原因，但 schema 漂移下可能缺失或形状
+    /// 不对，故为 `Option`——判别终局只看顶层 `type`，不因原因缺失而漏掉终局。
+    TurnFailed { message: Option<String> },
 }
 
+/// 本轮终局事件（一到手就读循环收摊，判定交给 [`drive`] 末尾的决策表）。
+#[derive(Debug, PartialEq)]
+enum TurnEnd {
+    /// `turn.completed`：成功收束。
+    Completed,
+    /// `turn.failed`：失败收束，带上 CLI 给的原因（可能没有）。
+    Failed(Option<String>),
+}
+
+/// `turn.failed` 没带 `error.message` 时的兜底人话（终局确实到了，不能退回「未见终局」的文案）。
+const ERR_TURN_FAILED_NO_REASON: &str = "codex 报告失败（未提供原因）";
+
 /// 按行映射：认不出的行一律 `None`。
+///
+/// 两个终局只按顶层 `type` 判别：`turn.failed` 的原因缺失（或 `error` 不是对象）时仍认作终局，
+/// 只是原因为 `None`——把整行当成「未知行」会让一次真实的失败终局丢掉。
 ///
 /// 静默跳过的三类（容忍 schema 漂移）：未知顶层事件类型（如 `thread.started`、重连用的
 /// `error`）、未知条目类型、非 JSON 行。本轮不映射的已知条目也只有跳过一种处理：
@@ -329,7 +366,11 @@ fn parse_line(line: &str) -> Option<CodexEvent> {
     match value.get("type")?.as_str()? {
         "turn.completed" => Some(CodexEvent::TurnCompleted),
         "turn.failed" => Some(CodexEvent::TurnFailed {
-            message: value.get("error")?.get("message")?.as_str()?.to_string(),
+            message: value
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(|message| message.as_str())
+                .map(str::to_string),
         }),
         "item.started" | "item.updated" | "item.completed" => {
             let item = value.get("item")?;
@@ -475,7 +516,7 @@ mod tests {
         assert_eq!(
             parse_line(r#"{"type":"turn.failed","error":{"message":"stream ended"}}"#),
             Some(CodexEvent::TurnFailed {
-                message: "stream ended".into()
+                message: Some("stream ended".into())
             })
         );
         // 过程性事件与不映射的条目：跳过
@@ -503,8 +544,16 @@ mod tests {
             None
         );
         assert_eq!(parse_line("not json at all"), None);
-        assert_eq!(parse_line(r#"{"type":"turn.failed"}"#), None);
         assert_eq!(parse_line(r#"{"type":"item.completed"}"#), None);
+        // 终局失败只看顶层 `type`：`error.message` 缺失或形状不对也认得出终局（原因是 `None`）
+        assert_eq!(
+            parse_line(r#"{"type":"turn.failed"}"#),
+            Some(CodexEvent::TurnFailed { message: None })
+        );
+        assert_eq!(
+            parse_line(r#"{"type":"turn.failed","error":"stream ended"}"#),
+            Some(CodexEvent::TurnFailed { message: None })
+        );
     }
 
     /// 过渡渲染：system 提示在前，随后逐条消息（角色名 + 正文），段落之间空行。

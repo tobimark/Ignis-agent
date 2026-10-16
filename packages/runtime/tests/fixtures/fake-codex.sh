@@ -5,7 +5,11 @@
 # 行为由最后一个位置参数（渲染好的 prompt）里的关键词决定：
 #   TOOL          工具/命令事件（只观察，不执行）
 #   TURNFAIL      turn.failed 终局（退出码 0，证明失败判定不看退出码）
+#   TURNFAIL_BARE turn.failed 不带 error.message，之后挂起（证明终局一到手即收束、
+#                 缺失原因也走「失败」而不是「没见到终局」或超时）
+#   COMPLETE_HANG turn.completed 之后挂起（证明完成的轮次不被拖成超时）
 #   FAIL          非零退出 + 两行 stderr
+#   REAL_FAIL     真机失败轨迹逐字回放（非终局 `error` 行 + turn.failed + 退出码 1）
 #   NOISE         未知事件类型 / 未知条目类型 / 非 JSON 行混在正常文本流里
 #   CANCEL_HANG   打出前导事件后挂起（取消用例；后台 sleep 只能靠进程组收尸）
 #   TIMEOUT_HANG  同上（超时用例）
@@ -36,11 +40,33 @@ done
 emit() { printf '%s\n' "$1"; }
 
 case "$prompt" in
+*TURNFAIL_BARE*)
+  emit '{"type":"thread.started","thread_id":"00000000-0000-7000-8000-000000000001"}'
+  emit '{"type":"turn.started"}'
+  emit '{"type":"turn.failed"}'
+  sleep 12381 &
+  sleep 12382
+  ;;
+*COMPLETE_HANG*)
+  emit '{"type":"thread.started","thread_id":"00000000-0000-7000-8000-000000000001"}'
+  emit '{"type":"turn.started"}'
+  emit '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"完成了但进程不退出"}}'
+  emit '{"type":"turn.completed","usage":{"input_tokens":21,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":5}}'
+  sleep 12371 &
+  sleep 12372
+  ;;
 *TURNFAIL*)
   emit '{"type":"thread.started","thread_id":"00000000-0000-7000-8000-000000000001"}'
   emit '{"type":"turn.started"}'
   emit '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"半截"}}'
   emit '{"type":"turn.failed","error":{"message":"model response stream ended unexpectedly"}}'
+  ;;
+*REAL_FAIL*)
+  emit '{"type":"thread.started","thread_id":"00000000-0000-7000-8000-000000000001"}'
+  emit '{"type":"turn.started"}'
+  emit '{"type":"error","message":"invalid params, code: 2013, msg: invalid params, unknown model '"'"'no-such-model-xyz'"'"' (2013)"}'
+  emit '{"type":"turn.failed","error":{"message":"invalid params, code: 2013, msg: invalid params, unknown model '"'"'no-such-model-xyz'"'"' (2013)"}}'
+  exit 1
   ;;
 *FAIL*)
   emit '{"type":"thread.started","thread_id":"00000000-0000-7000-8000-000000000001"}'

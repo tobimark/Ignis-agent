@@ -314,6 +314,96 @@ async fn turn_failed_maps_to_failed_even_with_zero_exit() {
     );
 }
 
+/// 终局事件即刻收束读循环：CLI 打完 `turn.completed` 后不退出（后台/前台 sleep 挂住），
+/// 结论必须是 `Success`，而不是等到 EOF 或 `task_timeout` 才收场。
+#[tokio::test]
+async fn turn_completed_short_circuits_a_cli_that_does_not_exit() {
+    let workspace = temp_workspace("complete-hang");
+    let runtime = CodexRuntime::with_command(fake_codex(), workspace, None);
+
+    let started = Instant::now();
+    let events = collect(
+        &runtime,
+        request("sys", "COMPLETE_HANG", 60),
+        CancellationToken::new(),
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        events,
+        vec![
+            RuntimeEvent::TextDelta {
+                text: "完成了但进程不退出".into()
+            },
+            RuntimeEvent::Done {
+                status: RunStatus::Success,
+                summary: Some("完成了但进程不退出".into()),
+                error: None,
+            },
+        ]
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "终局一到手就该收束，不该等满超时，实际 {elapsed:?}"
+    );
+    assert_eq!(pgrep("12371"), "", "后台任务逃出了进程组");
+    assert_eq!(pgrep("12372"), "", "前台任务未被终止");
+}
+
+/// `turn.failed` 不带 `error.message`（schema 漂移）：仍按失败收束并给通用中文人话，
+/// 不能退回「流结束但未见 turn.completed」——终局确实到了。
+#[tokio::test]
+async fn turn_failed_without_reason_reports_a_generic_failure() {
+    let workspace = temp_workspace("turnfail-bare");
+    let runtime = CodexRuntime::with_command(fake_codex(), workspace, None);
+
+    let started = Instant::now();
+    let events = collect(
+        &runtime,
+        request("sys", "TURNFAIL_BARE", 60),
+        CancellationToken::new(),
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    let (status, error) = failure(&events);
+    assert_eq!(status, RunStatus::Failed);
+    let error = error.expect("失败必须带人话");
+    assert!(error.contains("codex 报告失败"), "{error}");
+    assert!(error.contains("未提供原因"), "{error}");
+    assert!(
+        !error.contains("未见 turn.completed"),
+        "终局到了就不能说没见到终局：{error}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "失败终局一到手就该收束，不该等满超时，实际 {elapsed:?}"
+    );
+    assert_eq!(pgrep("12381"), "", "后台任务逃出了进程组");
+    assert_eq!(pgrep("12382"), "", "前台任务未被终止");
+}
+
+/// 真机失败轨迹（逐字回放 2026-10-15 的复测：非终局的 `type:"error"` 行 + `turn.failed` +
+/// 退出码 1）：`Failed` 的人话是 CLI 给的原因，`error` 行不被误当成终局。
+#[tokio::test]
+async fn real_failure_trace_reports_the_cli_reason() {
+    let workspace = temp_workspace("real-fail");
+    let runtime = CodexRuntime::with_command(fake_codex(), workspace, None);
+    let events = collect(
+        &runtime,
+        request("sys", "REAL_FAIL", 60),
+        CancellationToken::new(),
+    )
+    .await;
+
+    let (status, error) = failure(&events);
+    assert_eq!(status, RunStatus::Failed);
+    let error = error.expect("失败必须带人话");
+    assert!(error.contains("code: 2013"), "{error}");
+    assert!(error.contains("unknown model"), "{error}");
+}
+
 /// 缺失 `codex` 二进制：spawn 错误折成清晰的中文 `Done{Failed}`，不 panic、不静默。
 #[tokio::test]
 async fn missing_codex_binary_reports_a_clear_failure() {
