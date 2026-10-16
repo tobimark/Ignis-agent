@@ -2,17 +2,20 @@
 //!
 //! 检查项与顺序即输出契约：core 六项（home → config → api_key → base_url → workspace → db）之后是
 //! 配置里的内核名非法时的 `kernel` 行（紧跟六项、其余检查按 native 兜底），再是两个外部内核探测行
-//! （codex → claude）。退出码只看 `Fail`：任一 ✗ → 1；只有 `!` 警告（未装外部 CLI、选了外部内核
-//! 时缺 Ignis 密钥）照常 0——自检不该因为一个没用上的内核没装就变红。
+//! （codex → claude）。退出码只看 `Fail`：任一 ✗ → 1；`!` 警告照常 0，出现在四处——没装/跑不通的
+//! 外部 CLI（未选中它时）、选了外部内核时缺 Ignis 密钥、配置里的内核名非法且缺钥匙（这一条把
+//! api_key 降级为 `!`，退出码已由 `✗ kernel` 顶上）、外部内核下 `base_url` 不可达（该内核不访问
+//! 这个端点）——自检不该因为一个没用上的内核没装或没配就变红。
 
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::Path;
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ignis_core::config::{Config, ConfigError, ignis_home, load_config};
-use ignis_core::doctor::{CheckLevel, CheckResult, run_checks};
+use ignis_core::doctor::{CHECK_API_KEY, CheckLevel, CheckResult, run_checks};
 
 use crate::cli::Cli;
 use crate::commands::kernel::{KERNELS, NATIVE_KERNEL, find_program, resolve_kernel};
@@ -37,8 +40,8 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
 /// codex / claude 两个外部内核探测行。
 ///
 /// 生效内核与 `run`/REPL 走同一条解析链（`--kernel` > 配置 default_kernel > native）：它决定缺
-/// CLI、缺 Ignis 密钥是 ✗ 还是 `!`。`home` 与 `path` 可注入，用例因此不必碰真实 `~/.ignis` 与
-/// 进程环境（测试可并行）。
+/// CLI、缺 Ignis 密钥、`base_url` 不可达是 ✗ 还是 `!`。`home` 与 `path` 可注入，用例因此不必碰
+/// 真实 `~/.ignis` 与进程环境（测试可并行）。
 fn collect(
     home: &Path,
     loaded: &Result<Config, ConfigError>,
@@ -52,7 +55,7 @@ fn collect(
         .unwrap_or(NATIVE_KERNEL);
     let (selected, kernel_error) = resolve_selection(kernel_flag, configured);
 
-    let mut results = run_checks(home, loaded, selected == NATIVE_KERNEL);
+    let mut results = run_checks(home, loaded, selected);
     if kernel_error.is_some() {
         soften_api_key_for_unresolved_kernel(&mut results);
     }
@@ -64,9 +67,11 @@ fn collect(
 /// 配置里的内核名非法（`✗ kernel` 已让退出码非零）：其余检查按 native 兜底，此时缺 key 的
 /// `✗ api_key … native 内核需要` 会误导只是拼错名字、其实只打算用 codex/claude 的用户——
 /// 降级为 `!`，并在文案里点明这一行是兜底口径（顺序与退出码都不变）。
+///
+/// 行名用 core 的 [`CHECK_API_KEY`]：字面量同源，core 侧改名时这里不会悄悄匹配不上。
 fn soften_api_key_for_unresolved_kernel(results: &mut [CheckResult]) {
     for result in results.iter_mut() {
-        if result.name == "api_key" && result.level == CheckLevel::Fail {
+        if result.name == CHECK_API_KEY && result.level == CheckLevel::Fail {
             result.level = CheckLevel::Warn;
             result.detail = format!(
                 "{}（配置的内核名非法，其余检查按 native 兜底）",
@@ -139,13 +144,46 @@ fn kernel_check(name: &'static str, selected: &str, path: Option<&OsStr>) -> Che
     }
 }
 
+/// `--version` 探测的等待上限：卡住的 CLI 只该让这一行变 ✗/`!`，不该把 `ignis doctor` 拖住。
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 上限内的轮询间隔：探测是一条短命令，不值得为它引入通知机制。
+const VERSION_PROBE_POLL: Duration = Duration::from_millis(50);
+
 /// 跑 `{binary} --version`，取首个非空输出行作为版本短串。
 ///
-/// stdout 优先，它空时退到 stderr：有的 CLI 把版本打到 stderr，不该因此被判「不可用」。
+/// stdout 优先，它空时退到 stderr：有的 CLI 把版本打到 stderr，不该因此被判「不可用」；接受的
+/// 假 ✓ 模式是 stderr 上的启动噪声（如 `warning: ...`）会被读成版本。stdin 接空设备、整轮上限
+/// [`VERSION_PROBE_TIMEOUT`]，超时就杀掉子进程并按「不可用」如实报（与退出码非零/没有输出同形）。
 fn probe_version(binary: &Path) -> Result<String, String> {
-    let output = Command::new(binary)
+    let mut child = Command::new(binary)
         .arg("--version")
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let deadline = Instant::now() + VERSION_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "--version 超过 {}s 未返回（已终止）",
+                        VERSION_PROBE_TIMEOUT.as_secs()
+                    ));
+                }
+                std::thread::sleep(VERSION_PROBE_POLL);
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    // 子进程已经退出：`wait_with_output` 只是把管道里读全
+    let output = child
+        .wait_with_output()
         .map_err(|error| error.to_string())?;
     if !output.status.success() {
         let code = output
@@ -318,7 +356,10 @@ mod tests {
         let kernel = &results[6];
         assert_eq!(kernel.level, CheckLevel::Fail, "{kernel:?}");
         assert!(kernel.detail.contains("未知内核 'gemini'"), "{kernel:?}");
-        let api_key = &results[2];
+        let api_key = results
+            .iter()
+            .find(|result| result.name == CHECK_API_KEY)
+            .expect("api_key 行必在");
         assert_eq!(
             api_key.level,
             CheckLevel::Warn,
@@ -348,7 +389,7 @@ mod tests {
         let results = collect(dir.path(), &Ok(keyless), None, path);
         let api_key = results
             .iter()
-            .find(|result| result.name == "api_key")
+            .find(|result| result.name == CHECK_API_KEY)
             .expect("api_key 行必在");
         assert_eq!(api_key.level, CheckLevel::Fail, "{api_key:?}");
         assert!(!api_key.detail.contains("配置的内核名非法"), "{api_key:?}");
@@ -411,6 +452,94 @@ mod tests {
             "#!/bin/sh\nprintf '\\n\\n%s\\n' 'codex-cli 1.2.3' >&2\n",
         );
         assert_eq!(probe_version(&padded).unwrap(), "codex-cli 1.2.3");
+    }
+
+    /// `base_url` 不可达按内核分级：选中外部内核（Ignis 不访问该端点）只给 `!`、doctor 退出 0；
+    /// 同一份配置选中 native 仍是 ✗。
+    #[test]
+    fn unreachable_base_url_only_warns_for_external_kernels() {
+        let dir = TempDir::new("doctor-base-url");
+        let workspace = dir.path().join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        // PATH 夹具里装上 codex：选中它时探测行 ✓，只有 base_url 一条 `!`
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(
+            bin.join("codex"),
+            "#!/bin/sh\nprintf '%s\\n' 'codex-cli 9.9.9'\n",
+        )
+        .unwrap();
+        set_executable(&bin.join("codex"));
+        let path = Some(bin.as_os_str());
+
+        let config = Config {
+            workspace_root: workspace,
+            api_key: Some("test-key".into()),
+            model: ignis_runtime::ModelConfig {
+                // 端口 1 上不会有服务：连接会被立刻拒绝（不需要等超时）
+                base_url: "127.0.0.1:1".into(),
+                // 环境变量名取一个不存在的（不走默认的 `OPENAI_API_KEY`），断言与运行者环境无关
+                api_key_env: "IGNIS_T8_ABSENT_KEY".into(),
+                ..ignis_runtime::ModelConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let results = collect(dir.path(), &Ok(config.clone()), Some("codex"), path);
+        let base_url = &results[3];
+        assert_eq!(base_url.name, "base_url");
+        assert_eq!(base_url.level, CheckLevel::Warn, "{base_url:?}");
+        assert!(base_url.detail.contains("127.0.0.1:1"), "{base_url:?}");
+        assert!(
+            base_url.detail.contains("仅 native 内核需要"),
+            "{base_url:?}"
+        );
+        assert!(base_url.detail.contains("当前内核 codex"), "{base_url:?}");
+        let mut out = Vec::new();
+        assert_eq!(
+            report(&mut out, &results).unwrap(),
+            ExitCode::SUCCESS,
+            "外部内核下端点不可达不该让 doctor 变红：{results:?}"
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("! base_url:"), "{text}");
+        assert!(!text.contains('✗'), "{text}");
+
+        // 对照：同一份配置选中 native → `✗ base_url`，退出码 1
+        let results = collect(dir.path(), &Ok(config), Some("native"), path);
+        assert_eq!(results[3].level, CheckLevel::Fail, "{:?}", results[3]);
+        let mut out = Vec::new();
+        assert_eq!(report(&mut out, &results).unwrap(), ExitCode::FAILURE);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("✗ base_url:"), "{text}");
+    }
+
+    /// 卡住的外部 CLI 不会把 `ignis doctor` 拖住：`--version` 只等 [`VERSION_PROBE_TIMEOUT`]，
+    /// 超时就杀掉子进程并按「不可用」如实报（与退出码非零/没有输出同形，级别照旧由是否选中决定）。
+    #[test]
+    fn probe_version_bounds_a_wedged_cli() {
+        let dir = TempDir::new("probe-timeout");
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        // `exec`：子进程被 kill 时不会留下一个孤儿 `sleep`
+        fs::write(bin.join("codex"), "#!/bin/sh\nexec sleep 600\n").unwrap();
+        set_executable(&bin.join("codex"));
+
+        let started = Instant::now();
+        let results = kernel_checks("native", Some(bin.as_os_str()));
+        let elapsed = started.elapsed();
+
+        assert_eq!(results[0].name, "codex");
+        assert_eq!(results[0].level, CheckLevel::Warn, "{:?}", results[0]);
+        assert!(
+            results[0].detail.contains("codex CLI 不可用") && results[0].detail.contains("未返回"),
+            "超时要按「CLI 不可用」如实报：{:?}",
+            results[0]
+        );
+        assert!(
+            elapsed < VERSION_PROBE_TIMEOUT + Duration::from_secs(1),
+            "探测必须在有界时间内收场，实测 {elapsed:?}"
+        );
     }
 
     /// 没装外部内核：未选中 → `!` 警告（含安装提示），选中 → ✗。

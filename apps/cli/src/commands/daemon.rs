@@ -45,7 +45,8 @@ pub async fn run(command: &DaemonCommand) -> Result<ExitCode> {
             let line = status_report(&daemon::status(&home), &daemon::pid_file(&home))?;
             println!("{line}");
         }
-        // 隐藏入口：自守护 re-exec 与 systemd/Docker 总是显式带 `--foreground`，漏了就报人话
+        // 隐藏入口：只有自守护 re-exec 会走它（re-exec 总带 `--foreground`）；systemd 的 ExecStart 是
+        // 同族前台入口 `daemon start --foreground`，Docker 的 ENTRYPOINT 是裸 `ignis`——都不经过这里
         DaemonCommand::Run { foreground } => {
             ensure_foreground(*foreground)?;
             daemon::run_foreground(&home).await?

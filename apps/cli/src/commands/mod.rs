@@ -86,16 +86,26 @@ pub fn resolve_workspace(cli: &Cli, config: &Config) -> Result<PathBuf> {
 }
 
 /// 生效密钥的来源：配置文件里的 `api_key`（含 `IGNIS_API_KEY` 覆盖）优先，其次配置指定的
-/// 环境变量（`model.api_key_env`）；两处都没有给 `None`。
+/// 环境变量（`model.api_key_env`）；两处都没有——或只有空串/纯空白——给 `None`。
 ///
 /// 与内核无关：native 缺它不能跑（[`missing_api_key`] 给人话错误），两个外部内核不需要它
 /// （用各自 CLI 的凭据、适配器不收 Ignis 的 key）——但只要有就照旧回填进 `config.api_key`，
 /// 脱敏器因此对三个内核一视同仁。
 fn resolve_api_key(config: &Config) -> Option<String> {
+    resolve_api_key_with(config, |key| std::env::var(key).ok())
+}
+
+/// 带环境变量注入的变体（与 core 的 `load_config_with_env` 同一手法）：用例因此不必改进程环境
+/// （测试可并行）。
+///
+/// 空白字符串一律视为未设置（与 core 的 `apply_env_overrides` 同一口径）：否则 doctor 报「未配置
+/// API key」而 native 的 `run` 拿一把空 key 上路，直到第一次请求才 401。
+fn resolve_api_key_with(config: &Config, get: impl Fn(&str) -> Option<String>) -> Option<String> {
     config
         .api_key
         .clone()
-        .or_else(|| std::env::var(&config.model.api_key_env).ok())
+        .filter(|key| !key.trim().is_empty())
+        .or_else(|| get(&config.model.api_key_env).filter(|key| !key.trim().is_empty()))
 }
 
 impl Session {
@@ -368,6 +378,61 @@ mod tests {
         let error = missing_api_key(&missing);
         assert!(error.contains("未配置 API key"), "{error}");
         assert!(error.contains("IGNIS_T3_ABSENT_KEY"), "{error}");
+    }
+
+    /// 空串/纯空白一律视为没配 key（`IGNIS_API_KEY=""`、配置里写了空串、`model.api_key_env`
+    /// 指向空串）：`run` 的密钥解析与 doctor 的结论必须一致——否则 doctor 报「未配置」（native
+    /// 时 ✗）而 `run` 拿一把空 key 上路，直到第一次请求才 401。
+    #[test]
+    fn empty_api_key_values_count_as_missing_on_both_sides() {
+        let dir = TempDir::new("empty-key");
+        // 环境变量名取一个不存在的（不走默认的 `OPENAI_API_KEY`），断言与运行者环境无关
+        let model = ignis_runtime::ModelConfig {
+            api_key_env: "IGNIS_T8_ABSENT_KEY".into(),
+            ..ignis_runtime::ModelConfig::default()
+        };
+
+        // `IGNIS_API_KEY=""`：core 的加载把空白值视为未设置，`config.api_key` 不会变成 `Some("")`
+        let loaded = ignis_core::config::load_config_with_env(dir.path(), |key| {
+            (key == "IGNIS_API_KEY").then(String::new)
+        })
+        .unwrap();
+        assert_eq!(loaded.api_key, None, "空串不该变成一把密钥");
+        assert_eq!(
+            resolve_api_key_with(&loaded, |_| None),
+            None,
+            "模型环境变量也没有：`run` 视为没有 key"
+        );
+
+        // 落在 `Some("")`/纯空白的两个来源：配置里的空串与设成空串的环境变量都不算
+        let blank = Config {
+            api_key: Some("   ".into()),
+            model: model.clone(),
+            ..Config::default()
+        };
+        assert_eq!(resolve_api_key_with(&blank, |_| None), None);
+        let no_key = Config {
+            model: model.clone(),
+            ..Config::default()
+        };
+        assert_eq!(resolve_api_key_with(&no_key, |_| Some("  ".into())), None);
+
+        // doctor 的结论与上面一致：native 下同一条「未配置 API key」是 ✗
+        let results = ignis_core::doctor::run_checks(
+            dir.path(),
+            &Ok(blank),
+            ignis_core::doctor::NATIVE_KERNEL,
+        );
+        let api_key = results
+            .iter()
+            .find(|result| result.name == ignis_core::doctor::CHECK_API_KEY)
+            .expect("api_key 行必在");
+        assert_eq!(
+            api_key.level,
+            ignis_core::doctor::CheckLevel::Fail,
+            "{api_key:?}"
+        );
+        assert!(api_key.detail.contains("未配置 API key"), "{api_key:?}");
     }
 
     /// 最小会话：只装配 `/kernel` 切换要用的字段（临时 home/工作区 + 空记忆与技能目录）。

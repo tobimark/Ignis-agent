@@ -90,7 +90,7 @@ ignis --workspace /path/to/your/project
 | 凭据 | `IGNIS_API_KEY`（或 `model.api_key_env`） | 用户自己的 codex 登录 / 配置 | 用户自己的 claude 凭据 |
 | 验证状态 | 真机：流式 + 工具调用、Demo A 全栈 | 真机三态：success / tool / failed | 真机一轮含工具调用；超时收束 |
 
-`ignis doctor` 按生效内核分级：选 `native` 缺密钥 → `✗`；选外置内核缺 Ignis 密钥只给 `!` 警告（用不上），而选中却没装对应 CLI 才是 `✗`。
+`ignis doctor` 按生效内核分级：选 `native` 缺密钥、或 `base_url` 端点不可达 → `✗`；选外置内核时这两条都只给 `!`（用不上 Ignis 的密钥，也不访问那个端点），而选中却没装对应 CLI 才是 `✗`。配置里的内核名写错是另一条路径：`✗ kernel` 单列一行（其余检查按 `native` 兜底，缺钥匙的 `api_key` 随之降级为 `!`，退出码已由 `✗ kernel` 顶上）。
 
 两点补充：① `IGNIS_MODEL` / 配置里的 `model.model` 只作用于 `native`（OpenAI 兼容端点的模型名）；两个外置内核一律用各自 CLI 的默认模型，Ignis **不转发**模型名（见 `apps/cli/src/commands/kernel.rs`）。② Docker 镜像只带 `ignis` 二进制，**不含 codex / claude**——要在容器里用外置内核需自行安装并在容器内登录。
 
@@ -236,9 +236,9 @@ ignis daemon stop            # 幂等：没在跑也算成功
 1. **调度 / 守护进程只跑 `native`**（决策 #18）：`packages/gateway` 的守护进程固定装配 `NativeRuntime`；`jobs.kernel` 列存在但恒为 `native`（`schedule_create` 没有内核参数），`--kernel codex|claude` 不影响守护进程。即使配置 `default_kernel` 是外置内核，守护进程仍需要 Ignis 自己的 OpenAI 兼容凭据。
 2. **外置内核下 Ignis 工具 / 审批 / 审计不适用**：工具在 codex / claude 自己的沙箱里执行；Ignis 不注入工具、不经手审批、没有 `approvals` 行；`remember` / `load_skill` / `notify_user` / `schedule_create` 不可用（能力门控会把系统提示里的工具清单收成一句说明）。
 3. **缺失已配置的外置 CLI 时 `run` 直接失败，无回退**：`ignis run --kernel codex` 在会话装配期就报「找不到 codex CLI…」，不会悄悄回落 `native`；`ignis doctor` 对选中的缺失内核给 `✗`。
-4. **`base_url` 探测对所有内核都是硬检查**：选 `codex` / `claude` 时若配置里的 OpenAI 兼容端点不可达，`base_url` 仍报 `✗`（退出码 1），即使这次运行根本不用它。
+4. **`base_url` 探测按生效内核分级**：选 `native` 时端点不可达（或地址不成形）是 `✗`；选 `codex` / `claude` 时降级为 `!`（Ignis 不访问这个端点）。注意守护进程固定跑 `native`（见限制 #1）——外部内核下的 `!` 只说明当前交互内核不受影响，调度任务仍会在这个端点上失败。
 5. **Windows 上内核发现未做 PATHEXT 解析**：`find_program` 只做「PATH 目录拼接 + 存在性 + Unix 执行位」判定，本机只在 Unix 实测。
-6. **`--version` 探测没有超时**：卡住的 `codex --version` / `claude --version` 会把 `ignis doctor` 拖住（要堵需要 spawn + 有界等待）。
+6. **`--version` 探测有界、但不解析输出语义**：探测把 `stdin` 接空设备并限时 5s（超时杀子进程，按「CLI 不可用」如实报，不再拖住 `ignis doctor`）；代价是两处假读数——启动噪声打到 `stderr` 可能被当成版本（假 `✓`），5s 内不吐输出的 CLI 被判不可用。
 7. **外置内核用量与上限退化**：codex / claude 不出 `Usage` 事件（`Capabilities{usage:false}`），token 记为 0；因此 token / 成本上限对它们不生效，只剩墙钟超时（`limits.task_timeout_secs`）与取消（REPL Ctrl-C / SIGINT）。
 8. **调度重扫窗口 30s**：新建 / 暂停 / 恢复的调度任务最迟 30s 生效（守护进程每轮最多睡 30s 重读 active job；无到期任务时也一样）。
 9. **`/kernel` 不共享外置会话**：每轮任务都把 Ignis 的 canonical 历史渲染进 prompt 交给一个新的 CLI 进程，不依赖也不复用 codex / claude 自己的 `--resume` 会话（切换内核不会带过来外置 CLI 的会话状态）。
