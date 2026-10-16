@@ -104,6 +104,48 @@ pub fn read_facts(db_path: &Path, key: &str) -> Vec<(i64, String, Option<i64>, S
     rows.map(|row| row.expect("事实行应可读取")).collect()
 }
 
+/// 全部告警行，按 `created_at` 升序（同刻按 id 升序）：`(severity, title, created_at, read_at)`。
+///
+/// 直读 `alerts` 表：Demo C 要断言的是「去重窗口内同标题到底留了几行」——只回未读的读路径会把
+/// 「被翻成已读」的现场抹掉，所以 `read_at` 单独给出来（未读为 `None`），读路径的过滤一律绕开。
+pub fn read_alerts(db_path: &Path) -> Vec<(String, String, i64, Option<i64>)> {
+    let conn = rusqlite::Connection::open(db_path).expect("告警表应可直读");
+    let mut stmt = conn
+        .prepare(
+            "SELECT severity, title, created_at, read_at FROM alerts
+             ORDER BY created_at ASC, id ASC",
+        )
+        .expect("告警查询应可编译");
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .expect("告警查询应可执行");
+    rows.map(|row| row.expect("告警行应可读取")).collect()
+}
+
+/// 某个 job（`job_id` 为 `None` 时是全部 job）的运行行，按 `started_at` 升序（同刻按 id 升序）：
+/// `(id, status, error)`（`error` 为 NULL 时给 `None`）。
+///
+/// 直读 `job_runs`：Demo C 要按「第几次运行」定位现场（第一次落告警、第二次命中去重、被
+/// SIGKILL 遗留的 `running` 被清场），读路径的过滤与截断会把这几次数抹平。
+pub fn read_job_runs(
+    db_path: &Path,
+    job_id: Option<&str>,
+) -> Vec<(String, String, Option<String>)> {
+    let conn = rusqlite::Connection::open(db_path).expect("运行表应可直读");
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, status, error FROM job_runs
+             WHERE (?1 IS NULL OR job_id = ?1) ORDER BY started_at ASC, id ASC",
+        )
+        .expect("运行查询应可编译");
+    let rows = stmt
+        .query_map([job_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("运行查询应可执行");
+    rows.map(|row| row.expect("运行行应可读取")).collect()
+}
+
 /// 在 `dir` 里跑 `npm test`，返回退出状态（输出丢弃，断言只看退出码）。
 pub fn run_npm_test(dir: &Path) -> ExitStatus {
     Command::new("npm")
