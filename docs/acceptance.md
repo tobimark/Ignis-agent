@@ -159,8 +159,22 @@ Demo C 的「创建 + 审批留痕 + job 落库」也都真实通过，卡在「
 取舍）。公开的 `due_at()`（CLI `schedule list` 用）保持无状态不变。判别用例（`packages/gateway/src/loop.rs`）：
 `created_at = now − 2·间隔`、重扫 1s、间隔 3s 的休眠 job 修复前 6s 内 0 次运行（RED）、修复后
 ~3s 触发（GREEN）；另有「首轮后 cadence = `last_run_at + 间隔`、重扫窗口不补跑」与快照复用用例。
+（上面这条快照当时只覆盖「从未运行」的休眠 job；同一类缺陷的**跑过**作业变体由 Wave C 泛化修复，见下。）
 `demos` 的 Demo C 详情行现在记录 `expr=<kind/expr>`，并在间隔 ≤ 30s 重扫窗口时打印 note 说明
 「>30s 首次到期」路径未被覆盖（见 `harness/acceptance.sh`）。
+
+**补丁（Wave C，`fix(gateway): interval 作业过期后按首次观察重新锚定（泛化停机场景）`）**：Wave A
+的快照只治了「从未运行」的一半，**同一滑动到期缺陷对跑过的作业完全一样**——`last_run_at + 间隔`
+已经过去时（守护进程停机 ≥ 一个间隔：重启、升级、崩溃、笔记本休眠），每轮重扫都把 `next_due` 现算成
+`now + 间隔` 并跳过，job 会**静默地永不再触发**（重扫周期 ≤ 30s ≤ 间隔时必然发生；修前判别测试
+6s 内 0 次运行）。修复即把首次观察锚**泛化**到一切过期的 interval 作业：锚点（`last_run_at`，
+从未运行过时取 `created_at`）`+ 间隔 ≤ 现在` 时，首次观察快照 `首次观察 + 间隔` 并复用同一锚——
+一个守护进程生命周期内触发一次、不补跑；锚点 + 间隔 仍晚于现在（新 job、刚跑过的 job）维持原拍子
+**不进快照**；cron 一律维持无状态口径；`due_at()`（CLI `schedule list` 用）不变；无 schema 变更，
+重启重新快照（仍是刻意的「不补跑」取舍）。判别测试（`packages/gateway/src/loop.rs`）：
+① `last_run_at = now − 2·间隔`、重扫 1s、间隔 3s：修复前 6s 内 0 次运行（RED）、修复后 ~3s 触发；
+② 过期作业只触发一次、随后由 `last_run_at + 间隔` 续拍（重扫窗口不补跑）；③ 刚跑过的作业
+（`last_run_at + 间隔` 仍晚于现在）按原拍子触发且不进快照；既有两条休眠作业用例保持 GREEN。
 
 脚本自测记录（**不是验收结果**，仅验证脚本逻辑。假端点把 Demo C 的 `schedule_create` 脚本化为
 **2 秒档**间隔，与 `apps/cli/tests/demo_c.rs` 的 `2s` 同档；**注意**：短间隔（≤30s 重扫窗口）的假端点
