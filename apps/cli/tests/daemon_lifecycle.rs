@@ -1,26 +1,31 @@
 //! 守护进程生命周期的真实进程用例（真二进制 + 真子进程）：
 //!
-//! 1. `ignis daemon start --foreground`（spec §6.9 的 `ExecStart`）**真的前台运行**：pidfile 里
+//! 1. 默认路径（`ignis daemon start` 的自守护）：start 后 status 报 `Running { pid }`、pidfile 与
+//!    日志落到 `{home}` 下；二次 start 必须失败并点名第一个守护进程的 pid；stop 之后没有 pidfile，
+//!    重复 stop 幂等退 0。另有三条边界用例：残留 pidfile 里的活 pid（被复用的无关进程）不能骗过
+//!    start；没跑过时 status 说「没在跑」且不创建 pidfile；pidfile 被改坏（锁仍被在跑的守护进程
+//!    持有）时 status 是失败态（退出非 0、stderr 走 `error: {人话}`）。
+//! 2. `ignis daemon start --foreground`（spec §6.9 的 `ExecStart`）**真的前台运行**：pidfile 里
 //!    写着刚拉起的那个直接子进程自己的 pid，进程在断言期间一直是本进程的直接子进程（自守护实现会
 //!    让父进程立刻退掉、pidfile 里是别人的 pid），SIGTERM 后自己退出 0 并摘掉 pidfile。
-//! 2. `ignis daemon stop` 的等待窗口要盖过调度循环的优雅收尾（`SHUTDOWN_GRACE` = 10s）：
+//! 3. `ignis daemon stop` 的等待窗口要盖过调度循环的优雅收尾（`SHUTDOWN_GRACE` = 10s）：
 //!    一轮在飞运行停在 `sleep 7` 上，`stop` 必须等它自然收尾——运行行收成 `success`、守护进程
 //!    退出码 0、pidfile 摘掉。旧行为（5s 就升级 SIGKILL）会让这一轮留在 `running`、进程被信号
 //!    打死，所以这条用例同时是「STOP_TIMEOUT > SHUTDOWN_GRACE」的守护。
 //!
-//! 两条用例都直读用例自己的临时库（绝不碰真实 `~/.ignis`），收尾一律 SIGTERM → 必要 SIGKILL，
-//! 任何断言失败都不留后台守护进程。
+//! 所有用例都直读自己的临时 home / 临时库（绝不碰真实 `~/.ignis`），收尾一律 SIGTERM → 必要
+//! SIGKILL，任何断言失败都不留后台守护进程。
 
 mod common;
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use common::{TempDir, ignis_cmd, latest_task, output_text, read_job_runs, tool_call};
-use ignis_gateway::daemon::{DaemonStatus, status};
+use ignis_gateway::daemon::{DaemonStatus, status, stop};
 use ignis_runtime::test_support::{ScriptStep, ScriptedModel};
 use serde_json::json;
 
@@ -37,6 +42,9 @@ const INTERVAL: &str = "2s";
 const HANG_COMMAND: &str = "sleep 7";
 /// 轮询步长。
 const POLL: Duration = Duration::from_millis(100);
+/// 默认（自守护）路径用例的 base URL：这些用例只走守护进程生命周期、不跑任务，模型不会被访问，
+/// 给一个不会连上的本地地址即可（`ignis_cmd` 的装配要求一个 base URL，守护进程装配只查密钥）。
+const UNUSED_BASE_URL: &str = "http://127.0.0.1:1";
 
 /// 轮询等条件成立（100ms 一次）；超时 panic 并说明在等什么。
 fn wait_for(timeout: Duration, what: &str, mut check: impl FnMut() -> bool) {
@@ -71,6 +79,57 @@ fn any_task_log_contains(home: &Path, needle: &str) -> bool {
         path.extension().is_some_and(|ext| ext == "jsonl")
             && fs::read_to_string(&path).is_ok_and(|text| text.contains(needle))
     })
+}
+
+/// 跑一次 `ignis …`（默认自守护路径的用例）：home 与工作区都钉在临时目录里，密钥走环境变量，
+/// stdin 是非 tty。
+fn ignis(home: &Path, args: &[&str]) -> Output {
+    ignis_cmd(home, home, UNUSED_BASE_URL)
+        .args(args)
+        .output()
+        .expect("ignis 二进制应可执行")
+}
+
+/// stdout 文本（断言输出文案用）。
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// 从 `daemon started (pid N)` 里取出 N（start 的文案是契约）。
+fn started_pid(output: &Output) -> i32 {
+    let out = stdout(output);
+    let pid = out
+        .split("daemon started (pid ")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .unwrap_or_else(|| panic!("start 输出里没有 pid：{out}"));
+    pid.trim().parse().expect("pid 应是数字")
+}
+
+/// 用例结束（含断言失败/panic）时把守护进程收掉：`stop` 自身会走 SIGTERM → 12s → SIGKILL。
+struct StopDaemon(PathBuf);
+
+impl Drop for StopDaemon {
+    fn drop(&mut self) {
+        let _ = stop(&self.0);
+    }
+}
+
+/// 坏 pidfile 用例的守卫：pidfile 还在（可能已被改坏）时先写回已知的守护进程 pid，再走正规
+/// `stop`——坏 pidfile 下 `stop` 认不出 pid（会报 BadPidfile），收尾不能把守护进程留成泄漏。
+struct RestoreThenStop {
+    home: PathBuf,
+    pid: i32,
+}
+
+impl Drop for RestoreThenStop {
+    fn drop(&mut self) {
+        // pidfile 已被正规 stop 清掉时什么都不做；还在（含被改坏）才写回真 pid 再停
+        if self.home.join("ignis.pid").exists() {
+            let _ = fs::write(self.home.join("ignis.pid"), format!("{}\n", self.pid));
+            let _ = stop(&self.home);
+        }
+    }
 }
 
 /// 前台守护进程子进程 + 收尾守卫：`ignis daemon start --foreground` 的直接子进程。
@@ -193,6 +252,195 @@ impl Env {
     fn pid_path(&self) -> PathBuf {
         self.home.join("ignis.pid")
     }
+}
+
+/// 全流程：start（自守护）→ status Running → 二次 start 报错并点名 pid → stop → status Stopped
+/// → 重复 stop 友好返回 0。
+#[test]
+fn daemon_lifecycle_start_status_stop() {
+    let dir = TempDir::new("lifecycle");
+    let home = dir.join("home");
+
+    // 1) start：等 pidfile 就绪，父进程回 `daemon started (pid N)`
+    let started = ignis(&home, &["daemon", "start"]);
+    // 守卫必须装在断言之前：start 可能已经拉起了一个（半）活的守护进程，断言 panic 也不能把它留下
+    let _guard = StopDaemon(home.clone());
+    assert!(
+        started.status.success(),
+        "start 应成功：{}",
+        output_text(&started)
+    );
+    let pid = started_pid(&started);
+    assert!(pid > 0);
+    // pidfile / 日志都落在 home 下
+    assert!(home.join("ignis.pid").is_file(), "pidfile 应存在");
+    assert!(home.join("logs/daemon.log").is_file(), "daemon 日志应存在");
+    // 库侧状态：Running { pid }（flock 探测，跨进程可见）
+    assert_eq!(status(&home), DaemonStatus::Running { pid });
+
+    // 2) status 子命令：报在跑并点名 pid
+    let reported = ignis(&home, &["daemon", "status"]);
+    assert!(reported.status.success(), "{}", output_text(&reported));
+    let out = stdout(&reported);
+    assert!(out.contains("running"), "status 应报在跑：{out}");
+    assert!(out.contains(&pid.to_string()), "status 应点名 pid：{out}");
+
+    // 3) 二次 start：必须失败，且错误里点名第一个守护进程的 pid
+    let second = ignis(&home, &["daemon", "start"]);
+    assert!(
+        !second.status.success(),
+        "已经有守护进程时 start 必须失败：{}",
+        output_text(&second)
+    );
+    let err = String::from_utf8_lossy(&second.stderr).into_owned();
+    assert!(
+        err.starts_with("error: "),
+        "错误应走 `error: {{人话}}`：{err}"
+    );
+    assert!(
+        err.contains(&pid.to_string()),
+        "错误里必须点名 pid {pid}：{err}"
+    );
+    // 第二个进程没有真的起来：还是原来那个 pid
+    assert_eq!(status(&home), DaemonStatus::Running { pid });
+
+    // 4) stop：SIGTERM 优雅退出，pidfile 清掉
+    let stopped = ignis(&home, &["daemon", "stop"]);
+    assert!(
+        stopped.status.success(),
+        "stop 应成功：{}",
+        output_text(&stopped)
+    );
+    assert!(
+        stdout(&stopped).contains(&pid.to_string()),
+        "stop 应点名 pid：{}",
+        stdout(&stopped)
+    );
+    assert_eq!(status(&home), DaemonStatus::Stopped);
+    assert!(!home.join("ignis.pid").exists(), "pidfile 应被清掉");
+
+    // 5) 重复 stop：幂等、友好、退出 0
+    let again = ignis(&home, &["daemon", "stop"]);
+    assert!(
+        again.status.success(),
+        "没在跑时 stop 必须退出 0：{}",
+        output_text(&again)
+    );
+    assert!(
+        stdout(&again).contains("not running"),
+        "应提示没在跑：{}",
+        stdout(&again)
+    );
+    assert_eq!(status(&home), DaemonStatus::Stopped);
+}
+
+/// 残留 pidfile 里的**活** pid（SIGKILL 之后被复用到的无关进程）不能骗过 `start`：
+/// 它必须等到自己拉起的那个守护进程写下 pid 才算成功，回报的 pid 也绝不是那个无关进程的。
+#[test]
+fn daemon_start_ignores_a_stale_live_pid_in_the_pidfile() {
+    let dir = TempDir::new("stale-pid");
+    let home = dir.join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    // 模拟「上一次守护进程被 SIGKILL → 它的 pid 被复用」：写一个活着的、肯定不是守护进程的 pid
+    // （用测试进程自己最省事，`kill(pid, 0)` 一定说它活着）
+    let reused = std::process::id() as i32;
+    fs::write(home.join("ignis.pid"), format!("{reused}\n")).unwrap();
+
+    let started = ignis(&home, &["daemon", "start"]);
+    // 守卫先装：无论断言怎么失败，都不留下（可能已经起来的）守护进程
+    let _guard = StopDaemon(home.clone());
+
+    assert!(
+        started.status.success(),
+        "start 应成功：{}",
+        output_text(&started)
+    );
+    let pid = started_pid(&started);
+    assert_ne!(
+        pid,
+        reused,
+        "不能拿残留/被复用的 pid 谎报「已启动」：{}",
+        output_text(&started)
+    );
+    // 真守护进程的 pid 写进了 pidfile，库侧状态也指向它
+    assert_eq!(status(&home), DaemonStatus::Running { pid });
+    let in_file: i32 = fs::read_to_string(home.join("ignis.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("pidfile 应是新守护进程的 pid");
+    assert_eq!(in_file, pid, "pidfile 应被新守护进程换成自己的 pid");
+}
+
+/// 没跑过的时候 `status` 是 Stopped（不创建 pidfile，也不报错）。
+#[test]
+fn daemon_status_without_pidfile_is_stopped() {
+    let dir = TempDir::new("status-stopped");
+    let home = dir.join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    let reported = ignis(&home, &["daemon", "status"]);
+
+    assert!(reported.status.success(), "{}", output_text(&reported));
+    assert!(
+        stdout(&reported).contains("not running"),
+        "应提示没在跑：{}",
+        stdout(&reported)
+    );
+    assert!(!home.join("ignis.pid").exists(), "status 不该创建 pidfile");
+    assert_eq!(status(&home), DaemonStatus::Stopped);
+}
+
+/// pidfile 被改坏（锁仍被在跑的守护进程持有）时 `status` 必须报错：退出非 0、stderr 以
+/// `error: ` 开头——这是一条失败态，而不是悄悄说「没在跑」。收尾先把真 pid 写回 pidfile，
+/// 再走正规 `stop`，失败路径由守卫兜底，不留守护进程。
+#[test]
+fn daemon_status_with_a_corrupt_pidfile_fails() {
+    let dir = TempDir::new("bad-pidfile");
+    let home = dir.join("home");
+
+    let started = ignis(&home, &["daemon", "start"]);
+    // 基础守卫先进场（此时 pidfile 还是好的）：start 半途失败也不留守护进程
+    let _guard = StopDaemon(home.clone());
+    assert!(
+        started.status.success(),
+        "start 应成功：{}",
+        output_text(&started)
+    );
+    let pid = started_pid(&started);
+    // 坏 pidfile 专用守卫：无论后面哪条断言炸了，收尾都会先写回 pid 再停止
+    let _restore_and_stop = RestoreThenStop {
+        home: home.clone(),
+        pid,
+    };
+
+    // 守护进程在跑、锁被它持有；把 pidfile 改成不是 pid 的内容
+    fs::write(home.join("ignis.pid"), "not-a-pid\n").unwrap();
+
+    let reported = ignis(&home, &["daemon", "status"]);
+    assert!(
+        !reported.status.success(),
+        "坏 pidfile 时 status 必须退出非 0：{}",
+        output_text(&reported)
+    );
+    let err = String::from_utf8_lossy(&reported.stderr);
+    assert!(
+        err.starts_with("error: "),
+        "错误应走 `error: {{人话}}`：{err}"
+    );
+    assert!(err.contains("pidfile"), "错误要点名 pidfile：{err}");
+
+    // 收尾：先把真 pid 写回（`stop` 靠它找到进程），再走正规 stop
+    fs::write(home.join("ignis.pid"), format!("{pid}\n")).unwrap();
+    let stopped = ignis(&home, &["daemon", "stop"]);
+    assert!(
+        stopped.status.success(),
+        "stop 应成功：{}",
+        output_text(&stopped)
+    );
+    assert_eq!(status(&home), DaemonStatus::Stopped);
+    assert!(!home.join("ignis.pid").exists(), "pidfile 应被清掉");
 }
 
 /// `ignis daemon start --foreground` 前台运行：pidfile 是直接子进程自己的 pid，SIGTERM 后自己
