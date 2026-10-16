@@ -33,8 +33,10 @@
 #   IGNIS_ACCEPT_RESTART_BASELINE_WAIT  restarts 等基线运行的秒数（默认 180）
 #   IGNIS_ACCEPT_ALLOW_CI         在 CI 环境里显式放行（默认 CI 下拒绝运行；这是手动工具）
 #
-# 退出码：0 = 全部 PASS（允许带原因的 SKIP）｜1 = 有 FAIL（含门槛未达）
+# 退出码：0 = 全部 PASS 且没有任何门槛 SKIP｜1 = 有 FAIL（含门槛未达）或门槛 SKIP（验收不完整）
 #         2 = 前置检查未通过（缺环境/缺二进制/doctor 不通过）——不是「通过」
+# 「跳过」永不伪装成「通过」：逐项 SKIP 带原因；门槛级 SKIP（如无 uv 的 Demo B）让整体结论
+# 变成「验收不完整」并退出码 1——某条门槛从未被测量，就不能叫验收通过。
 # ============================================================================
 set -euo pipefail
 
@@ -53,6 +55,9 @@ readonly PROMPT_B_REMEMBER="这个项目使用 uv 管理 Python 环境，请记�
 readonly PROMPT_B_REUSE="帮我检查这个项目的依赖并运行测试"
 readonly PROMPT_B_CORRECT="不对，这个项目改用 pip 了"
 readonly PROMPT_C="创建一个调度任务：每隔 1 分钟运行 examples/test-server/check-health.sh --simulate 92，磁盘超过 85% 就用 notify_user 告警"
+# restarts 模式刻意用 20s 间隔：重启周期必须真的产出新运行行（20s ≤ RESCAN 的 30s 窗口，能按时触发）；
+# ≥1m 的「从未运行」job 即使修复后也要等到 created_at+间隔（60s）才首次到期，与重启周期不匹配。
+# 「>30s 首次到期」路径由 gateway 修复的判别测试与 demos 的 Demo C（1 分钟档）覆盖，不在这里等。
 readonly PROMPT_RESTART="创建一个调度任务：每隔 20 秒运行 examples/test-server/check-health.sh --simulate 92，磁盘超过 85% 就用 notify_user 告警"
 
 # ── 运行参数（parse_args 覆盖） ───────────────────────────────────────────────
@@ -82,6 +87,8 @@ DOCTOR_RC=""
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
+SKIP_GATE_COUNT=0
+SKIP_GATE_NAMES=""
 DRY_COUNT=0
 LAST_TASK_PASS=1
 JSONL_BYTES=0
@@ -94,10 +101,11 @@ B_PASS=0
 B_FAIL=0
 C_PASS=0
 C_FAIL=0
-# restarts 模式的累计计数
+# restarts 模式的累计计数（重复/孤儿跨轮取最大值：门槛行不能被后来的 0 覆盖掉先前非零）
 R_DUP_FIRES=0
 R_DUP_TASKS=0
 R_ORPHANS=0
+R_DUP_ERR=0
 R_CYCLES_PASS=0
 R_CYCLES_FAIL=0
 
@@ -165,7 +173,14 @@ gate() { # <PASS|FAIL|SKIP|DRY> <名称> <细节>
   local status="$1" name="$2" detail="${3:-}"
   printf '%-5s %-30s %s\n' "$status" "$name" "$detail"
   printf '%s\t%s\t%s\n' "$status" "$name" "$detail" >>"$GATES_FILE"
-  if [ "$status" = FAIL ]; then FAIL_COUNT=$((FAIL_COUNT + 1)); fi
+  case "$status" in
+    FAIL) FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
+    SKIP)
+      # 门槛级 SKIP = 验收不完整：某条门槛从未被测量，main 末尾据此给出非零退出码
+      SKIP_GATE_COUNT=$((SKIP_GATE_COUNT + 1))
+      SKIP_GATE_NAMES="${SKIP_GATE_NAMES}${SKIP_GATE_NAMES:+、}$name"
+      ;;
+  esac
 }
 
 # ── 小工具 ────────────────────────────────────────────────────────────────────
@@ -264,6 +279,28 @@ count() { # <db> <sql> → 非负整数（查不到给 0）
     ''|*[!0-9]*) printf '0' ;;
     *) printf '%s' "$value" ;;
   esac
+}
+
+# 否定侧断言专用（「没有重复」「没有 running 行」「没有孤儿行」）：查询失败必须与「零行」分开。
+# q()/count() 会把查询失败吞成 ""/0——在否定侧恰好等于 PASS，属于危险方向。这里让失败显式非零
+# 并打印原因到 stderr，调用方必须把它记成 FAIL（「查不到」≠「没有违规」）。
+count_checked() { # <db> <sql> → 非负整数；库不存在/打不开/SQL 报错/非数字 → 非零
+  local value=""
+  if [ ! -f "$1" ]; then
+    printf 'error: 否定侧检查失败：数据库不存在（%s）\n' "$1" >&2
+    return 1
+  fi
+  if ! value="$(dbq "$1" "$2")"; then
+    printf 'error: 否定侧检查失败：SQL 查询报错（db=%s）\n' "$1" >&2
+    return 1
+  fi
+  case "$value" in
+    ''|*[!0-9]*)
+      printf 'error: 否定侧检查失败：SQL 未返回非负整数（db=%s）\n' "$1" >&2
+      return 1
+      ;;
+  esac
+  printf '%s' "$value"
 }
 
 # 日志/工作区里是否混入了 API key 原文（0 干净 / 1 泄漏 / 2 没有 python3 无法判定）
@@ -445,6 +482,21 @@ wait_for() { # <秒> <描述> <命令...>
   done
   log "等待超时：$what"
   return 1
+}
+
+wait_for_rc() { # <秒> <描述> <命令...>：0=条件满足；1=超时；其他=命令自身报错（立即中止等待）
+  # 给否定侧等待用：命令用 2 表示「查询失败」，不能与「条件暂时不满足（1）」混为一谈。
+  local timeout="$1" what="$2"
+  shift 2
+  local deadline=$((SECONDS + timeout)) rc=1
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    rc=0
+    "$@" || rc=$?
+    [ "$rc" -eq 1 ] || return "$rc"
+    sleep 2
+  done
+  log "等待超时：$what"
+  return "$rc"
 }
 
 # ── 通用证据（任务行 / 审批 / 用量 / JSONL） ─────────────────────────────────
@@ -787,7 +839,7 @@ demo_gate() { # <名称> <PASS 数> <FAIL 数>
     return 0
   fi
   if [ "$pass" = "0" ] && [ "$fail" = "0" ]; then
-    gate SKIP "$name" "全部跳过（原因见上），未计入门槛"
+    gate SKIP "$name" "全部跳过（原因见上），未计入门槛；跳过 ≠ 通过 → 整体判「验收不完整」"
   elif [ "$fail" = "0" ] && [ "$pass" = "$N" ]; then
     gate PASS "$name" "$pass/$N 连续成功"
   else
@@ -834,6 +886,12 @@ task_run_one() { # <编号> <prompt> <判定子句> <home> <ws> <root>
     FAILURES="${FAILURES}JSONL 缺失; "
   elif ! log_has "$logpath" '"type":"task_end"'; then
     FAILURES="${FAILURES}JSONL 缺 task_end; "
+  fi
+
+  # 判定子句（tasks.md 第 4 列）必须非空：空/缺失 = FAIL。
+  # 不允许只靠上面的隐式检查兜底成 PASS——否则未来某行忘写判定就会悄悄弱化自己。
+  if [ -z "$(printf '%s' "$checks" | tr -d '[:space:]')" ]; then
+    FAILURES="${FAILURES}判定子句为空（tasks.md 第 4 列缺失）; "
   fi
 
   local clause="" value=""
@@ -969,8 +1027,10 @@ refresh_seen() { # <db> <job_id> <seen 文件>
   mv "$3.tmp" "$3"
 }
 
-no_running_runs() { # <db> <job_id>
-  [ "$(count "$1" "SELECT COUNT(*) FROM job_runs WHERE job_id='$2' AND status='running'")" -eq 0 ]
+no_running_runs() { # <db> <job_id>：0=已收尾；1=仍有 running；2=查询失败（不能当成「没有 running」）
+  local n=""
+  n="$(count_checked "$1" "SELECT COUNT(*) FROM job_runs WHERE job_id='$2' AND status='running'")" || return 2
+  [ "$n" -eq 0 ]
 }
 
 mode_restarts() {
@@ -988,7 +1048,9 @@ mode_restarts() {
   copy_tree "$EXAMPLES_DIR/test-server" "$ws/examples/test-server"
   track_home "$home"
 
-  # 1) 建一个短间隔调度任务（20s），由真实模型调 schedule_create
+  # 1) 建一个短间隔调度任务（20s），由真实模型调 schedule_create。
+  #    刻意用 20s：重启周期必须真的产出新运行行；≥1m 的「从未运行」job 修复后也要 60s 才首次到期，
+  #    等不起（>30s 首次到期路径由 gateway 判别测试与 demos 的 Demo C 覆盖，见 `PROMPT_RESTART` 处说明）。
   local rc=0
   run_ignis "$home" "$ws" "$root/create.out" "$root/create.err" run "$PROMPT_RESTART" --yes || rc=$?
   local job_id="" job_status="" job_expr="" job_kind=""
@@ -1019,6 +1081,7 @@ mode_restarts() {
   refresh_seen "$home/ignis.db" "$job_id" "$seen"
   prev_count="$(wc -l <"$seen" | tr -d ' ')"
   local i="" stop_out="" start_out="" status_out="" failures="" lost="" now_count=""
+  local dup_fires=0 dup_tasks=0 orphans=0 dup_err=""
   for ((i = 1; i <= N; i++)); do
     failures=""
     stop_out="$(ignis_cli "$home" daemon stop 2>&1 || true)"
@@ -1033,9 +1096,22 @@ mode_restarts() {
     esac
     sleep "$RESTART_SETTLE"
 
-    R_DUP_FIRES="$(count "$home/ignis.db" "SELECT COUNT(*) FROM (SELECT 1 FROM job_runs WHERE job_id='$job_id' GROUP BY started_at HAVING COUNT(*) > 1)")"
-    R_DUP_TASKS="$(count "$home/ignis.db" "SELECT COUNT(*) FROM (SELECT 1 FROM job_runs WHERE task_id IS NOT NULL AND task_id <> '' GROUP BY task_id HAVING COUNT(*) > 1)")"
-    R_ORPHANS="$(count "$home/ignis.db" "SELECT COUNT(*) FROM job_runs WHERE task_id IS NOT NULL AND task_id <> '' AND task_id NOT IN (SELECT id FROM tasks)")"
+    # 重复/孤儿是否定侧断言：count_checked——查询失败不能下沉成 0（那是 PASS 方向）
+    dup_fires=0 dup_tasks=0 orphans=0 dup_err=""
+    dup_fires="$(count_checked "$home/ignis.db" "SELECT COUNT(*) FROM (SELECT 1 FROM job_runs WHERE job_id='$job_id' GROUP BY started_at HAVING COUNT(*) > 1)")" \
+      || { dup_err="${dup_err}重复触发; "; dup_fires=0; }
+    dup_tasks="$(count_checked "$home/ignis.db" "SELECT COUNT(*) FROM (SELECT 1 FROM job_runs WHERE task_id IS NOT NULL AND task_id <> '' GROUP BY task_id HAVING COUNT(*) > 1)")" \
+      || { dup_err="${dup_err}重复引用; "; dup_tasks=0; }
+    orphans="$(count_checked "$home/ignis.db" "SELECT COUNT(*) FROM job_runs WHERE task_id IS NOT NULL AND task_id <> '' AND task_id NOT IN (SELECT id FROM tasks)")" \
+      || { dup_err="${dup_err}孤儿行; "; orphans=0; }
+    if [ -n "$dup_err" ]; then
+      R_DUP_ERR=$((R_DUP_ERR + 1))
+      failures="${failures}${dup_err}查询失败（「查不到」不能当「零行」）; "
+    fi
+    # 跨轮累积取最大值：门槛行会抄进结果文档，绝不能被后来某轮的 0 覆盖掉先前的非零
+    if [ "$dup_fires" -gt "$R_DUP_FIRES" ]; then R_DUP_FIRES="$dup_fires"; fi
+    if [ "$dup_tasks" -gt "$R_DUP_TASKS" ]; then R_DUP_TASKS="$dup_tasks"; fi
+    if [ "$orphans" -gt "$R_ORPHANS" ]; then R_ORPHANS="$orphans"; fi
     lost="$(comm -23 <(sort "$seen") <(runs_now "$home/ignis.db" "$job_id" | sort) | wc -l | tr -d ' ')"
     if [ "${lost:-0}" -gt 0 ]; then
       failures="${failures}丢失 $lost 条历史运行; "
@@ -1046,9 +1122,9 @@ mode_restarts() {
       failures="${failures}运行数从 $prev_count 降到 $now_count; "
     fi
     prev_count="$now_count"
-    [ "$R_DUP_FIRES" -eq 0 ] || failures="${failures}同一时刻重复触发 $R_DUP_FIRES 次; "
-    [ "$R_DUP_TASKS" -eq 0 ] || failures="${failures}同一 task_id 被重复引用 $R_DUP_TASKS 次; "
-    [ "$R_ORPHANS" -eq 0 ] || failures="${failures}孤儿运行行 $R_ORPHANS 条; "
+    [ "$dup_fires" -eq 0 ] || failures="${failures}同一时刻重复触发 $dup_fires 次; "
+    [ "$dup_tasks" -eq 0 ] || failures="${failures}同一 task_id 被重复引用 $dup_tasks 次; "
+    [ "$orphans" -eq 0 ] || failures="${failures}孤儿运行行 $orphans 条; "
     if [ -z "$failures" ]; then
       record PASS "restart #$i" "stop→start 干净；累计 runs=$now_count；重复触发=0 丢失=0"
       R_CYCLES_PASS=$((R_CYCLES_PASS + 1))
@@ -1058,10 +1134,16 @@ mode_restarts() {
     fi
   done
 
-  # 4) 收尾：等在飞运行落终态，再停守护进程并确认无残留
-  if ! wait_for 90 "所有运行收尾（无 running 行）" no_running_runs "$home/ignis.db" "$job_id"; then
-    record FAIL "restarts 收尾" "仍有 running 状态的运行行"
-  fi
+  # 4) 收尾：等在飞运行落终态，再停守护进程并确认无残留。
+  #    「无 running 行」是否定侧断言：查询失败（rc≥2）与「等到超时仍有 running」（rc=1）分别记 FAIL，
+  #    不能把「查不到」当「已收尾」。
+  local drain_rc=0
+  wait_for_rc 90 "所有运行收尾（无 running 行）" no_running_runs "$home/ignis.db" "$job_id" || drain_rc=$?
+  case "$drain_rc" in
+    0) : ;;
+    1) record FAIL "restarts 收尾" "90s 内仍有 running 状态的运行行" ;;
+    *) record FAIL "restarts 收尾" "running 行数查询失败：无法证明已收尾（「查不到」≠「零行」，见 stderr）" ;;
+  esac
   ignis_cli "$home" daemon stop >/dev/null 2>&1 || true
   status_out="$(ignis_cli "$home" daemon status 2>/dev/null || true)"
   if [ -n "$job_id" ] && [ "$(q "$home/ignis.db" "SELECT status FROM jobs WHERE id='$job_id'")" != "active" ]; then
@@ -1073,10 +1155,10 @@ mode_restarts() {
   esac
 
   local dup_total=$((R_DUP_FIRES + R_DUP_TASKS + R_ORPHANS))
-  if [ "$R_CYCLES_FAIL" -eq 0 ] && [ "$R_CYCLES_PASS" -eq "$N" ] && [ "$dup_total" -eq 0 ]; then
+  if [ "$R_CYCLES_FAIL" -eq 0 ] && [ "$R_CYCLES_PASS" -eq "$N" ] && [ "$dup_total" -eq 0 ] && [ "$R_DUP_ERR" -eq 0 ]; then
     gate PASS "restarts ×$N" "$R_CYCLES_PASS/$N 次启停干净；重复触发=0 重复引用=0 孤儿行=0 丢失=0"
   else
-    gate FAIL "restarts ×$N" "$R_CYCLES_PASS/$N 通过；重复触发=$R_DUP_FIRES 重复引用=$R_DUP_TASKS 孤儿行=$R_ORPHANS"
+    gate FAIL "restarts ×$N" "$R_CYCLES_PASS/$N 通过；重复触发=$R_DUP_FIRES 重复引用=$R_DUP_TASKS 孤儿行=$R_ORPHANS 重复检查查询失败轮数=$R_DUP_ERR"
   fi
 }
 
@@ -1090,8 +1172,8 @@ print_summary() {
   while IFS=$'\t' read -r status name detail; do
     printf '%-5s %-30s %s\n' "$status" "$name" "$detail"
   done <"$GATES_FILE"
-  printf '\n合计：PASS=%d FAIL=%d SKIP=%d DRY=%d（耗时 %ss）\n' \
-    "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT" "$DRY_COUNT" "$SECONDS"
+  printf '\n合计：PASS=%d FAIL=%d SKIP=%d 门槛SKIP=%d DRY=%d（耗时 %ss）\n' \
+    "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT" "$SKIP_GATE_COUNT" "$DRY_COUNT" "$SECONDS"
 }
 
 write_results() {
@@ -1115,8 +1197,8 @@ write_results() {
       printf '%-5s %-30s %s\n' "$status" "$name" "$detail"
     done <"$ITEMS_FILE"
     printf '```\n\n## 说明\n\n'
-    printf -- '- SKIP 不是 PASS：每一行 SKIP 都带原因（例如本机未安装 uv）。\n'
-    printf -- '- 退出码 0 只在没有任何 FAIL 时给出；本文件由 `harness/acceptance.sh` 自动生成。\n'
+    printf -- '- SKIP 不是 PASS：每一行 SKIP 都带原因（例如本机未安装 uv）；门槛级 SKIP 会把整体结论判成「验收不完整」。\n'
+    printf -- '- 退出码 0 只在没有任何 FAIL 且门槛行没有 SKIP 时给出；门槛 SKIP（某条门槛从未被测量）⇒ 退出码 1。本文件由 `harness/acceptance.sh` 自动生成。\n'
     printf -- '- 端点与模型来自环境变量；本文件只记录脱敏后的端点（URL 里的 user:pass@ 会被打码）。\n'
   } >"$RESULTS_PATH"
   log "结果已写入：$RESULTS_PATH"
@@ -1161,6 +1243,11 @@ main() {
   fi
   if [ "$FAIL_COUNT" -gt 0 ]; then
     log "验收未通过：FAIL=$FAIL_COUNT（SKIP=$SKIP_COUNT 不算通过）"
+    exit 1
+  fi
+  if [ "$SKIP_GATE_COUNT" -gt 0 ]; then
+    # 门槛级 SKIP：某条门槛从未被测量（典型：无 uv 时 Demo B 整条跳过）——不是通过，也不是 FAIL
+    log "验收不完整：${SKIP_GATE_NAMES:-某条门槛} 未运行（门槛 SKIP=$SKIP_GATE_COUNT）——跳过不等于通过，退出码 1"
     exit 1
   fi
   log "验收通过：PASS=$PASS_COUNT SKIP=$SKIP_COUNT"

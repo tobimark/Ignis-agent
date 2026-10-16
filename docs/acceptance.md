@@ -2,7 +2,8 @@
 
 `demo.md` §七给 V0.1 定了三条**内部门槛**；`harness/acceptance.sh` 是这三条的执行器：跑真二进制、
 连真实 OpenAI 兼容端点、核对真数据库行与真 JSONL 日志。它**不进 CI**、**不是 `cargo test` 的一部分**，
-且在没有真实模型凭据时**拒绝启动**（退出码 2）——「跳过」永远不会被伪装成「通过」。
+且在没有真实模型凭据时**拒绝启动**（退出码 2）——「跳过」永远不会被伪装成「通过」：逐项 SKIP 都带原因，
+且**门槛级 SKIP**（如本机无 `uv` 导致 Demo B 整条跳过）会把整体结论判成「验收不完整」、退出码非 0。
 
 - 脚本：`harness/acceptance.sh`（bash；`bash -n` 通过）
 - 任务清单：`harness/tasks.md`（20 例常见任务，逐条含机器可判定的预期）
@@ -12,19 +13,24 @@
 
 | # | 门槛（demo.md §七） | 命令 | 判定口径 |
 |---|-------------------|------|---------|
-| 1 | 三个演示场景**各连续成功 3 次** | `harness/acceptance.sh demos 3` | A / B / C 三行门槛各为 `3/3` 才算 PASS；任一次 FAIL → 该场景 FAIL → 退出码 1 |
+| 1 | 三个演示场景**各连续成功 3 次** | `harness/acceptance.sh demos 3` | A / B / C 三行门槛各为 `3/3` 才算 PASS；任一次 FAIL → 该场景 FAIL → 退出码 1；任一场景整条 SKIP（如无 uv 的 B）→ 门槛 SKIP → 结论「验收不完整」→ 退出码 1 |
 | 2 | 20 次常见任务端到端成功率 **≥80%** | `harness/acceptance.sh tasks 20` | `PASS / (PASS+FAIL) ≥ 80%`；`harness/tasks.md` 的前 N 条按顺序执行 |
 | 3 | 10 次服务重启**不重复执行、不丢记录** | `harness/acceptance.sh restarts 10` | 每次 `stop → start` 后核对：同一时刻无重复触发、无重复 task 引用、无孤儿运行行、历史运行不减少；收尾无守护进程残留 |
 
-三条各自独立跑；一次完整的验收 = 三个命令都跑（都退出 0）。`--dry-run` 只演练流程、不联网、
-不写结果文件，用于确认脚本与夹具就位。
+三条各自独立跑；一次完整的验收 = 三个命令都跑且都退出 0（即没有任何 FAIL、门槛行也没有 SKIP）。
+`--dry-run` 只演练流程、不联网、不写结果文件，用于确认脚本与夹具就位。
+
+> 口径说明：`restarts` 模式**刻意**用 20 秒间隔的调度任务（脚本里的 `PROMPT_RESTART`）——重启周期必须
+> 真的产出新的运行行；≥1 分钟的「从未运行」job 即使修复后也要等到 `created_at + 间隔`（60s）才首次
+> 到期，与重启周期不匹配。**>30 秒的首次到期路径**由 gateway 修复的判别测试（`never_run` 两条用例）与
+> `demos` 的 Demo C（1 分钟档）覆盖，不靠 restarts 模式。
 
 ### 每个场景具体核对了什么
 
 | 场景 | 证据（全部来自真库/真文件/真日志） |
 |------|-----------------------------------|
 | Demo A（修好坏项目） | 修复前 `npm test` 必须失败（复现）；`ignis run` 退出 0 且 `tasks.status=success`；修复后 `npm test` 退出 0；`approvals` 含写操作（`fs_edit`/`fs_write`）；`input_tokens+output_tokens > 0`；`logs/<task_id>.jsonl` 存在且含 `task_end` |
-| Demo B（跨会话记忆） | 会话 1 `remember` 落库（active 事实含 uv）；**新进程**会话 2 的工具日志出现 `uv sync` / `uv run`（注入命中）；会话 3 纠正后旧 uv 事实 `superseded`、新 pip 事实 active。**uv 未安装 → 整条记 SKIP（原因写明），不记 PASS** |
+| Demo B（跨会话记忆） | 会话 1 `remember` 落库（active 事实含 uv）；**新进程**会话 2 的工具日志出现 `uv sync` / `uv run`（注入命中）；会话 3 纠正后旧 uv 事实 `superseded`、新 pip 事实 active。**uv 未安装 → 整条记 SKIP（原因写明），不记 PASS**；门槛行随之 SKIP，整体结论为「验收不完整」（退出码 1） |
 | Demo C（后台主动工作） | `schedule_create` 有审批留痕、job 落库且 active；`ignis daemon start` 在 CLI 进程退出**之后**；等到一轮 `job_runs` 终态 success，其 `task.kind=schedule`（只可能是守护进程写的）；`job_runs.started_at ≥` 创建任务的 `ended_at`（后台触发的时间证据）；告警按 `source_job_id` 落库且 `ignis alerts` 可见；`ignis schedule history` 可见该运行；调度运行的 token 记账 > 0；调度任务 JSONL 存在（字节数即「时间线字节数」）；`daemon stop` 之后不再运行 |
 
 ## 2. demo.md 验收清单十条 → 本仓库的检查位置
@@ -48,7 +54,8 @@
 
 - 已构建二进制：`cargo build --release`（或 `IGNIS_BIN=/path/to/ignis`）。
 - 本机有 `npm`（Demo A 与任务 #7）、`sqlite3` 或 `python3`（直读 `ignis.db` 核对证据）。
-- Demo B 完整跑需要 `uv`（`curl -LsSf https://astral.sh/uv/install.sh | sh`）；未安装则 B 记 SKIP。
+- Demo B 完整跑需要 `uv`（`curl -LsSf https://astral.sh/uv/install.sh | sh`）；未安装则 B 记 SKIP，
+  且该门槛 SKIP 会让整体结论变成「验收不完整」（退出码 1）——B 项必须装了 uv 才会被真正测量。
 - 任意 OpenAI 兼容端点（本仓库在 `https://api.minimax.cn/v1` + `MiniMax-M2` 上真机验证过 native 内核）。
 
 ```sh
@@ -69,9 +76,10 @@ export IGNIS_API_KEY=sk-...                      # 只经环境变量传入；�
 
 退出码：
 
-- `0`：没有任何 FAIL（**允许**带原因的 SKIP；门槛行也全 PASS）。
-- `1`：有 FAIL（含门槛未达标）。注意：门槛行按成功率判定，而退出码更严——任何一条 FAIL 都会给 1，
-  例如 17/20（85%，门槛 PASS）里那 3 条失败仍会让退出码为 1。
+- `0`：没有任何 FAIL，且**门槛行没有 SKIP**。逐项明细里允许带原因的 SKIP；一旦门槛行出现 SKIP
+  （例如无 uv 时 Demo B 整条跳过），结论是「验收不完整」，退出码 1——某条门槛从未被测量，就不能叫通过。
+- `1`：有 FAIL（含门槛未达标）**或**门槛行有 SKIP（「验收不完整」）。注意：门槛行按成功率判定，
+  而退出码更严——任何一条 FAIL 都会给 1，例如 17/20（85%，门槛 PASS）里那 3 条失败仍会让退出码为 1。
 - `2`：前置检查未通过（缺环境变量/缺工具/`doctor` 未通过/CI 环境）——**不是**「通过」。
 
 `--dry-run`：不检查凭据、不联网、不写结果文件，只打印每个场景将执行的命令与判定子句；
@@ -95,10 +103,15 @@ gitignore），需要长期留存时请贴到发布说明或附件里。
 
 | 日期 | 端点 / 模型（形状） | 命令 | 门槛结果 | 结果文件 |
 |------|-------------------|------|---------|---------|
-| （运行后填写） | 例：`https://your-endpoint/v1` / `your-model` | `demos 3` / `tasks 20` / `restarts 10` | 例：A 3/3、B SKIP（无 uv）、C 3/3；tasks 17/20；restarts 10/10 | `harness/results-<ts>.md` |
+| （运行后填写） | 例：`https://your-endpoint/v1` / `your-model` | `demos 3` / `tasks 20` / `restarts 10` | 例：A 3/3、B SKIP（无 uv）→「验收不完整」退出码 1；tasks 17/20；restarts 10/10 | `harness/results-<ts>.md` |
 | 2026-10-16 | `https://api.minimax.cn/v1` / `MiniMax-M2` | `demos 1`（脚本首跑，**不是**门槛达标） | Doctor ✓；A 1/1 PASS；B SKIP（无 uv）；C 0/1 FAIL（真阳性，见下） | `harness/results-20261016-154501.md` |
 | 2026-10-16 | 同上 | `tasks 2`（前两条，**不是**门槛达标） | 2/2 = 100%（N=2 < 20，未计完整门槛）；退出码 0 | `harness/results-20261016-155357.md` |
-| 2026-10-16 | 同上 | `demos 1`（**修复后复验**） | Doctor ✓；A 1/1 PASS；B SKIP（无 uv）；**C 1/1 PASS**（`run=success kind=schedule alert=1`，daemon 停止后无残留）；退出码 0 | `harness/results-20261016-161436.md` |
+| 2026-10-16 | 同上 | `demos 1`（**修复后复验**） | Doctor ✓；A 1/1 PASS；B SKIP（无 uv）；**C 1/1 PASS**（`run=success kind=schedule alert=1`，daemon 停止后无残留）；按当时脚本为退出码 0（现行口径见下注） | `harness/results-20261016-161436.md` |
+| 2026-10-16 | 同上 | `demos 1`（门槛 SKIP 语义修复后复验，**不是**门槛达标） | Doctor ✓；A 1/1 PASS；B SKIP（无 uv）；C 1/1 PASS；结论「**验收不完整**：Demo B ×1 未运行」——跳过 ≠ 通过，退出码 1 | `harness/results-20261016-164015.md` |
+
+> 注：2026-10-16 早前的两次 `demos 1`（154501 / 161436）是**当时**脚本的结论；其中 161436 那次带 B SKIP
+> 却仍打印「验收通过、退出码 0」。本修复（门槛 SKIP ⇒「验收不完整」、退出码 1）落地后，任何带 B SKIP 的
+> `demos` 运行都不会再打印「验收通过」——164015 那次已按新口径退出 1。`tasks 2` 无门槛 SKIP，仍为退出码 0。
 
 ### 2026-10-16 真机首跑发现：Demo C 触发不了（真阳性，已修复）
 
@@ -130,7 +143,10 @@ Demo C 的「创建 + 审批留痕 + job 落库」也都真实通过，卡在「
 停止后无残留，`harness/results-20261016-161436.md`）；`cargo test --workspace` 505 passed /
 0 failed / 1 ignored。
 
-脚本自测记录（**不是验收结果**，仅验证脚本逻辑）：2026-10-16 用本地假端点（脚本化 SSE）跑过
-`demos 3`（三场景 3/3）、`tasks 5`（5/5）与 `tasks 20`（7/20，门槛 FAIL、退出码 1）、
-`restarts 1/2`（重复/孤儿/丢失全 0），并验证了缺凭据与 CI 的拒绝路径、`--dry-run`、`--keep`、
-以及 `sqlite3`/`python3` 两种证据读取后端。
+脚本自测记录（**不是验收结果**，仅验证脚本逻辑。假端点把 Demo C 的 `schedule_create` 脚本化为
+**2 秒档**间隔，与 `apps/cli/tests/demo_c.rs` 的 `2s` 同档；**注意**：短间隔（≤30s 重扫窗口）的假端点
+覆盖不到「>30s 的从未运行 job 首次到期」这条路径——真机首跑正是卡在这里，因此那次「C 3/3」只证明
+脚本管线可走通，**不构成 1 分钟路径的验收证据**；该路径由 gateway 修复的判别测试与真机 Demo C 覆盖）：
+2026-10-16 用本地假端点（脚本化 SSE）跑过 `demos 3`（三场景 3/3）、`tasks 5`（5/5）与 `tasks 20`
+（7/20，门槛 FAIL、退出码 1）、`restarts 1/2`（重复/孤儿/丢失全 0），并验证了缺凭据与 CI 的拒绝路径、
+`--dry-run`、`--keep`、以及 `sqlite3`/`python3` 两种证据读取后端。
