@@ -726,11 +726,16 @@ demo_c_once() {
   if [ "$(count "$home/ignis.db" "SELECT COUNT(*) FROM approvals WHERE task_id='$create_id' AND tool='schedule_create'")" -lt 1 ]; then
     FAILURES="${FAILURES}schedule_create 没有审批留痕; "
   fi
-  local job_id="" job_status="" job_kind="" job_expr=""
+  local job_id="" job_status="" job_kind="" job_expr="" job_name="" job_prompt="" job_simulate="no"
   job_id="$(q "$home/ignis.db" "SELECT id FROM jobs ORDER BY created_at DESC, id DESC LIMIT 1")"
   job_status="$(q "$home/ignis.db" "SELECT status FROM jobs WHERE id='$job_id'")"
   job_kind="$(q "$home/ignis.db" "SELECT schedule_kind FROM jobs WHERE id='$job_id'")"
   job_expr="$(q "$home/ignis.db" "SELECT schedule_expr FROM jobs WHERE id='$job_id'")"
+  # 作业提示由「创建 run」里的模型自写（两段式链路）：只读回显名称与是否含模拟步骤，
+  # 供 alert=0 失败时第一手归因——提示漏掉 `--simulate 92` 时观测值低于阈值，「不告警」是正确行为。
+  job_name="$(q "$home/ignis.db" "SELECT COALESCE(name,'') FROM jobs WHERE id='$job_id'")"
+  job_prompt="$(q "$home/ignis.db" "SELECT COALESCE(prompt,'') FROM jobs WHERE id='$job_id'")"
+  case "$job_prompt" in *--simulate*92*) job_simulate="yes" ;; esac
   if [ -z "$job_id" ]; then
     FAILURES="${FAILURES}没有落库的调度任务; "
   else
@@ -781,7 +786,8 @@ demo_c_once() {
   local alert_count="0" alert_title=""
   alert_count="$(count "$home/ignis.db" "SELECT COUNT(*) FROM alerts WHERE source_job_id='$job_id'")"
   if [ "${alert_count:-0}" -lt 1 ]; then
-    FAILURES="${FAILURES}没有落库的告警（notify_user 未触发？）; "
+    # 不落告警不一定是产品缺陷：提示由模型自写，漏掉模拟步骤时观测值低于阈值，「不告警」正确。
+    FAILURES="${FAILURES}没有落库的告警（alert=0）; 提示: 先查作业提示是否包含 --simulate 92（--keep 后用 sqlite3 查 jobs.prompt）以及守护运行的 JSONL 是否调用 notify_user；作业提示漏掉模拟步骤时「不告警」是正确行为; "
   fi
   alert_title="$(q "$home/ignis.db" "SELECT COALESCE(title,'') FROM alerts WHERE source_job_id='$job_id' ORDER BY id ASC LIMIT 1")"
   local alerts_out=""
@@ -809,7 +815,7 @@ demo_c_once() {
   key_scan "$home" >/dev/null 2>&1 || ks=$?
   if [ "$ks" -eq 1 ]; then FAILURES="${FAILURES}日志里出现 API key 原文; "; fi
 
-  # 详情行记录 job 的调度表达式；间隔 ≤ 重扫窗口（RESCAN_SECS）时，「>30s 的首次到期」路径
+  # 详情行记录 job 名、提示是否含模拟步骤（simulate=yes|no）与调度表达式；间隔 ≤ 重扫窗口（RESCAN_SECS）时，「>30s 的首次到期」路径
   # 不会被本次运行覆盖——表达式由模型自选，这里只记一条 note，不判 FAIL。
   local rescan_note="" every_secs=""
   if [ "$job_kind" = "interval" ]; then
@@ -819,7 +825,7 @@ demo_c_once() {
     fi
   fi
 
-  local detail="job=active expr=${job_kind:-none}/${job_expr:-none} run=${run_status:-none} kind=${run_kind:-none} alert=${alert_count:-0} tokens=${run_tin:-0}/${run_tout:-0} jsonl=${JSONL_BYTES}B skills=${skills:-none}${rescan_note}"
+  local detail="job=${job_name:-none} simulate=${job_simulate} expr=${job_kind:-none}/${job_expr:-none} run=${run_status:-none} kind=${run_kind:-none} alert=${alert_count:-0} tokens=${run_tin:-0}/${run_tout:-0} jsonl=${JSONL_BYTES}B skills=${skills:-none}${rescan_note}"
   if [ -z "$FAILURES" ]; then
     record PASS "$name" "$detail 停止后无残留"
     C_PASS=$((C_PASS + 1))

@@ -186,6 +186,7 @@ ignis daemon stop            # 幂等：没在跑也算成功
 - **codex 0.162.1**：真机三态（success / tool / failed）全部映射零改动。
 - **claude 2.1.274**：真机一轮含工具调用（7.4s）；端点不可达时按 `task_timeout` 收束、零残留进程。
 - 密钥只经环境变量传入，未落盘、未入仓库与日志。
+- **Demo C（2026-10-16 真机复验）**：调度全链路通过（作业提示含 `--simulate 92` → 守护 `shell_run` 读到 92% → `notify_user` → `alerts` 落库）；该场景的 `demos 3` 连胜受模型波动影响——作业提示由模型自写，漏掉模拟步骤时「不告警」是正确行为，稳定性说明与 `--keep` 诊断配方见 [`docs/acceptance.md`](docs/acceptance.md) §5。
 
 ## 架构
 

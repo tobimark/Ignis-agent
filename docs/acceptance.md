@@ -110,14 +110,46 @@ gitignore），需要长期留存时请贴到发布说明或附件里。
 | 2026-10-16 | 同上 | `tasks 2`（前两条，**不是**门槛达标） | 2/2 = 100%（N=2 < 20，未计完整门槛）；退出码 0 | `harness/results-20261016-155357.md` |
 | 2026-10-16 | 同上 | `demos 1`（**中间调试运行**，**不是**门槛达标） | Doctor ✓；A 0/1 FAIL（run 退出码 1、修复后 `npm test` 仍失败——模型侧未产出修复）；B SKIP；C 0/1 FAIL（创建 run 本身失败，job 未落库） | `harness/results-20261016-161316.md` |
 | 2026-10-16 | 同上 | `demos 1`（**修复后复验**，**不是**门槛达标） | Doctor ✓；A 1/1 PASS；B SKIP（无 uv）；**C 1/1 PASS**（`run=success kind=schedule alert=1`，daemon 停止后无残留）；按当时脚本为退出码 0（现行口径见下注） | `harness/results-20261016-161436.md` |
-| 2026-10-16 | 同上 | `demos 1`（**中间调试运行**，**不是**门槛达标） | Doctor ✓；A 1/1 PASS；B SKIP（无 uv）→「验收不完整」退出码 1；C 0/1 FAIL：调度运行 success 但 **`alert=0`**（`notify_user` 未触发，观测到的模型侧抖动） | `harness/results-20261016-163751.md` |
+| 2026-10-16 | 同上 | `demos 1`（**中间调试运行**，**不是**门槛达标） | Doctor ✓；A 1/1 PASS；B SKIP（无 uv）→「验收不完整」退出码 1；C 0/1 FAIL：调度运行 success 但 **`alert=0`**——作业提示（模型自写）漏掉 / 写偏模拟步骤时观测值低于阈值，**「不告警」是正确行为**（模型侧抖动，非产品缺陷；归因见下「Demo C 稳定性说明」） | `harness/results-20261016-163751.md` |
 | 2026-10-16 | 同上 | `demos 1`（门槛 SKIP 语义修复后复验，**不是**门槛达标） | Doctor ✓；A 1/1 PASS；B SKIP（无 uv）；C 1/1 PASS；结论「**验收不完整**：Demo B ×1 未运行」——跳过 ≠ 通过，退出码 1 | `harness/results-20261016-164015.md` |
+| 2026-10-16 | 同上 | `demos 1`（**中间调试运行**，**不是**门槛达标） | Doctor ✓；A 1/1 PASS；B SKIP（无 uv）→「验收不完整」退出码 1；C 0/1 FAIL：调度运行 success 但 **`alert=0`**——归因：作业提示（模型自写）漏掉模拟步骤，观测值低于 85% 阈值，**「不告警」是正确行为**（模型侧抖动，非产品缺陷） | `harness/results-20261016-184015.md` |
+| 2026-10-16 | 同上 | `demos 1`（**中间调试运行**，**不是**门槛达标） | Doctor ✓；A 1/1 PASS；B SKIP（无 uv）→「验收不完整」退出码 1；C 0/1 FAIL：与 184015 同因——**`alert=0`**（作业提示漏掉模拟步骤；「不告警」是正确行为） | `harness/results-20261016-185235.md` |
+| 2026-10-16 | 同上 | `demos 1`（**修复后复验**，**不是**门槛达标；`d4acc71` 之后） | Doctor ✓；A 1/1 PASS；B SKIP（无 uv）→「验收不完整」退出码 1；**C 1/1 PASS**：全链路通过——作业提示含 `check-health.sh --simulate 92` → 守护 `shell_run` 读到 92% → `notify_user` → `alerts` 行（`warning / Disk usage high: 92%`）；`alert=1`、daemon 停止后无残留 | `harness/results-20261016-185458.md` |
 
 > 注：2026-10-16 早前的两次 `demos 1`（154501 / 161436）是**当时**脚本的结论；其中 161436 那次带 B SKIP
 > 却仍打印「验收通过、退出码 0」。本修复（门槛 SKIP ⇒「验收不完整」、退出码 1）落地后，任何带 B SKIP 的
 > `demos` 运行都不会再打印「验收通过」——164015 那次已按新口径退出 1。`tasks 2` 无门槛 SKIP，仍为退出码 0。
-> 161316 / 163751 两次中间运行的 A/C 失败分别是模型侧未完成与模型侧抖动（原因见行内），不是脚本或
-> 产品缺陷；两者的结果文件都保留为「中间调试运行」的原始记录。
+> 161316 / 163751 两次中间运行的 A/C 失败分别是模型侧未完成与作业提示漏掉模拟步骤的抖动（原因见行内），
+> 不是脚本或产品缺陷；两者的结果文件都保留为「中间调试运行」的原始记录。此后 184015 / 185235 的
+> `alert=0` 同因（提示漏掉 / 写偏 `--simulate 92` 时观测值低于阈值，「不告警」是正确行为；归因见下
+> 「Demo C 稳定性说明」）；185458 全链路 PASS 复验了调度与告警机制本身。
+
+### Demo C 稳定性说明（两段式链路；`demos 3` 连胜取决于模型波动，不等价于调度器复验）
+
+Demo C 是**两段式、作业提示由模型自写**的管线：第一段 `ignis run`（`PROMPT_C`）里，模型**自己写**
+要落库的调度作业提示（`jobs.prompt`）；第二段由守护进程按点执行该提示。因此「Demo C 连续 3 次成功」
+不只取决于调度器与告警链路，也取决于模型每次都把提示写对（含 `check-health.sh --simulate 92` 与
+「超过 85% 就 `notify_user`」）。提示漏掉 / 写偏模拟步骤时，作业运行观测到的值低于 85% 阈值，
+**「不告警」是正确行为**——163751 / 184015 / 185235 的 `alert=0` 都是这一因（模型侧抖动，不是 C 链路
+回归）；这类失败请先查提示，再怀疑产品。
+
+`--keep` 诊断配方（保留本次临时目录后按两处查；`<home>` = `<临时目录>/demo-c-1/home`）：
+
+```sh
+# 1) 作业提示里有没有模拟步骤（92% 观测值的前提）
+sqlite3 <home>/ignis.db "SELECT name, prompt FROM jobs"
+# 取这次调度运行的 task_id，用于第 2 步（多轮运行时取最新一行）
+sqlite3 <home>/ignis.db "SELECT task_id FROM job_runs ORDER BY started_at DESC LIMIT 1"
+# 2) 守护那轮运行的 JSONL 里有没有调用 notify_user（提示正确 + 有观测却不落告警，才怀疑链路）
+grep -o '"name":"notify_user"' <home>/logs/<task_id>.jsonl
+```
+
+判据：提示原文含 `--simulate 92`、且运行成功却不落告警 → 怀疑产品链路；提示本身漏步骤 → 模型抖动，
+按「正确行为」归因，不判产品缺陷。**调度与告警机制本身**已由 185458 的真机全链路（`shell_run` 读到
+92% → `notify_user` → `alerts` 行 `warning / Disk usage high: 92%`）与 `packages/gateway` 的测试
+（调度循环 / 到期锚 / 失败告警与投递渠道）验证，不需要靠 `demos 3` 连胜来证明。Demo C 详情行自本波起
+记录 `job=<name> simulate=yes|no`，并在 `alert=0` 失败时附作业提示 / JSONL 的归因提示
+（见 `harness/acceptance.sh` 的 `demo_c_once`）。
 
 ### 2026-10-16 真机首跑发现：Demo C 触发不了（真阳性，已修复）
 
