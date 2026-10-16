@@ -30,12 +30,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cli_process::{
     REAP_GRACE, TERMINAL_REAP_GRACE, done, emit, event_stream, exit_text, kill_process_group,
-    role_label, spawn_stderr_drain, take_stderr_head, terminate, truncate,
+    spawn_stderr_drain, take_stderr_head, terminate, truncate,
 };
 use crate::native::{ERR_TASK_TIMEOUT, MAX_TASK_TIMEOUT};
-use crate::{
-    BoxStream, Capabilities, ChatMessage, Limits, RunRequest, RunStatus, Runtime, RuntimeEvent,
-};
+use crate::render::render_external_prompt;
+use crate::{BoxStream, Capabilities, Limits, RunRequest, RunStatus, Runtime, RuntimeEvent};
 
 /// 权限档位（任务书钉死：取「只读/默认」档）：`--help` 的可选值是 `acceptEdits` / `auto` /
 /// `bypassPermissions` / `manual` / `dontAsk` / `plan`；`manual` 就是 CLI 自己的默认档
@@ -103,7 +102,7 @@ impl Runtime for ClaudeRuntime {
         let program = self.program.clone();
         let workspace = self.workspace.clone();
         let model = self.model.clone();
-        let prompt = render_prompt(&req.system_prompt, &req.messages);
+        let prompt = render_external_prompt(&req.system_prompt, &req.messages);
         let limits = req.limits;
         // 事件管道是共享的：终局事件只发一次（驱动返回的 `Some` 一定是 `Done`）
         event_stream(move |tx| async move {
@@ -430,19 +429,6 @@ fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// T1 的过渡渲染：`system 提示 + 逐条消息`直拼。
-///
-/// TODO(T3): T3 落地 `render_external_prompt` 后删掉本函数、改调共享函数（任务书放行的过渡
-/// 实现，代价是 codex/claude 两个适配器之间重复一处渲染）。
-fn render_prompt(system_prompt: &str, messages: &[ChatMessage]) -> String {
-    let rendered = messages
-        .iter()
-        .map(|message| format!("{}: {}", role_label(message.role), message.content))
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    format!("{system_prompt}\n\n{rendered}")
-}
-
 /// 取首行并按字符截断（`Done.error` 是单行人话，失败原因可能是多行长文本）。
 fn first_line(text: &str, limit: usize) -> String {
     truncate(text.lines().next().unwrap_or("").trim(), limit)
@@ -451,7 +437,6 @@ fn first_line(text: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Role;
 
     /// 逐行映射：探测记录里的已知行各归其位，未知/不映射的行一律空表。
     #[test]
@@ -583,29 +568,6 @@ mod tests {
         assert_eq!(
             tool_summary("Bash", Some(&serde_json::json!({ "command": long }))),
             format!("Bash {}…", "字".repeat(TOOL_ARG_CHARS))
-        );
-    }
-
-    /// 过渡渲染：system 提示在前，随后逐条消息（角色名 + 正文），段落之间空行。
-    #[test]
-    fn render_prompt_puts_system_then_messages() {
-        let messages = vec![
-            ChatMessage {
-                role: Role::User,
-                content: "说一句 ok".into(),
-                tool_call_id: None,
-                tool_calls: vec![],
-            },
-            ChatMessage {
-                role: Role::Tool,
-                content: "a.txt".into(),
-                tool_call_id: Some("call_1".into()),
-                tool_calls: vec![],
-            },
-        ];
-        assert_eq!(
-            render_prompt("你是 Ignis", &messages),
-            "你是 Ignis\n\nuser: 说一句 ok\n\ntool: a.txt"
         );
     }
 

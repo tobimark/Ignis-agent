@@ -177,8 +177,8 @@ fn id_and_capabilities_are_pinned() {
     );
 }
 
-/// 命令行与 prompt 渲染（T1 过渡实现）逐字钉住：`--model` 只在给了模型时才出现，
-/// `--verbose` 是 `-p` + `stream-json` 的硬要求（探测记录），`--permission-mode` 取默认档。
+/// 命令行与 prompt 渲染（T3 的共享 `render_external_prompt`）逐字钉住：`--model` 只在给了模型时
+/// 才出现，`--verbose` 是 `-p` + `stream-json` 的硬要求（探测记录），`--permission-mode` 取默认档。
 #[tokio::test]
 async fn spawns_claude_print_with_pinned_flags_and_rendered_prompt() {
     let workspace = TempWorkspace::new("flags");
@@ -204,7 +204,7 @@ async fn spawns_claude_print_with_pinned_flags_and_rendered_prompt() {
                 "--model".into(),
                 "MiniMax-M2".into(),
             ],
-            "你是 Ignis 的助手\n\nuser: 说一句 ok".to_string(),
+            "你是 Ignis 的助手\n\n---\nUser: 说一句 ok\n".to_string(),
         )
     );
     // 只映射文本与终局：`thinking` 块、`system` 前导行、`result.usage` 都不出事件
@@ -244,7 +244,7 @@ async fn omits_model_flag_when_no_model_was_configured() {
                 "--permission-mode".into(),
                 "manual".into(),
             ],
-            "sys\n\nuser: 说一句 ok".to_string(),
+            "sys\n\n---\nUser: 说一句 ok\n".to_string(),
         )
     );
     assert_eq!(events.len(), 2, "{events:?}");

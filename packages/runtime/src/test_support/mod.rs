@@ -96,13 +96,27 @@ pub struct RecordedRequest {
 /// 脚本化内核：按序回放事件，并记录每次 `run` 收到的请求。
 pub struct MockRuntime {
     events: Vec<RuntimeEvent>,
+    capabilities: Capabilities,
     requests: Mutex<Vec<RecordedRequest>>,
 }
 
 impl MockRuntime {
     pub fn new(events: Vec<RuntimeEvent>) -> Arc<Self> {
+        Self::with_capabilities(
+            events,
+            Capabilities {
+                tools: true,
+                approvals: true,
+                usage: true,
+            },
+        )
+    }
+
+    /// 指定能力声明的变体：能力门控用例（如外部内核形状的 `tools: false`）用它。
+    pub fn with_capabilities(events: Vec<RuntimeEvent>, capabilities: Capabilities) -> Arc<Self> {
         Arc::new(Self {
             events,
+            capabilities,
             requests: Mutex::new(Vec::new()),
         })
     }
@@ -120,11 +134,7 @@ impl Runtime for MockRuntime {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            tools: true,
-            approvals: true,
-            usage: true,
-        }
+        self.capabilities
     }
 
     async fn run(

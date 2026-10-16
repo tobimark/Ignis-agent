@@ -174,7 +174,7 @@ fn id_and_capabilities_are_pinned() {
     );
 }
 
-/// 命令行与 prompt 渲染（T1 过渡实现）逐字钉住：`-m` 只在给了模型时才出现。
+/// 命令行与 prompt 渲染（T3 的共享 `render_external_prompt`）逐字钉住：`-m` 只在给了模型时才出现。
 #[tokio::test]
 async fn spawns_codex_exec_with_pinned_flags_and_rendered_prompt() {
     let workspace = TempWorkspace::new("flags");
@@ -201,7 +201,7 @@ async fn spawns_codex_exec_with_pinned_flags_and_rendered_prompt() {
                 "-m".into(),
                 "gpt-5-codex".into(),
             ],
-            "你是 Ignis 的助手\n\nuser: 说一句 ok".to_string(),
+            "你是 Ignis 的助手\n\n---\nUser: 说一句 ok\n".to_string(),
         )
     );
     // 只映射文本与终局：reasoning 条目、`turn.completed.usage` 都不出事件
@@ -242,7 +242,7 @@ async fn omits_model_flag_when_no_model_was_configured() {
                 "workspace-write".into(),
                 "--skip-git-repo-check".into(),
             ],
-            "sys\n\nuser: 说一句 ok".to_string(),
+            "sys\n\n---\nUser: 说一句 ok\n".to_string(),
         )
     );
     assert_eq!(events.len(), 2, "{events:?}");

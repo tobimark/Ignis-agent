@@ -2,7 +2,7 @@
 //!
 //! 两个适配器形状同构：spawn 一个自成一组的 CLI、逐行读 JSONL、把所有异常路径收束成恰好一条
 //! [`RuntimeEvent::Done`]。差别只在命令行开关与事件映射，故逐字相同的部分收在这里：终局事件、
-//! 退出人话、stderr 收尾、截断、整组终止、事件发送与角色名。
+//! 退出人话、stderr 收尾、截断、整组终止与事件发送。
 //!
 //! **stderr 收尾必须有上限**（评审 #1）：stdout 到 EOF、直接子进程也退出了，都不代表 stderr 的
 //! 写端都关了——真机的 `Bash` 工具会留下攥着继承 fd 的后台进程，MCP/helper 子进程也继承 stderr。
@@ -25,7 +25,7 @@ use tokio::sync::mpsc::{Sender, channel};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use crate::{BoxStream, Role, RunStatus, RuntimeEvent};
+use crate::{BoxStream, RunStatus, RuntimeEvent};
 
 /// 事件通道容量（与 native 一致）：消费者慢只会让循环在发送处等待，不会无界缓冲。
 const EVENT_CHANNEL: usize = 64;
@@ -148,16 +148,6 @@ pub(crate) async fn emit(tx: &Sender<RuntimeEvent>, event: RuntimeEvent) -> bool
     }
     tokio::task::yield_now().await;
     true
-}
-
-/// 角色名：与 [`Role`] 的 serde 名逐字一致，外置内核读得懂。
-pub(crate) fn role_label(role: Role) -> &'static str {
-    match role {
-        Role::System => "system",
-        Role::User => "user",
-        Role::Assistant => "assistant",
-        Role::Tool => "tool",
-    }
 }
 
 #[cfg(test)]

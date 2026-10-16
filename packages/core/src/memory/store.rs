@@ -801,7 +801,7 @@ mod tests {
         );
 
         // 后续任务的系统提示：这条事实同样只占一行
-        let prompt = build_system_prompt(Path::new("/w/a"), &[], &[record], &[]);
+        let prompt = build_system_prompt(Path::new("/w/a"), &[], false, &[record], &[]);
         let injected: Vec<&str> = prompt
             .lines()
             .filter(|line| line.starts_with("- [user/"))

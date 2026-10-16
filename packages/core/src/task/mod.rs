@@ -291,6 +291,8 @@ impl TaskRunner {
             system_prompt: prompts::build_system_prompt(
                 &workspace,
                 &executor.specs(),
+                // 能力门控：工具段依内核能力二选一（外部内核的工具对 Ignis 不可用）
+                !self.runtime.capabilities().tools,
                 &facts,
                 self.skills.metas(),
             ),
@@ -465,7 +467,9 @@ mod tests {
     use ignis_runtime::native::NativeRuntime;
     use ignis_runtime::openai::OpenAiClient;
     use ignis_runtime::test_support::{MockRuntime, ScriptStep, ScriptedApproval, ScriptedModel};
-    use ignis_runtime::{ChatMessage, ModelConfig, Role, RunStatus, RuntimeEvent, Usage};
+    use ignis_runtime::{
+        Capabilities, ChatMessage, ModelConfig, Role, RunStatus, RuntimeEvent, Usage,
+    };
     use ignis_storage::Db;
     use serde_json::{Value, json};
     use tokio::sync::mpsc::{self, UnboundedReceiver};
@@ -503,6 +507,15 @@ mod tests {
         }
     }
 
+    /// 脚本化内核的默认能力声明（native 形状：工具、审批、用量俱全）。
+    fn default_capabilities() -> Capabilities {
+        Capabilities {
+            tools: true,
+            approvals: true,
+            usage: true,
+        }
+    }
+
     /// 测试环境：临时工作区 + 真实 DB 文件 + 脚本化内核 + 组装好的运行器。
     struct Env {
         dir: TempDir,
@@ -528,10 +541,30 @@ mod tests {
             api_key: Option<&str>,
             profile: Option<JobProfile>,
         ) -> Self {
+            Self::build(label, events, api_key, profile, default_capabilities())
+        }
+
+        /// 带能力声明的环境：能力门控用例用它模拟 `tools: false` 的外部内核。
+        fn with_capabilities(
+            label: &str,
+            events: Vec<RuntimeEvent>,
+            capabilities: Capabilities,
+        ) -> Self {
+            Self::build(label, events, None, None, capabilities)
+        }
+
+        /// 三种构造共用的装配体。
+        fn build(
+            label: &str,
+            events: Vec<RuntimeEvent>,
+            api_key: Option<&str>,
+            profile: Option<JobProfile>,
+            capabilities: Capabilities,
+        ) -> Self {
             let dir = TempDir::new(label);
             let log_dir = dir.path().join("logs");
             let db = Arc::new(Db::open(&dir.path().join("ignis.db")).unwrap());
-            let runtime = MockRuntime::new(events);
+            let runtime = MockRuntime::with_capabilities(events, capabilities);
             let config = Arc::new(Config {
                 workspace_root: dir.path().to_path_buf(),
                 api_key: api_key.map(str::to_string),
@@ -1216,6 +1249,44 @@ mod tests {
         assert!(prompt.contains("fs_write"), "{prompt}");
         assert!(prompt.contains("shell_run"), "{prompt}");
         assert!(prompt.contains("notify_user"), "{prompt}");
+    }
+
+    /// 能力门控经完整装配链再验一遍：`capabilities().tools == false` 的内核拿到的 system prompt
+    /// 只有一行说明，工具清单整体不出现；事实段与技能段照旧注入（决策 #4）。
+    #[tokio::test]
+    async fn external_kernel_capabilities_hide_the_tool_list_from_the_system_prompt() {
+        let env = Env::with_capabilities(
+            "gated",
+            vec![success(Some("done"))],
+            Capabilities {
+                tools: false,
+                approvals: false,
+                usage: false,
+            },
+        );
+        env.remember_project(env.dir.path(), "pkg_manager", "这个项目用 uv 管理依赖");
+
+        let report = env.run(env.request("看看项目怎么装依赖")).await;
+
+        assert_eq!(report.outcome.status, RunStatus::Success);
+        let prompts = env.system_prompts();
+        assert_eq!(prompts.len(), 1);
+        let prompt = &prompts[0];
+        assert!(
+            prompt.contains("Tools: unavailable in this kernel (Ignis tools do not run here)."),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("Available tools:"), "{prompt}");
+        assert!(!prompt.contains("fs_read"), "{prompt}");
+        // 记忆注入与技能目录不受门控影响：两段照旧
+        assert!(
+            prompt.contains("\nKnown facts:\n- [project/pkg_manager] 这个项目用 uv 管理依赖"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("\nAvailable skills (call load_skill to read one):\n"),
+            "{prompt}"
+        );
     }
 
     /// A/B 工作区隔离经完整注入链再验一遍：B 的 project 事实不会出现在 A 的 system prompt 里。

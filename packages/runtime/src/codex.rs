@@ -29,12 +29,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cli_process::{
     REAP_GRACE, TERMINAL_REAP_GRACE, done, emit, event_stream, exit_text, kill_process_group,
-    role_label, spawn_stderr_drain, take_stderr_head, terminate,
+    spawn_stderr_drain, take_stderr_head, terminate,
 };
 use crate::native::{ERR_TASK_TIMEOUT, MAX_TASK_TIMEOUT};
-use crate::{
-    BoxStream, Capabilities, ChatMessage, Limits, RunRequest, RunStatus, Runtime, RuntimeEvent,
-};
+use crate::render::render_external_prompt;
+use crate::{BoxStream, Capabilities, Limits, RunRequest, RunStatus, Runtime, RuntimeEvent};
 
 /// 沙箱档位（任务书钉死）：`--help` 的可选值只有 `read-only` / `workspace-write` /
 /// `danger-full-access`，这里取「能干活、又不出工作区」的那档，适配器不自行放宽。
@@ -93,7 +92,7 @@ impl Runtime for CodexRuntime {
         let program = self.program.clone();
         let workspace = self.workspace.clone();
         let model = self.model.clone();
-        let prompt = render_prompt(&req.system_prompt, &req.messages);
+        let prompt = render_external_prompt(&req.system_prompt, &req.messages);
         let limits = req.limits;
         // 事件管道是共享的：终局事件只发一次（驱动返回的 `Some` 一定是 `Done`）
         event_stream(move |tx| async move {
@@ -376,23 +375,9 @@ fn parse_line(line: &str) -> Option<CodexEvent> {
     }
 }
 
-/// T1 的过渡渲染：`system 提示 + 逐条消息`直拼。
-///
-/// TODO(T3): T3 落地 `render_external_prompt` 后删掉本函数、改调共享函数（任务书放行的过渡
-/// 实现，代价是 codex/claude 两个适配器之间重复一处渲染）。
-fn render_prompt(system_prompt: &str, messages: &[ChatMessage]) -> String {
-    let rendered = messages
-        .iter()
-        .map(|message| format!("{}: {}", role_label(message.role), message.content))
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    format!("{system_prompt}\n\n{rendered}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Role;
 
     /// 逐行映射：探测记录里的已知行各归其位，未知/不映射的行一律 `None`。
     #[test]
@@ -458,29 +443,6 @@ mod tests {
         assert_eq!(
             parse_line(r#"{"type":"turn.failed","error":"stream ended"}"#),
             Some(CodexEvent::TurnFailed { message: None })
-        );
-    }
-
-    /// 过渡渲染：system 提示在前，随后逐条消息（角色名 + 正文），段落之间空行。
-    #[test]
-    fn render_prompt_puts_system_then_messages() {
-        let messages = vec![
-            ChatMessage {
-                role: Role::User,
-                content: "说一句 ok".into(),
-                tool_call_id: None,
-                tool_calls: vec![],
-            },
-            ChatMessage {
-                role: Role::Tool,
-                content: "a.txt".into(),
-                tool_call_id: Some("call_1".into()),
-                tool_calls: vec![],
-            },
-        ];
-        assert_eq!(
-            render_prompt("你是 Ignis", &messages),
-            "你是 Ignis\n\nuser: 说一句 ok\n\ntool: a.txt"
         );
     }
 }

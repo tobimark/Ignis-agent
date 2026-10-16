@@ -20,30 +20,42 @@ const PROJECT_SCOPE: &str = "project";
 /// 工具使用指引里点名 `remember` 的一句：用户说出的持久偏好或环境事实值得记下来。
 const REMEMBER_GUIDANCE: &str =
     "Call `remember` when the user states a durable preference or environment fact.";
+/// 外部内核（`Capabilities.tools == false`）的工具段：顶替工具清单的一行说明（决策 #4）。
+const TOOLS_UNAVAILABLE: &str = "Tools: unavailable in this kernel (Ignis tools do not run here).";
 
-/// 组装 system prompt：英文骨架（人格一行 + 工作区路径 + 工具使用要求 + 「用用户的语言回答」）
-/// 之后依次追加已知事实段与技能目录段；两段都为空时整个不出现，骨架保持原样。
+/// 组装 system prompt：英文骨架（人格一行 + 工作区路径 + 工具使用要求 + 工具段 + 「用用户的语言
+/// 回答」）之后依次追加已知事实段与技能目录段；两段都为空时整个不出现，骨架保持原样。
 ///
-/// 工具逐个点名（完整描述由内核的 `tools` 字段下发），让模型知道手上有什么、在哪儿干活；
+/// 工具段依内核能力二选一（`tools_unavailable` 即 `!Capabilities.tools`）：native 逐个点名工具
+/// （完整描述由内核的 `tools` 字段下发），让模型知道手上有什么、在哪儿干活；外部内核自带工具循环、
+/// Ignis 的工具对它们不可用，用一行 [`TOOLS_UNAVAILABLE`] 顶替清单。
 /// 事实逐条 `- [{scope}/{key}] {text}`（见 [`facts_section`]）；技能只列名称与描述，正文交给
 /// `load_skill` 按需读取（渐进披露）。
 pub fn build_system_prompt(
     workspace: &Path,
     tools: &[ToolSpec],
+    tools_unavailable: bool,
     facts: &[FactRecord],
     skills: &[SkillMeta],
 ) -> String {
-    let names = tools
-        .iter()
-        .map(|tool| tool.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
+    // 工具段依内核能力二选一：外部内核（`tools: false`）不注入工具，只留一行说明——清单里点名
+    // 的工具对它们跑不起来，模型不该照着调用
+    let tools_line = if tools_unavailable {
+        TOOLS_UNAVAILABLE.to_string()
+    } else {
+        let names = tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("Available tools: {names}")
+    };
     let mut prompt = format!(
         "You are Ignis, a personal AI agent that does real work with tools.\n\
          Workspace: {}\n\
          Use the tools instead of guessing; prefer absolute paths inside the workspace, and keep \
          replies concise. {REMEMBER_GUIDANCE}\n\
-         Available tools: {names}\n\
+         {tools_line}\n\
          Answer in the user's language.",
         workspace.display()
     );
@@ -142,7 +154,7 @@ mod tests {
     fn system_prompt_mentions_workspace_and_tools() {
         let tools = crate::tools::default_registry().specs();
 
-        let prompt = build_system_prompt(Path::new("/tmp/ignis-ws"), &tools, &[], &[]);
+        let prompt = build_system_prompt(Path::new("/tmp/ignis-ws"), &tools, false, &[], &[]);
 
         assert!(prompt.contains("/tmp/ignis-ws"), "{prompt}");
         for name in [
@@ -171,7 +183,7 @@ mod tests {
             fact(2, "project", "pkg_manager", "使用 uv"),
         ];
 
-        let prompt = build_system_prompt(Path::new("/w/a"), &[], &facts, &[]);
+        let prompt = build_system_prompt(Path::new("/w/a"), &[], false, &facts, &[]);
 
         assert!(
             prompt.contains(
@@ -193,7 +205,7 @@ mod tests {
             .collect();
         facts.extend((0..25).map(|i| fact(100 + i, "user", &format!("u{i:02}"), &text)));
 
-        let prompt = build_system_prompt(Path::new("/w/a"), &[], &facts, &[]);
+        let prompt = build_system_prompt(Path::new("/w/a"), &[], false, &facts, &[]);
 
         let section = prompt
             .split_once(&format!("\n{FACTS_HEADER}\n"))
@@ -241,7 +253,7 @@ mod tests {
             meta("beta", "Second skill.", SkillSource::User),
         ];
 
-        let prompt = build_system_prompt(Path::new("/w/a"), &[], &[], &metas);
+        let prompt = build_system_prompt(Path::new("/w/a"), &[], false, &[], &metas);
 
         assert!(
             prompt.contains(
@@ -264,7 +276,7 @@ mod tests {
         let project = fact(3, "project", "pkg_manager", "使用 uv");
         let facts = [monster, normal, project];
 
-        let prompt = build_system_prompt(Path::new("/w/a"), &[], &facts, &[]);
+        let prompt = build_system_prompt(Path::new("/w/a"), &[], false, &facts, &[]);
 
         assert!(
             prompt.contains("- [project/pkg_manager] 使用 uv"),
@@ -281,7 +293,7 @@ mod tests {
     /// 工具使用指引里点名 `remember`：用户说出持久的偏好或环境事实时就该写进记忆。
     #[test]
     fn tool_guidance_tells_the_model_to_remember_durable_facts() {
-        let prompt = build_system_prompt(Path::new("/w/a"), &[], &[], &[]);
+        let prompt = build_system_prompt(Path::new("/w/a"), &[], false, &[], &[]);
 
         assert!(prompt.contains(REMEMBER_GUIDANCE), "{prompt}");
         // 钉住措辞本身（改文案要一起改测试，别把指引悄悄删掉）
@@ -289,5 +301,50 @@ mod tests {
             prompt.contains("`remember`") && prompt.contains("durable preference"),
             "{prompt}"
         );
+    }
+
+    /// 能力门控（决策 #4）：外部内核（`Capabilities.tools == false`）的工具段换成一行说明，
+    /// 工具清单整体不出现；骨架的其余部分、事实段与技能段照旧。
+    #[test]
+    fn external_kernels_get_the_unavailable_tools_line_instead_of_the_tool_list() {
+        let tools = crate::tools::default_registry().specs();
+        let facts = [fact(1, "project", "pkg_manager", "使用 uv")];
+        let metas = [meta("alpha", "First skill.", SkillSource::Builtin)];
+
+        let prompt = build_system_prompt(Path::new("/w/a"), &tools, true, &facts, &metas);
+
+        // 说明行逐字，清单段整体不出现
+        assert!(prompt.contains(TOOLS_UNAVAILABLE), "{prompt}");
+        assert!(!prompt.contains("Available tools:"), "{prompt}");
+        assert!(
+            prompt.contains(&format!(
+                "\n{TOOLS_UNAVAILABLE}\nAnswer in the user's language."
+            )),
+            "{prompt}"
+        );
+        // 工具名一个都不在：模型不该尝试调用不存在的工具（技能段标题里的 `load_skill` 不算，
+        // 它是技能目录的一部分）
+        for name in ["fs_read", "shell_run", "notify_user", "schedule_create"] {
+            assert!(!prompt.contains(name), "{prompt}");
+        }
+        // 骨架其余部分、事实段与技能段照旧
+        assert!(prompt.contains("You are Ignis"), "{prompt}");
+        assert!(
+            prompt.contains("\nKnown facts:\n- [project/pkg_manager] 使用 uv"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("\nAvailable skills (call load_skill to read one):\n"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.ends_with("\n- alpha: First skill."),
+            "技能段照旧（目录一行一条，收尾无多余空行）：{prompt}"
+        );
+
+        // native（`false`）不变：清单在，说明行不在
+        let native = build_system_prompt(Path::new("/w/a"), &tools, false, &facts, &metas);
+        assert!(native.contains("Available tools: fs_read"), "{native}");
+        assert!(!native.contains(TOOLS_UNAVAILABLE), "{native}");
     }
 }

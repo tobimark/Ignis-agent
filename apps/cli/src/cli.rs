@@ -6,21 +6,30 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use ignis_runtime::RunStatus;
 
 use crate::{commands, repl};
 
-/// P1 唯一支持的内核；codex/claude 要到 P4。
-const NATIVE_KERNEL: &str = "native";
+/// 三个执行内核：`--kernel` 的值域、`/kernel` 的校验与 [`commands::mk_runtime`] 共用一份口径。
+pub const KERNELS: [&str; 3] = ["native", "codex", "claude"];
+
+/// 主路径内核：`--kernel` 的默认值（完整工具与审批，见设计文档 §6.3）。
+pub const NATIVE_KERNEL: &str = KERNELS[0];
 
 /// `ignis`：本地个人 AI Agent。
 #[derive(Debug, Parser)]
 #[command(name = "ignis", version, about = "Ignis：本地个人 AI Agent")]
 pub struct Cli {
-    /// 执行内核（v0.1 仅 native）
-    #[arg(long, global = true, value_name = "KERNEL", default_value = NATIVE_KERNEL)]
+    /// 执行内核（native|codex|claude）
+    #[arg(
+        long,
+        global = true,
+        value_name = "KERNEL",
+        default_value = NATIVE_KERNEL,
+        value_parser = clap::builder::PossibleValuesParser::new(KERNELS)
+    )]
     pub kernel: String,
 
     /// 工作区目录（默认取配置里的 workspace_root）
@@ -227,9 +236,9 @@ pub struct AlertsCommand {
 }
 
 /// 解析参数后分发：错误一律经 `anyhow::Result` 上抛给 `main`。
+///
+/// 内核名与可用性由 `--kernel` 的值域（clap）与 [`commands::Session::new`] 校验，这里不再复查。
 pub async fn dispatch(cli: &Cli) -> Result<ExitCode> {
-    ensure_kernel(&cli.kernel)?;
-
     match &cli.command {
         Some(Command::Run { task }) => commands::run::run(cli, task).await,
         Some(Command::Task { command }) => commands::task::run(command),
@@ -243,14 +252,6 @@ pub async fn dispatch(cli: &Cli) -> Result<ExitCode> {
         // 无子命令 → REPL
         None => repl::run(cli).await,
     }
-}
-
-/// 内核白名单：v0.1 只有 native，其余取值明确告知是 P4 的能力。
-fn ensure_kernel(kernel: &str) -> Result<()> {
-    if kernel == NATIVE_KERNEL {
-        return Ok(());
-    }
-    bail!("kernel '{kernel}' 在 v0.1 尚未支持（P4 才有 codex/claude）")
 }
 
 /// 运行状态 → 进程退出码：成功 0；失败与触限 1；用户中止 130（128 + SIGINT，与 shell 约定一致）。
@@ -286,13 +287,9 @@ mod tests {
     }
 
     #[test]
-    fn kernel_whitelist_names_the_p4_kernels() {
-        assert!(ensure_kernel("native").is_ok());
-
-        let error = ensure_kernel("codex").unwrap_err().to_string();
-        assert_eq!(
-            error,
-            "kernel 'codex' 在 v0.1 尚未支持（P4 才有 codex/claude）"
-        );
+    fn kernel_whitelist_is_the_three_kernels() {
+        // 值域与 `/kernel` 共用一份口径：三个名字逐字钉住，native 是默认值
+        assert_eq!(KERNELS, ["native", "codex", "claude"]);
+        assert_eq!(NATIVE_KERNEL, KERNELS[0]);
     }
 }

@@ -15,13 +15,17 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::Cli;
-use crate::commands::{Session, spawn_ctrl_c_watcher};
+use crate::commands::{Session, kernel_note, spawn_ctrl_c_watcher};
 
 /// 提示词（固定文案）。
 const PROMPT: &str = "❯ ";
 
-/// `/help` 列出的命令：v0.1 只有退出与帮助两条。
-const HELP: [&str; 2] = ["/exit  退出 REPL", "/help  显示可用命令"];
+/// `/help` 列出的命令：退出、帮助与内核切换。
+const HELP: [&str; 3] = [
+    "/exit  退出 REPL",
+    "/help  显示可用命令",
+    "/kernel [name]  显示或切换执行内核（native|codex|claude）",
+];
 
 /// 一行输入的含义。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +36,8 @@ enum Input {
     Exit,
     /// `/help`：打印可用命令。
     Help,
+    /// `/kernel`（无参显示当前内核）或 `/kernel <name>`（切换后续任务的内核）。
+    Kernel(Option<String>),
     /// 其余输入：一次任务的内容。
     Task(String),
 }
@@ -100,13 +106,38 @@ fn memory_segment(facts: usize) -> String {
     }
 }
 
-/// 分类一行输入：空行跳过，两个斜杠命令之外都当作任务内容（去掉行尾换行与首尾空白）。
+/// 分类一行输入：空行跳过，三个斜杠命令之外都当作任务内容（去掉行尾换行与首尾空白）。
+///
+/// `/kernel` 只认「单独一条命令」或「命令 + 一个名字」；多出的词与其它未知斜杠输入一样当任务，
+/// 与 `/exit` / `/help` 的既有口径一致。
 fn classify(line: &str) -> Input {
-    match line.trim() {
-        "" => Input::Empty,
-        "/exit" => Input::Exit,
-        "/help" => Input::Help,
-        task => Input::Task(task.to_string()),
+    let trimmed = line.trim();
+    match trimmed.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [] => Input::Empty,
+        ["/exit"] => Input::Exit,
+        ["/help"] => Input::Help,
+        ["/kernel"] => Input::Kernel(None),
+        ["/kernel", name] => Input::Kernel(Some((*name).to_string())),
+        _ => Input::Task(trimmed.to_string()),
+    }
+}
+
+/// `/kernel` 的输出：当前生效的内核名，非 native 时补上那行能力提示。
+///
+/// 无参显示与切换成功共用同一份文案（提示来自 [`kernel_note`]）：两处措辞分家的话，用户会以为
+/// 切换没生效。
+fn kernel_lines(kernel: &str) -> Vec<String> {
+    let mut lines = vec![format!("kernel: {kernel}")];
+    if let Some(note) = kernel_note(kernel) {
+        lines.push(note);
+    }
+    lines
+}
+
+/// 逐行打印一个命令的输出。
+fn print_lines(lines: &[String]) {
+    for line in lines {
+        println!("{line}");
     }
 }
 
@@ -116,13 +147,24 @@ pub async fn run(cli: &Cli) -> Result<ExitCode> {
         bail!("交互模式需要 TTY；请用 ignis run");
     }
 
-    let session = Session::new(cli)?;
+    let mut session = Session::new(cli)?;
     // 计数来自会话里那份存储/技能目录（与运行器同一份），读库失败只退回 `Memory: off`
     // 与「不打未读行」（各自已打一行警告）
     let (skills, memory) = session.banner_counts();
     let unread = session.unread_alerts();
-    for line in banner_lines(session.workspace(), &cli.kernel, skills, memory, unread) {
+    for line in banner_lines(
+        session.workspace(),
+        session.kernel(),
+        skills,
+        memory,
+        unread,
+    ) {
         println!("{line}");
+    }
+    // 选定非 native 内核时能力提示行跟着 banner 一起给出（`/kernel` 切换时是同一份文案）；
+    // native 不加任何行——启动屏的形状保持 4 行（有未读告警时 5 行）
+    if let Some(note) = kernel_note(session.kernel()) {
+        println!("{note}");
     }
 
     let reader: Arc<dyn LineReader> = Arc::new(StdinReader);
@@ -157,6 +199,13 @@ pub async fn run(cli: &Cli) -> Result<ExitCode> {
                     println!("{command}");
                 }
             }
+            // 无参：显示当前内核，非 native 时补一行能力提示
+            Input::Kernel(None) => print_lines(&kernel_lines(session.kernel())),
+            // 有参：校验可用后切换后续任务的内核；不可用就只打错误行，不切换
+            Input::Kernel(Some(name)) => match session.set_kernel(&name) {
+                Ok(kernel) => print_lines(&kernel_lines(kernel)),
+                Err(error) => eprintln!("error: {error}"),
+            },
             Input::Task(prompt) => {
                 let outcome = session
                     .run_task(prompt, history.clone(), TaskKind::Repl)
@@ -240,19 +289,48 @@ mod tests {
         assert_eq!(classify("   \n"), Input::Empty);
         assert_eq!(classify("/exit\n"), Input::Exit);
         assert_eq!(classify("/help\n"), Input::Help);
+        // `/kernel` 无参与带参两种形状；多余空白归一
+        assert_eq!(classify("/kernel\n"), Input::Kernel(None));
+        assert_eq!(
+            classify("/kernel codex\n"),
+            Input::Kernel(Some("codex".to_string()))
+        );
+        assert_eq!(
+            classify("  /kernel   claude  \n"),
+            Input::Kernel(Some("claude".to_string()))
+        );
+        // 多余的词不当命令：与其它未知斜杠输入一样当任务
+        assert_eq!(
+            classify("/kernel codex now\n"),
+            Input::Task("/kernel codex now".to_string())
+        );
         // 任务内容保留原文（只去掉行尾换行与首尾空白）
         assert_eq!(
             classify("把 README 翻译成中文\n"),
             Input::Task("把 README 翻译成中文".to_string())
         );
-        // 两个斜杠命令之外带 `/` 的输入照常当任务
-        assert_eq!(classify("/kernel\n"), Input::Task("/kernel".to_string()));
+        assert_eq!(classify("/unknown\n"), Input::Task("/unknown".to_string()));
     }
 
     #[test]
-    fn help_lists_the_two_commands() {
+    fn help_lists_the_three_commands() {
         let help = HELP.join("\n");
         assert!(help.contains("/exit"), "{help}");
         assert!(help.contains("/help"), "{help}");
+        // 内核切换必须可发现：无参形状与三个取值都写在帮助里
+        assert!(help.contains("/kernel [name]"), "{help}");
+        assert!(help.contains("native|codex|claude"), "{help}");
+    }
+
+    /// `/kernel` 的两行输出：当前内核名 + 非 native 的那行能力提示（与 `--kernel` 路径同一份文案）。
+    #[test]
+    fn kernel_lines_pair_the_current_kernel_with_its_capability_note() {
+        assert_eq!(kernel_lines("native"), ["kernel: native"]);
+
+        assert_eq!(kernel_lines("codex").len(), 2);
+        assert_eq!(kernel_lines("codex")[0], "kernel: codex");
+        // 提示行与 `commands::kernel_note` 是同一条（两处措辞分家 = 用户以为切换没生效）
+        assert_eq!(kernel_lines("codex")[1], kernel_note("codex").unwrap());
+        assert_eq!(kernel_lines("claude")[1], kernel_note("claude").unwrap());
     }
 }
