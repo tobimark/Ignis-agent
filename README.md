@@ -240,7 +240,7 @@ ignis daemon stop            # 幂等：没在跑也算成功
 7. **外置内核用量与上限退化**：codex / claude 不出 `Usage` 事件（`Capabilities{usage:false}`），token 记为 0；因此 token / 成本上限对它们不生效，只剩墙钟超时（`limits.task_timeout_secs`）与取消（REPL Ctrl-C / SIGINT）。
 8. **调度重扫窗口 30s**：新建 / 暂停 / 恢复的调度任务最迟 30s 生效（守护进程每轮最多睡 30s 重读 active job；无到期任务时也一样）。
 9. **`/kernel` 不共享外置会话**：每轮任务都把 Ignis 的 canonical 历史渲染进 prompt 交给一个新的 CLI 进程，不依赖也不复用 codex / claude 自己的 `--resume` 会话（切换内核不会带过来外置 CLI 的会话状态）。
-10. **relay spike 结论**：原生中转（`opencode.ai`）当时额度 / 路由不可得，两轮未达模型；随后以一个可用的 OpenAI 兼容端点复验，确认流式工具调用可用（`docs/spikes/2026-10-15-relay-streaming-toolcalls.md`）。native 内核依赖这一结论，降级路径（`stream:false` / Anthropic 协议）无需启用。
+10. **relay spike 结论（已关闭）**：原生中转（`opencode.ai/zen/go`）两轮「不可得」为套餐额度 / 端点配置问题，**不是协议不兼容**；随后以一个可用的 OpenAI 兼容端点（`https://api.minimax.cn/v1`，模型 `MiniMax-M2`）复验，流式工具调用、`usage` 记账与审批链路全部通过（该端点不发 `[DONE]`，流以 EOF 收尾，native 客户端按 EOF 正常结束）。降级路径（`stream:false` / Anthropic 协议）无需启用。详见 [`docs/spikes/2026-10-15-relay-streaming-toolcalls.md`](docs/spikes/2026-10-15-relay-streaming-toolcalls.md)。
 11. **调度策略**：失败即记录 + 告警、不无限重试；上一次运行未结束时再次到期只跳过并记日志；停机期间错过的时点不补跑（防重启后重复执行危险操作）。
 
 ## 已知偏差
@@ -260,7 +260,7 @@ cargo test --workspace          # 离线：不依赖网络与真实模型
 
 - 单元测试随各 crate；外置内核适配器的假 CLI 集成测试在 `packages/runtime/tests/`。
 - 端到端测试在 `apps/cli/tests/`（`demo_a.rs` / `demo_b.rs` / `demo_c.rs` / `approval_modes.rs` / `kernel.rs` / `daemon_lifecycle.rs` / `autostart.rs` / `limits.rs` / `redaction.rs`）：用真构建的 `ignis` 二进制 + `ignis-runtime` 的脚本化假模型（`test-support`），断言落在真文件、真数据库行与真进程上。
-- 真实模型的量化验收（三场景各连续 3 次、20 例常见任务 ≥80%、10 次重启）是**手动、可选**执行（控制额度消耗），不进 CI；脚本随后续任务交付。
+- 真实模型的量化验收（三场景各连续 3 次、20 例常见任务 ≥80%、10 次重启）是**手动、可选**执行（控制额度消耗），不进 CI：三条门槛见 [`harness/acceptance.sh`](harness/acceptance.sh)（`demos 3` / `tasks 20` / `restarts 10`），门槛定义、运行方法与最近结果记录见 [`docs/acceptance.md`](docs/acceptance.md)。
 - 提交信息用 Conventional Commits（英文 type/scope，中文正文）。
 - Docker / systemd 部署见上文与 [`deploy/README.md`](deploy/README.md)。
 
