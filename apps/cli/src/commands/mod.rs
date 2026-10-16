@@ -95,6 +95,35 @@ pub fn known_kernel(kernel: &str) -> Result<&'static str, String> {
         .ok_or_else(|| unknown_kernel(kernel))
 }
 
+/// 生效内核名的解析（spec §6.1「默认取配置」）：`--kernel` > 配置 `default_kernel` > `native`。
+///
+/// 两处来源都过同一份白名单 [`known_kernel`]：配置文件里的未知内核（手改或拼错）给人话错误，
+/// 不静默回落到 native——用户以为切过去了、实际没有，比直接报错更难查。
+pub fn resolve_kernel(flag: Option<&str>, configured: &str) -> Result<&'static str, String> {
+    known_kernel(flag.unwrap_or(configured))
+}
+
+/// 生效密钥的来源：配置文件里的 `api_key`（含 `IGNIS_API_KEY` 覆盖）优先，其次配置指定的
+/// 环境变量（`model.api_key_env`）；两处都没有给 `None`。
+///
+/// 与内核无关：native 缺它不能跑（[`missing_api_key`] 给人话错误），两个外部内核不需要它
+/// （用各自 CLI 的凭据、适配器不收 Ignis 的 key）——但只要有就照旧回填进 `config.api_key`，
+/// 脱敏器因此对三个内核一视同仁。
+fn resolve_api_key(config: &Config) -> Option<String> {
+    config
+        .api_key
+        .clone()
+        .or_else(|| std::env::var(&config.model.api_key_env).ok())
+}
+
+/// native 缺少生效密钥时的人话错误：点名该设哪个环境变量。
+fn missing_api_key(config: &Config) -> String {
+    format!(
+        "未配置 API key（设置 {} 或 config.json 的 api_key）",
+        config.model.api_key_env
+    )
+}
+
 /// 非 native 内核的能力提示行（决策 #4：工具跑在内核自己的沙箱里，记忆写与技能全文加载不可用）；
 /// native 没有降级可提示，返回 `None`。
 ///
@@ -192,10 +221,10 @@ fn is_executable(candidate: &Path) -> bool {
 }
 
 impl Session {
-    /// 装配会话：配置 → 工作区 → 存储 → 策略 → 选定内核 → 审批。
+    /// 装配会话：配置 → 工作区 → 选定内核 → 存储 → 策略 → 凭据 → 审批。
     ///
-    /// 缺 API key、配置解析失败、工作区不存在、建库失败、选定内核不可用都是预期内的失败，返回
-    /// 人话 `Err` 即可，调用方不会因此 panic 或打印堆栈。
+    /// 缺 API key（只有 native 需要）、配置解析失败、工作区不存在、建库失败、选定内核不可用都是
+    /// 预期内的失败，返回人话 `Err` 即可，调用方不会因此 panic 或打印堆栈。
     pub fn new(cli: &Cli) -> Result<Self> {
         // 配置里的 api_key 已被 IGNIS_API_KEY 覆盖过，这里只是读出生效值
         let home = ignis_home();
@@ -205,26 +234,26 @@ impl Session {
 
         let workspace = resolve_workspace(cli, &config)?;
 
+        // 生效内核先定下来（`--kernel` > 配置 `default_kernel` > `native`）：它决定下面要不要
+        // Ignis 的模型凭据，也决定构造哪个内核实现
+        let kernel = resolve_kernel(cli.kernel.as_deref(), &config.default_kernel)
+            .map_err(anyhow::Error::msg)?;
+
         // stdin 是否为 tty 只有命令层知道，策略规则本身在 `resolve_mode` 里
         let mode = resolve_mode(cli.yes, cli.unsafe_ops, std::io::stdin().is_terminal());
         let db = Arc::new(Db::open(&home.join("ignis.db"))?);
         let policy = Arc::new(Policy::new(mode));
 
-        // key 来源：配置文件里的 api_key（含 IGNIS_API_KEY 覆盖）优先，其次配置指定的环境变量
-        let api_key = config
-            .api_key
-            .clone()
-            .or_else(|| std::env::var(&config.model.api_key_env).ok());
-        let Some(api_key) = api_key else {
-            bail!(
-                "未配置 API key（设置 {} 或 config.json 的 api_key）",
-                config.model.api_key_env
-            );
-        };
-        // 解析出的生效密钥回填进 config：`TaskRunner` 与每轮任务的 `ToolRuntime` 都从
-        // `config.api_key` 取脱敏密钥，只把它交给 HTTP 客户端会让环境变量这条路完全绕过
-        // `Redactor`——工具输出里的密钥会明文进 JSONL、也明文回填给模型。
-        config.api_key = Some(api_key);
+        // Ignis 自己的密钥只有 native 必须：两个外部内核用各自 CLI 的凭据（适配器不收 key），
+        // 只配了 codex/claude 的用户不该被这一条挡在门外。拿到的密钥一律回填进 config：
+        // `TaskRunner` 与每轮任务的 `ToolRuntime` 都从 `config.api_key` 取脱敏密钥，只把它交给
+        // HTTP 客户端会让环境变量这条路完全绕过 `Redactor`——工具输出与任务提示词里的密钥会
+        // 明文进 JSONL 与 `tasks` 表。
+        let api_key = resolve_api_key(&config);
+        if kernel == NATIVE_KERNEL && api_key.is_none() {
+            bail!("{}", missing_api_key(&config));
+        }
+        config.api_key = api_key;
         let config = Arc::new(config);
 
         // 只有交互模式才该问到人：其余模式策略已经给出结论，被问到说明策略漏判 → 一律拒绝
@@ -236,7 +265,7 @@ impl Session {
         };
 
         // 选定内核先构造一次：缺二进制的错误在碰记忆库与第一轮任务之前就变成人话（构造开销小）
-        mk_runtime(&cli.kernel, &config, &workspace).map_err(anyhow::Error::msg)?;
+        mk_runtime(kernel, &config, &workspace).map_err(anyhow::Error::msg)?;
 
         // 记忆与技能目录都落在 `~/.ignis` 下：每轮任务的运行器在组装期把已知事实与技能目录注入
         // 系统提示，也把 `remember`/`load_skill`/`notify_user`/`schedule_create` 四个元工具挂进注册表
@@ -256,7 +285,7 @@ impl Session {
             // 告警投递渠道：CLI 侧先留空组合——告警照常落库与去重（`ignis alerts` 的未读收件箱
             // 就是渠道①），真实渠道（notify-send / 日志 / IM）由 T5 的 gateway 在这里注入
             notifier: Arc::new(MultiNotifier::new(Vec::new())),
-            kernel: cli.kernel.clone(),
+            kernel: kernel.to_string(),
             already_prompted: AtomicBool::new(false),
         })
     }
@@ -273,9 +302,25 @@ impl Session {
 
     /// 切换内核：校验名字与可用性（缺二进制的错误原样交回），只影响后续任务。
     pub fn set_kernel(&mut self, kernel: &str) -> Result<&'static str, String> {
+        self.set_kernel_with_path(kernel, std::env::var_os("PATH").as_deref())
+    }
+
+    /// 带 PATH 注入的切换变体：可用性判定只看传进来的这份 PATH（与 [`mk_runtime_with_path`]
+    /// 同一接缝），用例因此不必改进程环境（测试可并行）。
+    fn set_kernel_with_path(
+        &mut self,
+        kernel: &str,
+        path: Option<&OsStr>,
+    ) -> Result<&'static str, String> {
         let kernel = known_kernel(kernel)?;
+        // native 的可用性还包括「有凭据」：`Session::new` 已经回填过能拿到的密钥，这里还是空的
+        // 就说明这份安装根本没有 key——切过去只会拿一把空 key 在第一次请求时 401，提前报同一句
+        // 人话；外部内核没有 Ignis 凭据也能跑，不走这条
+        if kernel == NATIVE_KERNEL && self.config.api_key.is_none() {
+            return Err(missing_api_key(&self.config));
+        }
         // 先构造一次：不可用的内核不切换
-        mk_runtime(kernel, &self.config, &self.workspace)?;
+        mk_runtime_with_path(kernel, &self.config, &self.workspace, path)?;
         self.kernel = kernel.to_string();
         Ok(kernel)
     }
@@ -491,6 +536,51 @@ mod tests {
         );
     }
 
+    /// 生效内核的解析真值表（spec §6.1「默认取配置」）：`--kernel` > 配置 `default_kernel` >
+    /// `native`；两处来源共用同一条白名单，配置里的未知名不静默回落。
+    #[test]
+    fn resolve_kernel_prefers_the_flag_then_the_config_then_native() {
+        // 显式旗标压过配置（`config set default_kernel claude` 之后仍能用 --kernel 临时改）
+        assert_eq!(resolve_kernel(Some("codex"), "claude").unwrap(), "codex");
+        // 不给旗标：配置说了算——这正是 `config set default_kernel codex` 之后的下一轮运行
+        assert_eq!(resolve_kernel(None, "codex").unwrap(), "codex");
+        assert_eq!(resolve_kernel(None, "native").unwrap(), NATIVE_KERNEL);
+
+        // 配置里的未知名（手改或拼错）：同一条人话错误，不静默回落到 native
+        for bad in ["gemini", "", "Native"] {
+            let error = resolve_kernel(None, bad).unwrap_err();
+            assert!(error.contains(&format!("未知内核 '{bad}'")), "{error}");
+            assert!(error.contains("native / codex / claude"), "{error}");
+            // 旗标一侧是同一份口径：显式给了就轮不到配置，错误也逐字同形
+            assert_eq!(resolve_kernel(Some(bad), "codex").unwrap_err(), error);
+        }
+    }
+
+    /// 凭据来源与门槛：有 key（配置文件优先）就回填交回，没有时 native 报人话错误、外部内核照跑。
+    #[test]
+    fn api_key_resolution_feeds_native_and_gives_external_kernels_a_pass() {
+        // 配置里的 key（含 `IGNIS_API_KEY` 覆盖）优先，原样交回
+        let with_key = Config {
+            api_key: Some("test-key".into()),
+            ..Config::default()
+        };
+        assert_eq!(resolve_api_key(&with_key).as_deref(), Some("test-key"));
+
+        // 两处都没有：来源是 `None`；错误文案点名该设哪个环境变量
+        //（用不存在的变量名，断言不受运行者环境影响）
+        let missing = Config {
+            model: ignis_runtime::ModelConfig {
+                api_key_env: "IGNIS_T3_ABSENT_KEY".into(),
+                ..ignis_runtime::ModelConfig::default()
+            },
+            ..Config::default()
+        };
+        assert_eq!(resolve_api_key(&missing), None);
+        let error = missing_api_key(&missing);
+        assert!(error.contains("未配置 API key"), "{error}");
+        assert!(error.contains("IGNIS_T3_ABSENT_KEY"), "{error}");
+    }
+
     /// `mk_runtime` 的选择真值表（`/kernel` 与 `--kernel` 同一条路径）：名字合法且可用才构造出内核。
     ///
     /// 可用性走 PATH 注入的变体——不能为测试改进程环境（用例并行，`set_var` 会互相打架）。
@@ -594,6 +684,39 @@ mod tests {
 
     /// 最小会话：只装配 `/kernel` 切换要用的字段（临时 home/工作区 + 空记忆与技能目录）。
     fn session_fixture(label: &str, kernel: &str) -> (TempDir, Session) {
+        session_fixture_with_config(
+            label,
+            kernel,
+            Config {
+                api_key: Some("test-key".into()),
+                ..Config::default()
+            },
+        )
+    }
+
+    /// 一份 Ignis 凭据都没有的会话（外部内核起步的形状）：验 native 的凭据门槛。
+    ///
+    /// 环境变量名取一个不存在的（不走默认的 `OPENAI_API_KEY`），断言因此与运行者环境无关。
+    fn keyless_session_fixture(label: &str, kernel: &str) -> (TempDir, Session) {
+        session_fixture_with_config(
+            label,
+            kernel,
+            Config {
+                model: ignis_runtime::ModelConfig {
+                    api_key_env: "IGNIS_T3_ABSENT_KEY".into(),
+                    ..ignis_runtime::ModelConfig::default()
+                },
+                ..Config::default()
+            },
+        )
+    }
+
+    /// 两个会话夹具共用的装配体：配置由调用方给（其余字段只求「可实现」）。
+    fn session_fixture_with_config(
+        label: &str,
+        kernel: &str,
+        config: Config,
+    ) -> (TempDir, Session) {
         let dir = TempDir::new(label);
         let home = dir.path().to_path_buf();
         let db = Arc::new(Db::open(&home.join("ignis.db")).unwrap());
@@ -601,7 +724,7 @@ mod tests {
             home: home.clone(),
             workspace: home.clone(),
             db: Arc::clone(&db),
-            config: Arc::new(Config::default()),
+            config: Arc::new(config),
             policy: Arc::new(Policy::new(ApprovalMode::Unattended)),
             approvals: Arc::new(PolicyOnlyApproval),
             log_dir: home.join("logs"),
@@ -626,9 +749,70 @@ mod tests {
             assert_eq!(session.kernel(), "codex", "校验不过不该换内核");
         }
 
-        // native 恒可（不查 PATH）：切过去并回生效名，且没有能力提示行
+        // native 不查 PATH（会话本身有凭据），切过去并回生效名，且没有能力提示行
         assert_eq!(session.set_kernel("native").unwrap(), "native");
         assert_eq!(session.kernel(), "native");
         assert_eq!(kernel_note(session.kernel()), None);
+    }
+
+    /// native 的凭据门槛在**切换点**也成立：只有外部内核凭据的会话切到 native 时给人话错误、
+    /// 当前内核不动（否则切过去只会拿一把空 key 在第一次请求时 401）。
+    #[test]
+    fn set_kernel_refuses_native_without_an_ignis_key() {
+        let (_dir, mut session) = keyless_session_fixture("switch-keyless", "codex");
+
+        let error = session.set_kernel("native").unwrap_err();
+        assert!(error.contains("未配置 API key"), "{error}");
+        assert!(error.contains("IGNIS_T3_ABSENT_KEY"), "{error}");
+        assert_eq!(session.kernel(), "codex", "缺凭据不该换到 native");
+
+        // 外部内核之间切换不受影响：没有 Ignis 凭据照样切（各自 CLI 的凭据管）
+        let (dir, mut session) = keyless_session_fixture("switch-keyless-external", "codex");
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("claude"), "#!/bin/sh\n").unwrap();
+        set_executable(&bin.join("claude"));
+        assert_eq!(
+            session
+                .set_kernel_with_path("claude", Some(bin.as_os_str()))
+                .unwrap(),
+            "claude"
+        );
+        assert_eq!(session.kernel(), "claude");
+    }
+
+    /// `/kernel` 的**可用性**失败路径（与上一条的「名字非法」并列）：PATH 上没有这个 CLI 时
+    /// 错误原样交回、当前内核不动；装上之后同一份 PATH 注入就能切过去。
+    #[test]
+    fn set_kernel_keeps_the_current_kernel_when_the_binary_is_missing() {
+        let (dir, mut session) = session_fixture("switch-missing", "native");
+        // 空目录当 PATH：codex 没装
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let path = Some(bin.as_os_str());
+
+        let error = session
+            .set_kernel_with_path("codex", path)
+            .expect_err("PATH 上没有 codex 时应报错");
+        assert_eq!(error, "找不到 codex CLI：请先安装 codex 并确保它在 PATH 中");
+        assert_eq!(session.kernel(), "native", "不可用的内核不切换");
+
+        // 装上就能切：可用性只看传进来的这份 PATH，进程环境一个字节都没动
+        fs::write(bin.join("codex"), "#!/bin/sh\n").unwrap();
+        set_executable(&bin.join("codex"));
+        assert_eq!(
+            session.set_kernel_with_path("codex", path).unwrap(),
+            "codex"
+        );
+        assert_eq!(session.kernel(), "codex");
+        // 同一次切换后，claude 仍然没装：再失败一次，内核停在 codex
+        let error = session
+            .set_kernel_with_path("claude", path)
+            .expect_err("PATH 上没有 claude 时应报错");
+        assert_eq!(
+            error,
+            "找不到 claude CLI：请先安装 claude 并确保它在 PATH 中"
+        );
+        assert_eq!(session.kernel(), "codex");
     }
 }

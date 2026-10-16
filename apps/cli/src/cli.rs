@@ -15,22 +15,22 @@ use crate::{commands, repl};
 /// 三个执行内核：`--kernel` 的值域、`/kernel` 的校验与 [`commands::mk_runtime`] 共用一份口径。
 pub const KERNELS: [&str; 3] = ["native", "codex", "claude"];
 
-/// 主路径内核：`--kernel` 的默认值（完整工具与审批，见设计文档 §6.3）。
+/// 主路径内核：`--kernel` 与配置 `default_kernel` 都没给时回落的默认值（完整工具与审批，
+/// 见设计文档 §6.3）。
 pub const NATIVE_KERNEL: &str = KERNELS[0];
 
 /// `ignis`：本地个人 AI Agent。
 #[derive(Debug, Parser)]
 #[command(name = "ignis", version, about = "Ignis：本地个人 AI Agent")]
 pub struct Cli {
-    /// 执行内核（native|codex|claude）
+    /// 执行内核（native|codex|claude；不给时取配置里的 default_kernel，默认 native）
     #[arg(
         long,
         global = true,
         value_name = "KERNEL",
-        default_value = NATIVE_KERNEL,
         value_parser = clap::builder::PossibleValuesParser::new(KERNELS)
     )]
-    pub kernel: String,
+    pub kernel: Option<String>,
 
     /// 工作区目录（默认取配置里的 workspace_root）
     #[arg(long, global = true, value_name = "DIR")]
@@ -237,7 +237,8 @@ pub struct AlertsCommand {
 
 /// 解析参数后分发：错误一律经 `anyhow::Result` 上抛给 `main`。
 ///
-/// 内核名与可用性由 `--kernel` 的值域（clap）与 [`commands::Session::new`] 校验，这里不再复查。
+/// `--kernel` 的值域由 clap 把关、配置里的 `default_kernel` 由 [`commands::resolve_kernel`] 补齐
+/// 并同样过白名单，两侧共用一份 [`KERNELS`]；内核可用性由 [`commands::Session::new`] 校验。
 pub async fn dispatch(cli: &Cli) -> Result<ExitCode> {
     match &cli.command {
         Some(Command::Run { task }) => commands::run::run(cli, task).await,
@@ -291,5 +292,24 @@ mod tests {
         // 值域与 `/kernel` 共用一份口径：三个名字逐字钉住，native 是默认值
         assert_eq!(KERNELS, ["native", "codex", "claude"]);
         assert_eq!(NATIVE_KERNEL, KERNELS[0]);
+    }
+
+    /// `--kernel` 是**可选项**：不给就得是 `None`（由配置 `default_kernel` 兜底，spec §6.1 的
+    /// 「默认取配置」），给了才取值；非法取值仍在解析期被拒绝（值域与 `/kernel` 共用 KERNELS）。
+    #[test]
+    fn kernel_flag_is_optional_and_validated_by_the_parser() {
+        let omitted =
+            Cli::try_parse_from(["ignis", "run", "说一句 ok"]).expect("不给 --kernel 应可解析");
+        assert_eq!(omitted.kernel, None, "缺省必须是 None，不能钉死成 native");
+
+        let given = Cli::try_parse_from(["ignis", "--kernel", "codex"]).expect("显式内核应可解析");
+        assert_eq!(given.kernel.as_deref(), Some("codex"));
+
+        // 非法取值不落到下面（不会变成「未知内核」运行期错误）：clap 解析期即拒绝
+        let error = Cli::try_parse_from(["ignis", "--kernel", "gemini"]).unwrap_err();
+        assert!(
+            error.to_string().contains("native, codex, claude"),
+            "{error}"
+        );
     }
 }

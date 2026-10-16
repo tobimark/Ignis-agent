@@ -204,7 +204,8 @@ mod tests {
     /// 只有 `--workspace` 一项不同的最小 `Cli`（其余取默认值，命令自身不参与解析）。
     fn cli_at(workspace: Option<&Path>) -> Cli {
         Cli {
-            kernel: "native".into(),
+            // 不给 `--kernel`：与真实默认路径一致（由配置 `default_kernel` 兜底）
+            kernel: None,
             workspace: workspace.map(Path::to_path_buf),
             yes: false,
             unsafe_ops: false,

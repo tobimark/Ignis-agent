@@ -182,6 +182,17 @@ pub fn ignis_cmd_with_api_key_env(
     cmd
 }
 
+/// 一份 Ignis 凭据都不给的变体：两个密钥来源（`IGNIS_API_KEY` 与 `OPENAI_API_KEY`）都从子进程
+/// 环境里摘掉。
+///
+/// 只服务「外部内核不吃 Ignis 的 key」这条断言：`--kernel codex|claude` 在这条路径上必须照跑，
+/// native 则在选内核之后报「未配置 API key」。
+pub fn ignis_cmd_without_api_key(home: &Path, workspace: &Path, base_url: &str) -> Command {
+    let mut cmd = base_cmd(home, workspace, base_url);
+    cmd.env_remove("IGNIS_API_KEY").env_remove("OPENAI_API_KEY");
+    cmd
+}
+
 /// 两个变体的共同部分：home、工作区、假模型地址与固定的 stdio。
 fn base_cmd(home: &Path, workspace: &Path, base_url: &str) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ignis"));

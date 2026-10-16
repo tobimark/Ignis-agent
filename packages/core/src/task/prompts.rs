@@ -18,6 +18,9 @@ const TRUNCATED_MARKER: &str = "… [facts truncated]";
 /// 走 project 预算的 `facts.scope` 取值。
 const PROJECT_SCOPE: &str = "project";
 /// 工具使用指引里点名 `remember` 的一句：用户说出的持久偏好或环境事实值得记下来。
+///
+/// 与工具段同一道门控：只有工具可用的内核（native）才写进去——外部内核没有 `remember` 这个
+/// 元工具，写了只会让模型去追一个不存在的工具。
 const REMEMBER_GUIDANCE: &str =
     "Call `remember` when the user states a durable preference or environment fact.";
 /// 外部内核（`Capabilities.tools == false`）的工具段：顶替工具清单的一行说明（决策 #4）。
@@ -50,11 +53,17 @@ pub fn build_system_prompt(
             .join(", ");
         format!("Available tools: {names}")
     };
+    // 工具指引与工具段同一道门控：外部内核没有这些元工具，指引整句不出现；native 逐字节不变
+    let guidance = if tools_unavailable {
+        String::new()
+    } else {
+        format!(" {REMEMBER_GUIDANCE}")
+    };
     let mut prompt = format!(
         "You are Ignis, a personal AI agent that does real work with tools.\n\
          Workspace: {}\n\
          Use the tools instead of guessing; prefer absolute paths inside the workspace, and keep \
-         replies concise. {REMEMBER_GUIDANCE}\n\
+         replies concise.{guidance}\n\
          {tools_line}\n\
          Answer in the user's language.",
         workspace.display()
@@ -303,6 +312,43 @@ mod tests {
         );
     }
 
+    /// 两种内核的骨架逐字节钉住：native 与今天完全一致（工具指引 + 清单都在），外部内核同一骨架
+    /// 但**整句 `remember` 指引与清单一起被顶掉**——它那边没有元工具，写了只会让模型去追不存在的工具。
+    #[test]
+    fn native_and_external_skeletons_are_pinned_byte_for_byte() {
+        let tools = [ToolSpec {
+            name: "fs_read".into(),
+            description: "Read a file.".into(),
+            parameters: serde_json::Value::Null,
+        }];
+
+        let native = build_system_prompt(Path::new("/w/a"), &tools, false, &[], &[]);
+        assert_eq!(
+            native,
+            "You are Ignis, a personal AI agent that does real work with tools.\n\
+Workspace: /w/a\n\
+Use the tools instead of guessing; prefer absolute paths inside the workspace, and keep replies \
+concise. Call `remember` when the user states a durable preference or environment fact.\n\
+Available tools: fs_read\n\
+Answer in the user's language."
+        );
+
+        let external = build_system_prompt(Path::new("/w/a"), &tools, true, &[], &[]);
+        assert_eq!(
+            external,
+            format!(
+                "You are Ignis, a personal AI agent that does real work with tools.\n\
+Workspace: /w/a\n\
+Use the tools instead of guessing; prefer absolute paths inside the workspace, and keep replies \
+concise.\n\
+{TOOLS_UNAVAILABLE}\n\
+Answer in the user's language."
+            ),
+            "外部内核既不出现工具指引（它没有元工具），也不出现工具清单"
+        );
+        assert!(!external.contains("`remember`"), "{external}");
+    }
+
     /// 能力门控（决策 #4）：外部内核（`Capabilities.tools == false`）的工具段换成一行说明，
     /// 工具清单整体不出现；骨架的其余部分、事实段与技能段照旧。
     #[test]
@@ -327,6 +373,9 @@ mod tests {
         for name in ["fs_read", "shell_run", "notify_user", "schedule_create"] {
             assert!(!prompt.contains(name), "{prompt}");
         }
+        // 工具指引与清单同一道门控：外部内核没有元工具，`remember` 指引整句不出现
+        assert!(!prompt.contains(REMEMBER_GUIDANCE), "{prompt}");
+        assert!(!prompt.contains("`remember`"), "{prompt}");
         // 骨架其余部分、事实段与技能段照旧
         assert!(prompt.contains("You are Ignis"), "{prompt}");
         assert!(
@@ -342,9 +391,10 @@ mod tests {
             "技能段照旧（目录一行一条，收尾无多余空行）：{prompt}"
         );
 
-        // native（`false`）不变：清单在，说明行不在
+        // native（`false`）不变：清单与指引都在，说明行不在
         let native = build_system_prompt(Path::new("/w/a"), &tools, false, &facts, &metas);
         assert!(native.contains("Available tools: fs_read"), "{native}");
+        assert!(native.contains(REMEMBER_GUIDANCE), "{native}");
         assert!(!native.contains(TOOLS_UNAVAILABLE), "{native}");
     }
 }
