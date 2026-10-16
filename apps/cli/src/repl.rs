@@ -3,7 +3,7 @@
 //! 输入读取走 [`LineReader`] 这一层薄接口：[`StdinReader`] 只做「写提示词 + 读一行」，
 //! 将来换成 rustyline（历史与行编辑）只需要在这里加一个实现，REPL 主循环不用动。
 
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -57,10 +57,13 @@ impl LineReader for StdinReader {
         write!(out, "{prompt}")?;
         out.flush()?;
 
-        let mut line = String::new();
-        // EOF（Ctrl-D）时读到 0 字节，行内容不可用
-        if io::stdin().lock().read_line(&mut line)? == 0 {
-            return Ok(None);
+        // 终端 / 输入法 / 粘贴都可能送进非法 UTF-8 字节；std 的 `read_line` 对此会硬失败，
+        // 一个坏字节就足以带走整个会话（历史一起丢）。这里按字节读了宽松解码（见 `input`）。
+        let Some((line, valid)) = crate::input::read_line_lossy(&mut io::stdin().lock())? else {
+            return Ok(None); // EOF（Ctrl-D）时读到 0 字节
+        };
+        if !valid {
+            eprintln!("warning: 输入含非法 UTF-8 字节，已按替换字符处理（检查终端编码或输入法）");
         }
         Ok(Some(line))
     }

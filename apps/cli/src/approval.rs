@@ -3,7 +3,7 @@
 //! 交互路径拆成「写提示词 + 解析输入」的纯函数 [`decide_from_lines`]，[`InteractiveApproval`]
 //! 只负责把真实 stdin/stdout 接进来，逻辑因此可单测。
 
-use std::io::{BufRead, Write};
+use std::io::Write;
 
 use async_trait::async_trait;
 use ignis_core::security::ApprovalMode;
@@ -115,8 +115,9 @@ impl ApprovalHandler for InteractiveApproval {
         tokio::task::spawn_blocking(move || {
             let stdin = std::io::stdin();
             let mut out = std::io::stdout();
-            // 读失败与 EOF 都让迭代器结束 → decide_from_lines 兜底 Reject。
-            let lines = stdin.lock().lines().map_while(Result::ok);
+            // 读失败与 EOF 都让迭代器结束 → decide_from_lines 兜底 Reject；非法 UTF-8 字节
+            // 按替换字符读出（终端边界），不再掐断后续问答。
+            let lines = crate::input::lossy_lines(stdin.lock());
 
             decide_from_lines(&req, lines, &mut out)
         })
