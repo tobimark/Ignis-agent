@@ -106,8 +106,9 @@ impl SchedulerLoop {
     ///
     /// 启动先清场（遗留的 `running` 运行行收成 `failed`/`interrupted`，防重启重复执行与悬挂），
     /// 随后每轮：从库里重读 active job → 按 `next_due` 算出各自到期时刻与下一次唤醒时刻
-    /// （`min(最近到期, now + `[`RESCAN_SECS`]`)`）→ 睡到那时 → 执行到期的 job（该 job 已有运行
-    /// 在飞时只记一行 `overlap skipped`）。取消后不再接受新运行，等在飞运行收尾（≤10s）再返回。
+    /// （`min(最近到期, now + 重扫周期)`，生产即 `now + `[`RESCAN_SECS`]）→ 睡到那时 → 执行到期的
+    /// job（该 job 已有运行在飞时只记一行 `overlap skipped`）。取消后不再接受新运行，等在飞运行
+    /// 收尾（≤10s）再返回。
     pub async fn run(&self, cancel: CancellationToken) -> Result<()> {
         // 启动清场：上一个守护进程被 SIGKILL / 崩溃时留下的行收成终态（`failed` / `interrupted`），
         // 免得重启后 `job_runs` 与 `tasks` 里挂着永远 `running` 的行、或把错过的时点当成待跑。
@@ -229,7 +230,10 @@ impl SchedulerLoop {
 /// （[`RESCAN_SECS`]）也能在 `created_at + 间隔` 准时触发。锚点已过期时由 `next_due` 的
 /// 「无补跑」口径兜住（给 `now + every`）。cron 不看锚点，只看表达式。库里存毫秒，
 /// `next_due` 用秒。
-fn due_at(spec: &ScheduleSpec, job: &JobRecord, now_secs: i64) -> i64 {
+///
+/// `pub` 是刻意的：CLI `schedule list` 的 NEXT DUE 单元格复用同一份锚点口径——显示层自己算
+/// 一套 `now + every` 会在从未运行过的 job 上与真正的触发时刻漂开。
+pub fn due_at(spec: &ScheduleSpec, job: &JobRecord, now_secs: i64) -> i64 {
     // 从没跑过（last_run_at 为 NULL）→ 锚在创建时刻；跑过 → 从上次运行起算
     let last_fired = job
         .last_run_at
@@ -242,7 +246,8 @@ fn due_at(spec: &ScheduleSpec, job: &JobRecord, now_secs: i64) -> i64 {
 struct Plan {
     /// 会到期的 active job 与到期时刻（epoch 秒），按 `list_jobs` 的加载顺序。
     due: Vec<(JobRecord, i64)>,
-    /// 下一次该醒来的时刻（epoch 秒）：`min(最近到期时刻, now + RESCAN_SECS)`。
+    /// 下一次该醒来的时刻（epoch 秒）：`min(最近到期时刻, now + 重扫周期)`——重扫周期生产恒为
+    /// [`RESCAN_SECS`]（测试专用构造器可调短）。
     wake: i64,
 }
 

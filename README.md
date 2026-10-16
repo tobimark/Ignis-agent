@@ -47,7 +47,7 @@ docker run --rm -it -v ~/.ignis:/root/.ignis -v "$PWD:/workspace" -w /workspace 
   ignis --workspace . run "用 fs_list 列一下当前目录" --yes
 ```
 
-构建阶段需要能访问 crates.io。systemd 部署示例见 [`deploy/README.md`](deploy/README.md)。
+构建阶段需要能访问 crates.io（构建镜像 pin 在 `rust:1-slim-bookworm`，`cargo build` 带 `--locked`）。`docker build` **未在本仓库的交付环境执行**（registry 不可达），Docker 部分是文档级交付，镜像定义以 [`Dockerfile`](Dockerfile) 为准。systemd 部署示例见 [`deploy/README.md`](deploy/README.md)。
 
 ## 快速开始
 
@@ -92,49 +92,7 @@ ignis --workspace /path/to/your/project
 
 `ignis doctor` 按生效内核分级：选 `native` 缺密钥 → `✗`；选外置内核缺 Ignis 密钥只给 `!` 警告（用不上），而选中却没装对应 CLI 才是 `✗`。
 
-## 架构
-
-```
-                  ┌───────────────────────────────────────────────┐
-  用户 ──────▶    │ apps/cli（bin: ignis）                        │
-                  │  REPL · 子命令 · 审批 UI · daemon 模式入口     │
-                  └───────────────┬───────────────────────────────┘
-                                  │ Session / Task
-                  ┌───────────────▼───────────────────────────────┐
-  daemon 模式 ──▶ │ packages/core（ignis-core）                    │
-                  │  task · memory · skills · tools                │
-                  │  scheduler · security（审批 / 策略 / 脱敏）     │
-                  └──────┬───────────────────────┬────────────────┘
-                         │ Runtime trait          │ Storage
-                  ┌──────▼────────────┐   ┌───────▼──────────┐
-                  │ packages/runtime  │   │ packages/storage │
-                  │ native / codex    │   │ rusqlite(bundled)│
-                  │ / claude          │   │ ~/.ignis/        │
-                  └───────────────────┘   └──────────────────┘
-                  ┌───────────────────┐
-                  │ packages/gateway  │  守护进程逻辑：调度循环、通知投递
-                  │  Notifier（IM 预留）│  （由 `ignis daemon` 模式驱动）
-                  └───────────────────┘
-```
-
-- **核心模块**（`packages/core`）：`task`（任务执行、事件流与会话历史）、`memory`、`skills`、`scheduler`、`security`（审批 / 策略 / 脱敏）、`tools`；另有 `alerts`、`config`、`doctor`。
-- **依赖方向**：`runtime` 定义 `Runtime` / `ToolExecutor` 等 trait（含内核能力声明），`core` 实现工具执行与审批并注入；native 执行循环在 `runtime` 侧——所以是 `core → runtime`，无循环依赖。`runtime` 的 `RuntimeEvent` 序列化形状就是任务 JSONL 的格式，属跨模块契约。
-- **数据流**：CLI 或调度器发起 Task → core 组装上下文（记忆、技能目录、工作区）→ 内核执行（native 的工具调用经 security 层审批）→ 事件流回写 JSONL 与 UI → 结束写用量、记忆与告警。
-
-## 安全模型
-
-- **工作区沙箱**：文件与 Shell 工具解析后的路径必须落在工作区内（工作区外的读写直接拒绝）；Shell 的工作目录固定为工作区。
-- **审批三档**（风险等级 × 运行模式）：
-  - 交互终端（stdin 是 TTY，且无开关）：`Safe` 直接执行；写文件 / Shell / 外联请求 `Ask`，终端内联提示 `[a]pprove / [s]ession-allow / [r]eject / [d]etails`；危险操作同样询问。
-  - `--yes`：预授权常规风险操作（`Elevated` 直接放行）；危险操作仍拒绝，需要显式 `--unsafe`。
-  - `--unsafe`：预授权全部操作（含危险命令库）。
-  - 非交互且无开关（管道、脚本、无人值守）：**fail-closed**——写 / Shell / 外联一律拒绝并记录原因，模型收到拒绝结果后可继续。
-- **危险命令库**：`rm -rf`、`sudo`、`curl | sh`、`chmod 777`、`mkfs`、`dd if=`、关机类命令、写块设备、fork bomb 等强制走危险档。
-- **敏感文件**：`.env` / `.env.*`、`*.pem`、`*.key`、`id_rsa*`、`.netrc`、`.git-credentials` 的读写升级为危险档（含软链别名解析后的判定）。
-- **审计**：所有非 `Safe` 调用（放行或拒绝）都会写 `approvals` 记录；记录写不进去就**不执行**（fail-closed）。`ignis task show <id>` 可查审批记录与事件流。
-- **脱敏**：密钥统一经脱敏器，不进入任务日志、错误输出与终端；`config show` 与 `Debug` 恒显示 `***`；配置文件写盘为 0600。
-- **后台任务**：创建时即确定执行边界（工具白名单 + 风险上限 + 时间/token 上限 + 工作区），运行期严格执行；失败有记录并告警，不无限重试，重叠执行跳过，停机错过的时点不补跑。
-- **外置内核**：工具在 codex / claude 自己的沙箱里执行（`workspace-write` / `manual` 档，适配器不自行放宽）；Ignis 不经手审批，也没有审批行——这些内核的能力边界见[限制](#限制)。
+两点补充：① `IGNIS_MODEL` / 配置里的 `model.model` 只作用于 `native`（OpenAI 兼容端点的模型名）；两个外置内核一律用各自 CLI 的默认模型，Ignis **不转发**模型名（见 `apps/cli/src/commands/kernel.rs`）。② Docker 镜像只带 `ignis` 二进制，**不含 codex / claude**——要在容器里用外置内核需自行安装并在容器内登录。
 
 ## 命令参考
 
@@ -229,6 +187,50 @@ ignis daemon stop            # 幂等：没在跑也算成功
 - **claude 2.1.274**：真机一轮含工具调用（7.4s）；端点不可达时按 `task_timeout` 收束、零残留进程。
 - 密钥只经环境变量传入，未落盘、未入仓库与日志。
 
+## 架构
+
+```
+                  ┌───────────────────────────────────────────────┐
+  用户 ──────▶    │ apps/cli（bin: ignis）                        │
+                  │  REPL · 子命令 · 审批 UI · daemon 模式入口     │
+                  └───────────────┬───────────────────────────────┘
+                                  │ Session / Task
+                  ┌───────────────▼───────────────────────────────┐
+  daemon 模式 ──▶ │ packages/core（ignis-core）                    │
+                  │  task · memory · skills · tools                │
+                  │  scheduler · security（审批 / 策略 / 脱敏）     │
+                  └──────┬───────────────────────┬────────────────┘
+                         │ Runtime trait          │ Storage
+                  ┌──────▼────────────┐   ┌───────▼──────────┐
+                  │ packages/runtime  │   │ packages/storage │
+                  │ native / codex    │   │ rusqlite(bundled)│
+                  │ / claude          │   │ ~/.ignis/        │
+                  └───────────────────┘   └──────────────────┘
+                  ┌───────────────────┐
+                  │ packages/gateway  │  守护进程逻辑：调度循环、通知投递
+                  │  Notifier（IM 预留）│  （由 `ignis daemon` 模式驱动）
+                  └───────────────────┘
+```
+
+- **核心模块**（`packages/core`）：`task`（任务执行、事件流与会话历史）、`memory`、`skills`、`scheduler`、`security`（审批 / 策略 / 脱敏）、`tools`；另有 `alerts`、`config`、`doctor`。
+- **依赖方向**：`runtime` 定义 `Runtime` / `ToolExecutor` 等 trait（含内核能力声明），`core` 实现工具执行与审批并注入；native 执行循环在 `runtime` 侧——所以是 `core → runtime`，无循环依赖。`runtime` 的 `RuntimeEvent` 序列化形状就是任务 JSONL 的格式，属跨模块契约。
+- **数据流**：CLI 或调度器发起 Task → core 组装上下文（记忆、技能目录、工作区）→ 内核执行（native 的工具调用经 security 层审批）→ 事件流回写 JSONL 与 UI → 结束写用量、记忆与告警。
+
+## 安全模型
+
+- **工作区沙箱**：文件与 Shell 工具解析后的路径必须落在工作区内（工作区外的读写直接拒绝）；Shell 的工作目录固定为工作区。
+- **审批三档**（风险等级 × 运行模式）：
+  - 交互终端（stdin 是 TTY，且无开关）：`Safe` 直接执行；写文件 / Shell / 外联请求 `Ask`，终端内联提示 `[a]pprove / [s]ession-allow / [r]eject / [d]etails`；危险操作同样询问。
+  - `--yes`：预授权常规风险操作（`Elevated` 直接放行）；危险操作仍拒绝，需要显式 `--unsafe`。
+  - `--unsafe`：预授权全部操作（含危险命令库）。
+  - 非交互且无开关（管道、脚本、无人值守）：**fail-closed**——写 / Shell / 外联一律拒绝并记录原因，模型收到拒绝结果后可继续。
+- **危险命令库**：`rm -rf`、`sudo`、`curl | sh`、`chmod 777`、`mkfs`、`dd if=`、关机类命令、写块设备、fork bomb 等强制走危险档。
+- **敏感文件**：`.env` / `.env.*`、`*.pem`、`*.key`、`id_rsa*`、`id_ed25519*`、`.netrc`、`.git-credentials` 的读写升级为危险档（含软链别名解析后的判定）。
+- **审计**：所有非 `Safe` 调用（放行或拒绝）都会写 `approvals` 记录；记录写不进去就**不执行**（fail-closed）。`ignis task show <id>` 可查审批记录与事件流。
+- **脱敏**：密钥统一经脱敏器，不进入任务日志、错误输出与终端；`config show` 与 `Debug` 恒显示 `***`；配置文件写盘为 0600。
+- **后台任务**：创建时即确定执行边界（工具白名单 + 风险上限 + 时间/token 上限 + 工作区），运行期严格执行；失败有记录并告警，不无限重试，重叠执行跳过，停机错过的时点不补跑。
+- **外置内核**：工具在 codex / claude 自己的沙箱里执行（`workspace-write` / `manual` 档，适配器不自行放宽）；Ignis 不经手审批，也没有审批行——这些内核的能力边界见[限制](#限制)。
+
 ## 限制
 
 1. **调度 / 守护进程只跑 `native`**（决策 #18）：`packages/gateway` 的守护进程固定装配 `NativeRuntime`；`jobs.kernel` 列存在但恒为 `native`（`schedule_create` 没有内核参数），`--kernel codex|claude` 不影响守护进程。即使配置 `default_kernel` 是外置内核，守护进程仍需要 Ignis 自己的 OpenAI 兼容凭据。
@@ -247,6 +249,7 @@ ignis daemon stop            # 幂等：没在跑也算成功
 
 - **banner 形状与 `demo.md` 概念图不同**（`demo.md` 原文标注「CLI 概念展示，并非已经实现的 Ignis 界面」）：实际启动屏为 `IGNIS v0.1` / `● Ready` / `Workspace: <dir>` / `Runtime: <kernel> · Skills: <n> · Memory: <n facts|off>`，有未读告警时追加一行 `⚠ N unread alerts — run \`ignis alerts\``。
 - **设计文档措辞与 `demo.md` 不完全一致**：`docs/superpowers/specs/2026-10-15-ignis-v0.1-design.md` 按对话中的新决定固化了工程取舍（Rust 取代 TS/Node、Telegram 推迟为 CLI 收件箱 / 桌面通知、内核数量等），冲突时以设计文档为准。
+- **设计文档的 DDL 措辞与实现的库表不同**：设计文档 §6.7「任务模型」只给字段级草案（§9 把「数据库 schema 字段级细化」留给构建者），与实现有三处出入——实现多了 `jobs.workspace` / `jobs.last_run_at` / `job_runs.task_id`，用量是 `job_runs.input_tokens` + `output_tokens` 两列（没有单列 `usage`），`alerts` 表在设计文档里只有文字描述；一律以 [`packages/storage/src/migrations.rs`](packages/storage/src/migrations.rs) 的 001–003 DDL 为准。
 - **`demo.md` 按作者要求保持原文未修改**；上述偏差只记录在这里，不回改历史文档。
 - **e2e 测试位于 `apps/cli/tests/`**：`CARGO_BIN_EXE_ignis`（真构建二进制路径）只对拥有 bin 的包可用，`packages/*` 里的 crate 没有 bin，因此这类用例不能下沉到 `packages/`。
 

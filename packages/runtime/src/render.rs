@@ -14,14 +14,18 @@ const UNKNOWN_TOOL: &str = "unknown";
 
 /// 渲染外部内核的 prompt：`{system}\n\n---\n` 之后按序逐条消息各占一行（assistant 带
 /// `tool_calls` 时再追加一行调用概要），空历史只留 system 与分隔线。
+///
+/// 标签冻结三个（`User:` / `Assistant:` / `Tool {名} →`）：Ignis 的 system 提示单独走
+/// `system_prompt` 参数，历史里罕见的 `System:` 消息照常成行——不在冻结集里是刻意的，
+/// 但宁可多一行也不静默丢掉。内容为空时不留冒号后的尾随空格（纯工具调用轮的 `Assistant:`）。
 pub fn render_external_prompt(system_prompt: &str, messages: &[ChatMessage]) -> String {
     let mut prompt = format!("{system_prompt}\n\n---\n");
     for (index, message) in messages.iter().enumerate() {
         match message.role {
-            Role::System => prompt.push_str(&format!("System: {}\n", message.content)),
-            Role::User => prompt.push_str(&format!("User: {}\n", message.content)),
+            Role::System => prompt.push_str(&message_line("System:", &message.content)),
+            Role::User => prompt.push_str(&message_line("User:", &message.content)),
             Role::Assistant => {
-                prompt.push_str(&format!("Assistant: {}\n", message.content));
+                prompt.push_str(&message_line("Assistant:", &message.content));
                 if !message.tool_calls.is_empty() {
                     prompt.push_str(&format!("Assistant: [calls: {}]\n", calls_line(message)));
                 }
@@ -30,11 +34,20 @@ pub fn render_external_prompt(system_prompt: &str, messages: &[ChatMessage]) -> 
                 let name = resolve_tool_name(messages, index, message.tool_call_id.as_deref());
                 let first_line = message.content.lines().next().unwrap_or("").trim();
                 let result = crate::cli_process::truncate(first_line, TOOL_RESULT_CHARS);
-                prompt.push_str(&format!("Tool {name} → {result}\n"));
+                prompt.push_str(&message_line(&format!("Tool {name} →"), &result));
             }
         }
     }
     prompt
+}
+
+/// 一行消息：`{head} {内容}`；内容为空时省略分隔空格（不留行尾空格，纯工具调用轮的 `Assistant:`）。
+fn message_line(head: &str, content: &str) -> String {
+    if content.is_empty() {
+        format!("{head}\n")
+    } else {
+        format!("{head} {content}\n")
+    }
 }
 
 /// assistant 的工具调用概要：`名字(紧凑 JSON)`，逐条以 `, ` 相连。
@@ -181,7 +194,7 @@ mod tests {
             render_external_prompt(SYSTEM, &messages),
             "你是 Ignis\n\n---\n\
              User: 读一下\n\
-             Assistant: \n\
+             Assistant:\n\
              Assistant: [calls: fs_read({\"path\":\"a.txt\"})]\n\
              Tool fs_read → 文件第一行\n\
              User: 谢谢\n"
@@ -202,7 +215,7 @@ mod tests {
             render_external_prompt(SYSTEM, &messages),
             "你是 Ignis\n\n---\n\
              Tool call_9 → 孤儿结果\n\
-             Assistant: \n\
+             Assistant:\n\
              Assistant: [calls: fs_read({})]\n\
              Tool unknown → 没有 id 的结果\n"
         );
@@ -222,7 +235,7 @@ mod tests {
         assert_eq!(
             rendered,
             format!(
-                "你是 Ignis\n\n---\nAssistant: \nAssistant: [calls: shell_run({{\"command\":\"x\"}})]\n\
+                "你是 Ignis\n\n---\nAssistant:\nAssistant: [calls: shell_run({{\"command\":\"x\"}})]\n\
                  Tool shell_run → {}…\n",
                 "字".repeat(TOOL_RESULT_CHARS)
             )
@@ -248,6 +261,32 @@ mod tests {
         assert_eq!(
             render_external_prompt(SYSTEM, &messages),
             "你是 Ignis\n\n---\nSystem: 只读模式\n"
+        );
+    }
+
+    /// 空内容的消息不留行尾空格（纯工具调用轮的 `Assistant:`，旧写法是 `Assistant: `）；
+    /// 非空内容与既有的三标签逐字节不变。
+    #[test]
+    fn empty_content_leaves_no_trailing_space() {
+        let messages = vec![
+            user(""),
+            assistant_with_calls("", vec![("call_1", "fs_read", json!({}))]),
+            tool("", Some("call_1")),
+        ];
+
+        let rendered = render_external_prompt(SYSTEM, &messages);
+
+        assert_eq!(
+            rendered,
+            "你是 Ignis\n\n---\n\
+             User:\n\
+             Assistant:\n\
+             Assistant: [calls: fs_read({})]\n\
+             Tool fs_read →\n"
+        );
+        assert!(
+            !rendered.lines().any(|line| line.ends_with(' ')),
+            "任何一行都不该以空格收尾：{rendered:?}"
         );
     }
 }

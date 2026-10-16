@@ -24,7 +24,7 @@ mod common;
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use common::{
@@ -660,4 +660,72 @@ fn demo_c_daemon_keeps_scheduling_after_the_cli_exits() {
     assert!(!home.join("ignis.pid").exists(), "优雅退出应摘掉 pidfile");
     assert_eq!(status(&home), DaemonStatus::Stopped, "库侧状态应是 Stopped");
     mark(started, "收尾完成（SIGTERM 优雅退出、pidfile 摘掉）");
+}
+
+// ---- 夹具契约小测（brief ②）：不拉起任何进程，直接钉脚本自己的出口 ----
+
+/// 用 `sh` 跑夹具脚本（不依赖脚本的执行位）。
+fn run_script(script: &Path, args: &[&str]) -> Output {
+    Command::new("sh")
+        .arg(script)
+        .args(args)
+        .output()
+        .expect("sh 应可执行")
+}
+
+/// 把夹具的一行 JSON 输出解析成对象（解析不了直接失败并贴出原文）。
+fn health_json(output: &Output) -> serde_json::Value {
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(text.trim())
+        .unwrap_or_else(|error| panic!("夹具输出应是 JSON（{error}）：{text:?}"));
+    assert!(value.is_object(), "夹具输出应是 JSON 对象：{value}");
+    value
+}
+
+/// `examples/test-server/check-health.sh` 是 Demo C 与手工联调共用的出口，三种用法各钉一条：
+/// 无参输出可解析、`--simulate 92` 如实回填、非法值退出 2（而不是 1 或 0）。
+///
+/// 直接在仓库夹具上跑（不复制、不写文件）：脚本只读磁盘与 `/proc`，没有副作用。
+#[test]
+fn check_health_fixture_contract_is_pinned() {
+    let script = test_server_dir().join("check-health.sh");
+
+    // 无参：真实读数，形状必须是三键 JSON（两个百分比是 0-100 的整数，docker 是布尔）
+    let plain = run_script(&script, &[]);
+    assert_eq!(plain.status.code(), Some(0), "{}", output_text(&plain));
+    let value = health_json(&plain);
+    for key in ["disk_pct", "mem_pct"] {
+        let pct = value[key]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{key} 应是整数：{value}"));
+        assert!(pct <= 100, "{key}={pct} 越界：{value}");
+    }
+    assert!(value["docker"].is_boolean(), "docker 应是布尔：{value}");
+    assert_eq!(
+        value.as_object().expect("对象").len(),
+        3,
+        "只该有 disk_pct / mem_pct / docker 三个键：{value}"
+    );
+
+    // --simulate 92：演示用读数如实回填（Demo C 的 85% 阈值场景与 README 都依赖它）
+    let simulated = run_script(&script, &["--simulate", "92"]);
+    assert_eq!(
+        simulated.status.code(),
+        Some(0),
+        "{}",
+        output_text(&simulated)
+    );
+    assert_eq!(health_json(&simulated)["disk_pct"], 92);
+
+    // 非法值：退出 2（不是 1），stderr 说清是哪一项坏了
+    let bad = run_script(&script, &["--simulate", "abc"]);
+    assert_eq!(bad.status.code(), Some(2), "{}", output_text(&bad));
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("--simulate"),
+        "{}",
+        output_text(&bad)
+    );
+    // 越界值走同一条拒绝路径（100 是边界，101 不是）
+    let over = run_script(&script, &["--simulate", "101"]);
+    assert_eq!(over.status.code(), Some(2), "{}", output_text(&over));
 }

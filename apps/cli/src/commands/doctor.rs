@@ -1,9 +1,9 @@
 //! `ignis doctor`：环境自检，逐行 `✓/!/✗ {name}: {detail}`。
 //!
-//! 检查项与顺序即输出契约：core 六项（home → config → api_key → base_url → workspace → db）
-//! 之后是 codex / claude 两个外部内核探测行，配置里的内核名非法时再补一行 `kernel`。
-//! 退出码只看 `Fail`：任一 ✗ → 1；只有 `!` 警告（未装外部 CLI、选了外部内核时缺 Ignis 密钥）
-//! 照常 0——自检不该因为一个没用上的内核没装就变红。
+//! 检查项与顺序即输出契约：core 六项（home → config → api_key → base_url → workspace → db）之后是
+//! 配置里的内核名非法时的 `kernel` 行（紧跟六项、其余检查按 native 兜底），再是两个外部内核探测行
+//! （codex → claude）。退出码只看 `Fail`：任一 ✗ → 1；只有 `!` 警告（未装外部 CLI、选了外部内核
+//! 时缺 Ignis 密钥）照常 0——自检不该因为一个没用上的内核没装就变红。
 
 use std::ffi::OsStr;
 use std::io::Write;
@@ -11,7 +11,7 @@ use std::path::Path;
 use std::process::{Command, ExitCode};
 
 use anyhow::Result;
-use ignis_core::config::{ignis_home, load_config};
+use ignis_core::config::{Config, ConfigError, ignis_home, load_config};
 use ignis_core::doctor::{CheckLevel, CheckResult, run_checks};
 
 use crate::cli::Cli;
@@ -22,20 +22,58 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
     let home = ignis_home();
     // 配置解析失败是自检要报告的结论之一：不让它变成 `error:` 直接退出
     let loaded = load_config(&home);
-    // 生效内核与 `run`/REPL 走同一条解析链（`--kernel` > 配置 default_kernel > native）：
-    // 它决定缺 CLI、缺 Ignis 密钥是 ✗ 还是 `!`
+    let results = collect(
+        &home,
+        &loaded,
+        cli.kernel.as_deref(),
+        std::env::var_os("PATH").as_deref(),
+    );
+
+    let mut out = std::io::stdout();
+    report(&mut out, &results)
+}
+
+/// 组合全部检查项（打印与退出码交给 [`report`]）：core 六项 → 内核名非法时的 `kernel` 行 →
+/// codex / claude 两个外部内核探测行。
+///
+/// 生效内核与 `run`/REPL 走同一条解析链（`--kernel` > 配置 default_kernel > native）：它决定缺
+/// CLI、缺 Ignis 密钥是 ✗ 还是 `!`。`home` 与 `path` 可注入，用例因此不必碰真实 `~/.ignis` 与
+/// 进程环境（测试可并行）。
+fn collect(
+    home: &Path,
+    loaded: &Result<Config, ConfigError>,
+    kernel_flag: Option<&str>,
+    path: Option<&OsStr>,
+) -> Vec<CheckResult> {
+    // 配置里的内核名只在解析不出来时兜底 native：其余检查先按这个口径跑
     let configured = loaded
         .as_ref()
         .map(|config| config.default_kernel.as_str())
         .unwrap_or(NATIVE_KERNEL);
-    let (selected, kernel_error) = resolve_selection(cli.kernel.as_deref(), configured);
+    let (selected, kernel_error) = resolve_selection(kernel_flag, configured);
 
-    let mut results = run_checks(&home, &loaded, selected == NATIVE_KERNEL);
+    let mut results = run_checks(home, loaded, selected == NATIVE_KERNEL);
+    if kernel_error.is_some() {
+        soften_api_key_for_unresolved_kernel(&mut results);
+    }
     results.extend(kernel_error);
-    results.extend(kernel_checks(selected, std::env::var_os("PATH").as_deref()));
+    results.extend(kernel_checks(selected, path));
+    results
+}
 
-    let mut out = std::io::stdout();
-    report(&mut out, &results)
+/// 配置里的内核名非法（`✗ kernel` 已让退出码非零）：其余检查按 native 兜底，此时缺 key 的
+/// `✗ api_key … native 内核需要` 会误导只是拼错名字、其实只打算用 codex/claude 的用户——
+/// 降级为 `!`，并在文案里点明这一行是兜底口径（顺序与退出码都不变）。
+fn soften_api_key_for_unresolved_kernel(results: &mut [CheckResult]) {
+    for result in results.iter_mut() {
+        if result.name == "api_key" && result.level == CheckLevel::Fail {
+            result.level = CheckLevel::Warn;
+            result.detail = format!(
+                "{}（配置的内核名非法，其余检查按 native 兜底）",
+                result.detail
+            );
+        }
+    }
 }
 
 /// 生效内核的解析（与 `run`/REPL 同一条链）：`--kernel` > 配置 `default_kernel` > `native`。
@@ -101,7 +139,9 @@ fn kernel_check(name: &'static str, selected: &str, path: Option<&OsStr>) -> Che
     }
 }
 
-/// 跑 `{binary} --version`，取首行非空输出作为版本短串。
+/// 跑 `{binary} --version`，取首个非空输出行作为版本短串。
+///
+/// stdout 优先，它空时退到 stderr：有的 CLI 把版本打到 stderr，不该因此被判「不可用」。
 fn probe_version(binary: &Path) -> Result<String, String> {
     let output = Command::new(binary)
         .arg("--version")
@@ -115,12 +155,18 @@ fn probe_version(binary: &Path) -> Result<String, String> {
             .unwrap_or_else(|| "信号终止".to_string());
         return Err(format!("--version 退出码 {code}"));
     }
-    String::from_utf8_lossy(&output.stdout)
+    first_line(&output.stdout)
+        .or_else(|| first_line(&output.stderr))
+        .ok_or_else(|| "--version 没有输出".to_string())
+}
+
+/// 输出字节里的首个非空行（lossy 解码，与内核适配器同一宽容度）。
+fn first_line(bytes: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(bytes)
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| "--version 没有输出".to_string())
 }
 
 /// 逐行打印 `✓/!/✗ {name}: {detail}`；返回进程退出码：任一 ✗ → 1；只有 `!` 警告照常 0。
@@ -198,6 +244,118 @@ mod tests {
         assert!(text.contains("! claude: 未安装 claude CLI"), "{text}");
     }
 
+    /// 组合顺序与退出码接线：core 六项 → （配置内核名非法时）`kernel` → codex → claude；
+    /// 退出码只看 ✗（`!` 照常 0，`✗ kernel` 也照样变红）。
+    #[test]
+    fn collect_composes_checks_in_the_documented_order_and_wires_the_exit_code() {
+        let dir = TempDir::new("collect");
+        let workspace = dir.path().join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        // 本地 listener 顶替真实端点：TCP 握手能完成即可（与 core 的用例同一手法）
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = Config {
+            workspace_root: workspace,
+            api_key: Some("test-key".into()),
+            model: ignis_runtime::ModelConfig {
+                base_url: format!("http://{}/v1", listener.local_addr().unwrap()),
+                // 环境变量名取一个不存在的（不走默认的 `OPENAI_API_KEY`），断言与运行者环境无关
+                api_key_env: "IGNIS_T7_ABSENT_KEY".into(),
+                ..ignis_runtime::ModelConfig::default()
+            },
+            ..Config::default()
+        };
+        // 空目录当 PATH：两个外部内核都探不到（未选中 → `!`，不改变退出码）
+        let path = Some(dir.path().as_os_str());
+
+        let results = collect(dir.path(), &Ok(config.clone()), None, path);
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| (result.name, result.level))
+                .collect::<Vec<_>>(),
+            [
+                ("home", CheckLevel::Ok),
+                ("config", CheckLevel::Ok),
+                ("api_key", CheckLevel::Ok),
+                ("base_url", CheckLevel::Ok),
+                ("workspace", CheckLevel::Ok),
+                ("db", CheckLevel::Ok),
+                ("codex", CheckLevel::Warn),
+                ("claude", CheckLevel::Warn),
+            ],
+            "core 六项之后是 codex → claude"
+        );
+        let mut out = Vec::new();
+        assert_eq!(
+            report(&mut out, &results).unwrap(),
+            ExitCode::SUCCESS,
+            "只有 ! 警告时退出码照常 0"
+        );
+
+        // 配置里的内核名非法：`kernel` 行紧跟 core 六项（不是排在探测行之后）；缺 key 的
+        // api_key 降级为 `!`（只是拼错名字、本来要用外部内核的用户不该被那条 ✗ 带偏）；
+        // 退出码仍由 `✗ kernel` 顶上
+        let bad = Config {
+            default_kernel: "gemini".into(),
+            api_key: None,
+            ..config.clone()
+        };
+        let results = collect(dir.path(), &Ok(bad), None, path);
+        assert_eq!(
+            results.iter().map(|result| result.name).collect::<Vec<_>>(),
+            [
+                "home",
+                "config",
+                "api_key",
+                "base_url",
+                "workspace",
+                "db",
+                "kernel",
+                "codex",
+                "claude"
+            ]
+        );
+        let kernel = &results[6];
+        assert_eq!(kernel.level, CheckLevel::Fail, "{kernel:?}");
+        assert!(kernel.detail.contains("未知内核 'gemini'"), "{kernel:?}");
+        let api_key = &results[2];
+        assert_eq!(
+            api_key.level,
+            CheckLevel::Warn,
+            "拼错内核名时缺 key 的 ✗ 会误导：{api_key:?}"
+        );
+        assert!(
+            api_key.detail.contains("配置的内核名非法"),
+            "降级后的文案要点明兜底口径：{api_key:?}"
+        );
+
+        let mut out = Vec::new();
+        assert_eq!(
+            report(&mut out, &results).unwrap(),
+            ExitCode::FAILURE,
+            "✗ kernel 仍让 doctor 变红"
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("✗ kernel:"), "{text}");
+        assert!(text.contains("! api_key:"), "{text}");
+
+        // 对照：配置正常但缺 key（选中 native）时同一条 api_key 结论仍是 ✗——只有内核名非法
+        // 这一条路径才降级
+        let keyless = Config {
+            api_key: None,
+            ..config.clone()
+        };
+        let results = collect(dir.path(), &Ok(keyless), None, path);
+        let api_key = results
+            .iter()
+            .find(|result| result.name == "api_key")
+            .expect("api_key 行必在");
+        assert_eq!(api_key.level, CheckLevel::Fail, "{api_key:?}");
+        assert!(!api_key.detail.contains("配置的内核名非法"), "{api_key:?}");
+
+        drop(listener);
+    }
+
     /// 生效内核的解析链与非法配置名：`--kernel` 压过配置；配置里拼错的名字单列一行 ✗
     /// （其余内核口径按 native 兜底），而不是静默当成 native 或中断检查。
     #[test]
@@ -215,6 +373,44 @@ mod tests {
         assert_eq!(line.name, "kernel");
         assert_eq!(line.level, CheckLevel::Fail);
         assert!(line.detail.contains("未知内核 'gemini'"), "{line:?}");
+    }
+
+    /// `--version` 的读数：stdout 优先，它空时退到 stderr（版本打到 stderr 的 CLI 不该被判
+    /// 「不可用」）；两边都没有非空输出时如实报「没有输出」。
+    #[test]
+    fn probe_version_prefers_stdout_and_falls_back_to_stderr() {
+        let dir = TempDir::new("probe-version");
+        let script = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            fs::write(&path, body).unwrap();
+            set_executable(&path);
+            path
+        };
+
+        // 版本只打到 stderr：仍读出同一个版本短串（修复前这一条会得到「--version 没有输出」）
+        let stderr_only = script(
+            "stderr-only",
+            "#!/bin/sh\nprintf '%s\\n' 'codex 9.9.9' >&2\n",
+        );
+        assert_eq!(probe_version(&stderr_only).unwrap(), "codex 9.9.9");
+
+        // stdout 有输出时仍是 stdout 说了算
+        let both = script(
+            "both",
+            "#!/bin/sh\nprintf '%s\\n' 'stdout-version'\nprintf '%s\\n' 'stderr-noise' >&2\n",
+        );
+        assert_eq!(probe_version(&both).unwrap(), "stdout-version");
+
+        // 两边都空：如实报「没有输出」，不拿空串冒充版本
+        let quiet = script("quiet", "#!/bin/sh\nexit 0\n");
+        assert_eq!(probe_version(&quiet).unwrap_err(), "--version 没有输出");
+
+        // 首个非空行：前导空行跳过
+        let padded = script(
+            "padded",
+            "#!/bin/sh\nprintf '\\n\\n%s\\n' 'codex-cli 1.2.3' >&2\n",
+        );
+        assert_eq!(probe_version(&padded).unwrap(), "codex-cli 1.2.3");
     }
 
     /// 没装外部内核：未选中 → `!` 警告（含安装提示），选中 → ✗。

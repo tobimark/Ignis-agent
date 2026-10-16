@@ -102,12 +102,8 @@ pub fn format_task_end(
     usage: &Usage,
     skills: &[String],
 ) -> String {
-    let status = match status {
-        RunStatus::Success => "success",
-        RunStatus::Failed => "failed",
-        RunStatus::Aborted => "aborted",
-        RunStatus::LimitReached => "limit_reached",
-    };
+    // 契约字符串只在 `RunStatus::as_str` 一处映射（与 `tasks.status`、`done.status` 同一份口径）
+    let status = status.as_str();
     let elapsed = format!("{:.1}s", elapsed.as_secs_f64());
     let mark = if usage.estimated { "~" } else { "" };
     let input = format!("{mark}in={}", usage.input_tokens);

@@ -182,7 +182,7 @@ pub enum DaemonCommand {
     /// 前台运行调度循环（自守护 re-exec 与 systemd/Docker 用；不直接面向用户）
     #[command(hide = true)]
     Run {
-        /// 前台运行（re-exec 时总是带上）
+        /// 前台运行（re-exec 时总是带上；漏掉则报错，不静默按前台跑）
         #[arg(long)]
         foreground: bool,
     },

@@ -12,7 +12,7 @@ use std::process::ExitCode;
 
 use anyhow::{Result, bail};
 use ignis_core::config::ignis_home;
-use ignis_runtime::{RunStatus, RuntimeEvent};
+use ignis_runtime::RuntimeEvent;
 use ignis_storage::{ApprovalRecord, Db, TaskLog, TaskRecord};
 use serde_json::Value;
 
@@ -250,7 +250,8 @@ fn event_detail(event: &RuntimeEvent) -> String {
             summary,
             error,
         } => {
-            let mut detail = format!("done status={}", status_name(*status));
+            // 契约字符串只在 `RunStatus::as_str` 一处映射（与 `tasks.status`、结束行同一份口径）
+            let mut detail = format!("done status={}", status.as_str());
             if let Some(summary) = summary {
                 detail.push_str(&format!(
                     " summary={}",
@@ -398,16 +399,6 @@ pub(crate) fn truncate(text: &str, max_chars: usize) -> String {
     let mut out: String = text.chars().take(max_chars).collect();
     out.push('…');
     out
-}
-
-/// `RunStatus` 的跨模块契约字符串（与 `tasks.status`、`done.status` 一致）。
-fn status_name(status: RunStatus) -> &'static str {
-    match status {
-        RunStatus::Success => "success",
-        RunStatus::Failed => "failed",
-        RunStatus::Aborted => "aborted",
-        RunStatus::LimitReached => "limit_reached",
-    }
 }
 
 #[cfg(test)]

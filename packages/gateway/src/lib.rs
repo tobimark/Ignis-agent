@@ -22,7 +22,7 @@ use ignis_core::config::ConfigError;
 use ignis_storage::StorageError;
 
 pub use daemon::{DaemonStatus, StartOutcome, StopOutcome};
-pub use r#loop::{RESCAN_SECS, SchedulerLoop};
+pub use r#loop::{RESCAN_SECS, SchedulerLoop, due_at};
 
 /// gateway 的失败原因：进程生命周期与调度循环里「预期内」的失败，消息一律中文人话
 /// （CLI 只把它们打成 `error: …`，终端不出现堆栈）。

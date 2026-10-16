@@ -45,9 +45,24 @@ pub async fn run(command: &DaemonCommand) -> Result<ExitCode> {
             let line = status_report(&daemon::status(&home), &daemon::pid_file(&home))?;
             println!("{line}");
         }
-        DaemonCommand::Run { .. } => daemon::run_foreground(&home).await?,
+        // 隐藏入口：自守护 re-exec 与 systemd/Docker 总是显式带 `--foreground`，漏了就报人话
+        DaemonCommand::Run { foreground } => {
+            ensure_foreground(*foreground)?;
+            daemon::run_foreground(&home).await?
+        }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// 隐藏入口 `daemon run` 的入口校验：必须显式 `--foreground`。
+///
+/// 不带旗标时这条命令既不是后台启动（那是 `daemon start`）、也不是明确的前台意图——静默按前台
+/// 跑会把调度循环卡在一个用户以为「启动完就退」的终端上。
+fn ensure_foreground(foreground: bool) -> Result<()> {
+    if foreground {
+        return Ok(());
+    }
+    bail!("daemon run 必须显式带 --foreground（后台启动请用 `ignis daemon start`）")
 }
 
 /// `status` 的读数 → 一行文案；坏 pidfile 是唯一的失败态（上抛后 `main` 打成 `error:` 并给退出 1）。
@@ -270,5 +285,16 @@ mod tests {
             START_HINT,
             "hint: daemon is not running; run `ignis daemon start` to enable schedules"
         );
+    }
+
+    /// 隐藏入口的入口校验：`daemon run` 必须显式带 `--foreground`（自守护 re-exec 总是带上）；
+    /// 漏了就报人话错误，并指向用户多半真正想要的那条命令。
+    #[test]
+    fn daemon_run_requires_an_explicit_foreground_flag() {
+        assert!(ensure_foreground(true).is_ok(), "显式 --foreground 应放行");
+
+        let error = ensure_foreground(false).unwrap_err().to_string();
+        assert!(error.contains("--foreground"), "{error}");
+        assert!(error.contains("daemon start"), "{error}");
     }
 }

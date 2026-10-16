@@ -1,15 +1,17 @@
 //! `ignis schedule list|pause|resume|remove|history`：调度任务的命令行入口。
 //!
 //! 这一组命令只碰 `jobs` / `job_runs` 两张表：暂停与恢复改 `jobs.status`，删除是物理删行
-//! （历史运行留痕不动，`history` 因此对已删任务照常可查）。`list` 的 next due 用守护进程同一份
-//! [`next_due`] 现算——两边不会各算一套「下次什么时候跑」。
+//! （历史运行留痕不动，`history` 因此对已删任务照常可查）。`list` 的 next due 复用守护进程的
+//! [`due_at`]（同一份锚点：`last_run_at` 优先、从未运行过时取 `created_at`）——两边不会各算
+//! 一套「下次什么时候跑」。
 
 use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::{Result, anyhow};
 use ignis_core::config::{ensure_home, ignis_home};
-use ignis_core::scheduler::{NEVER_DUE, next_due, parse_schedule};
+use ignis_core::scheduler::{NEVER_DUE, parse_schedule};
+use ignis_gateway::due_at;
 use ignis_storage::{Db, JobRecord, JobRunRecord, now_secs};
 
 use super::task::{format_time, one_line, render_table, truncate};
@@ -144,14 +146,14 @@ fn render_jobs(jobs: &[JobRecord], now: i64) -> String {
 }
 
 /// next due 单元格：永不到期渲染成 `never`，表达式坏掉（手工改库）给 `?`。
+///
+/// 到期时刻与守护进程共用 [`due_at`]：interval 的锚点优先取 `last_run_at`，从未运行过时取
+/// `created_at`（显示层自己算 `now + every` 会让从未运行过的 job 逐轮漂向未来）。
 fn next_due_cell(job: &JobRecord, now: i64) -> String {
     let Ok(spec) = parse_schedule(&job.schedule_kind, &job.schedule_expr) else {
         return "?".to_string();
     };
-    // interval 的节奏从上次运行起算（库里存毫秒，`next_due` 用秒），与守护进程同一口径；
-    // cron 只看表达式，`last_fired` 不参与
-    let last_fired = job.last_run_at.map(|millis| millis.div_euclid(1_000));
-    format_due(next_due(&spec, now, last_fired))
+    format_due(due_at(&spec, job, now))
 }
 
 /// 到期时刻的展示：`NEVER_DUE` 是哨兵（不是真实时刻），渲染成 `never`；其余给 RFC 3339 短形。
@@ -355,6 +357,31 @@ mod tests {
         // 到点时刻走的是守护进程那一份 `next_due`：cron 不可达 → 哨兵 → `never`
         let unreachable = record("02", "cron", "0 0 30 2 *", None);
         assert_eq!(next_due_cell(&unreachable, STARTED_AT / 1000), "never");
+    }
+
+    /// 从未运行过的 interval：NEXT DUE 锚在 `created_at + 间隔`（与守护进程共用同一份 [`due_at`]），
+    /// 不随「现在」逐轮漂——显示层自己算 `now + every` 会显示一个守护进程永远不会命中的时刻。
+    #[test]
+    fn a_never_run_interval_is_anchored_to_its_creation_time() {
+        // created = 2026-10-15T12:00:00Z，间隔 10m；下一次查看发生在 created+1s
+        let job = record("01", "interval", "10m", None);
+        let created = STARTED_AT / 1000;
+
+        // 锚在创建时刻：给 12:10:00 整（`now + every` 的旧写法会给 12:10:01，晚 1 秒）
+        assert_eq!(next_due_cell(&job, created + 1), "2026-10-15T12:10:00Z");
+        // 重扫窗口内再看若干次：同一个时刻（不向后漂）
+        for elapsed in [2, 17, 29, 59] {
+            assert_eq!(
+                next_due_cell(&job, created + elapsed),
+                "2026-10-15T12:10:00Z"
+            );
+        }
+
+        // 创建时刻已经过去一整格（停机跨度）：不补跑，从「现在」重新起算
+        assert_eq!(next_due_cell(&job, created + 601), "2026-10-15T12:20:01Z");
+        // 跑过一次之后节奏由 `last_run_at` 接管：fired + 10m 仍晚于现在 → 保持原节奏
+        let ran = record("02", "interval", "10m", Some((created + 60) * 1_000));
+        assert_eq!(next_due_cell(&ran, created + 90), "2026-10-15T12:11:00Z");
     }
 
     /// 暂停/恢复改的是 `jobs.status`，回执点名完整 id 与任务名。
