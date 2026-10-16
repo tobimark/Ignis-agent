@@ -108,12 +108,16 @@ gitignore），需要长期留存时请贴到发布说明或附件里。
 | （运行后填写） | 例：`https://your-endpoint/v1` / `your-model` | `demos 3` / `tasks 20` / `restarts 10` | 例：A 3/3、B SKIP（无 uv）→「验收不完整」退出码 1；tasks 17/20；restarts 10/10 | `harness/results-<ts>.md` |
 | 2026-10-16 | `https://api.minimax.cn/v1` / `MiniMax-M2` | `demos 1`（脚本首跑，**不是**门槛达标） | Doctor ✓；A 1/1 PASS；B SKIP（无 uv）；C 0/1 FAIL（真阳性，见下） | `harness/results-20261016-154501.md` |
 | 2026-10-16 | 同上 | `tasks 2`（前两条，**不是**门槛达标） | 2/2 = 100%（N=2 < 20，未计完整门槛）；退出码 0 | `harness/results-20261016-155357.md` |
-| 2026-10-16 | 同上 | `demos 1`（**修复后复验**） | Doctor ✓；A 1/1 PASS；B SKIP（无 uv）；**C 1/1 PASS**（`run=success kind=schedule alert=1`，daemon 停止后无残留）；按当时脚本为退出码 0（现行口径见下注） | `harness/results-20261016-161436.md` |
+| 2026-10-16 | 同上 | `demos 1`（**中间调试运行**，**不是**门槛达标） | Doctor ✓；A 0/1 FAIL（run 退出码 1、修复后 `npm test` 仍失败——模型侧未产出修复）；B SKIP；C 0/1 FAIL（创建 run 本身失败，job 未落库） | `harness/results-20261016-161316.md` |
+| 2026-10-16 | 同上 | `demos 1`（**修复后复验**，**不是**门槛达标） | Doctor ✓；A 1/1 PASS；B SKIP（无 uv）；**C 1/1 PASS**（`run=success kind=schedule alert=1`，daemon 停止后无残留）；按当时脚本为退出码 0（现行口径见下注） | `harness/results-20261016-161436.md` |
+| 2026-10-16 | 同上 | `demos 1`（**中间调试运行**，**不是**门槛达标） | Doctor ✓；A 1/1 PASS；B SKIP（无 uv）→「验收不完整」退出码 1；C 0/1 FAIL：调度运行 success 但 **`alert=0`**（`notify_user` 未触发，观测到的模型侧抖动） | `harness/results-20261016-163751.md` |
 | 2026-10-16 | 同上 | `demos 1`（门槛 SKIP 语义修复后复验，**不是**门槛达标） | Doctor ✓；A 1/1 PASS；B SKIP（无 uv）；C 1/1 PASS；结论「**验收不完整**：Demo B ×1 未运行」——跳过 ≠ 通过，退出码 1 | `harness/results-20261016-164015.md` |
 
 > 注：2026-10-16 早前的两次 `demos 1`（154501 / 161436）是**当时**脚本的结论；其中 161436 那次带 B SKIP
 > 却仍打印「验收通过、退出码 0」。本修复（门槛 SKIP ⇒「验收不完整」、退出码 1）落地后，任何带 B SKIP 的
 > `demos` 运行都不会再打印「验收通过」——164015 那次已按新口径退出 1。`tasks 2` 无门槛 SKIP，仍为退出码 0。
+> 161316 / 163751 两次中间运行的 A/C 失败分别是模型侧未完成与模型侧抖动（原因见行内），不是脚本或
+> 产品缺陷；两者的结果文件都保留为「中间调试运行」的原始记录。
 
 ### 2026-10-16 真机首跑发现：Demo C 触发不了（真阳性，已修复）
 
@@ -144,6 +148,19 @@ Demo C 的「创建 + 审批留痕 + job 落库」也都真实通过，卡在「
 复验：`demos 1` 退出码 0，**Demo C 1/1 PASS**（`run=success`、`kind=schedule`、`alert=1`、daemon
 停止后无残留，`harness/results-20261016-161436.md`）；`cargo test --workspace` 505 passed /
 0 failed / 1 ignored。
+
+**补丁（Wave A，`fix(gateway): 补上休眠作业的首次到期锚并收紧收尾证据`）**：上面的「锚在创建
+时刻」对**休眠**作业仍不完整——`created_at + 间隔` 在守护进程启动前就已过去时（守护进程停机期间
+创建，或停机 ≥ 一个间隔），每轮重扫都把到期现算成 `now + 间隔` 并跳过：job 会**静默地永不触发**
+（真机复现：昨日创建的 `10m` job，今早启动守护进程，138s 内 0 次运行、`last_run_at` 仍为 NULL）。
+修复：调度循环在首次观察到这类 job 时把锚钉进**进程内快照**（= 首次观察 + 间隔），此后每轮复用
+同一锚——一个守护进程生命周期内只在锚点触发一次、不补跑；首轮在飞期间该 job 不参与唤醒（不空转、
+不补出第二行），运行结束后由 `last_run_at + 间隔` 续拍；重启后锚重新快照（不落库是刻意的「不补跑」
+取舍）。公开的 `due_at()`（CLI `schedule list` 用）保持无状态不变。判别用例（`packages/gateway/src/loop.rs`）：
+`created_at = now − 2·间隔`、重扫 1s、间隔 3s 的休眠 job 修复前 6s 内 0 次运行（RED）、修复后
+~3s 触发（GREEN）；另有「首轮后 cadence = `last_run_at + 间隔`、重扫窗口不补跑」与快照复用用例。
+`demos` 的 Demo C 详情行现在记录 `expr=<kind/expr>`，并在间隔 ≤ 30s 重扫窗口时打印 note 说明
+「>30s 首次到期」路径未被覆盖（见 `harness/acceptance.sh`）。
 
 脚本自测记录（**不是验收结果**，仅验证脚本逻辑。假端点把 Demo C 的 `schedule_create` 脚本化为
 **2 秒档**间隔，与 `apps/cli/tests/demo_c.rs` 的 `2s` 同档；**注意**：短间隔（≤30s 重扫窗口）的假端点

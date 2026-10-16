@@ -4,8 +4,11 @@
 //! 1. **无补跑（锚在创建/上次运行时刻）**：每轮都从「现在」与锚点现算到期时刻；interval 的锚点
 //!    优先取 `last_run_at`，从未运行过时取 `created_at`——① 新 job 的首次到期 = `created_at + 间隔`，
 //!    重扫（≤ [`RESCAN_SECS`] 一轮）不会把它向后推，间隔大于重扫周期也能准时触发；②
-//!    `created_at + 间隔` 已经过去（停机期间错过的时点）不补跑，重启后的首次执行至少在一个间隔
-//!    之后；③ 首次运行后由 `last_run_at` 接管节奏（`fired + every` 仍晚于现在就按它）。
+//!    `created_at + 间隔` 已经过去（停机期间错过的时点）**不补跑**：从未运行过的 interval job
+//!    在首次被观察时把锚钉成「首次观察 + 间隔」（进程内快照，见 [`SchedulerLoop::plan_due`]），
+//!    此后每轮复用同一锚——一个循环生命周期内它只在那个锚点触发一次，重扫既不会推后也不会
+//!    提前补跑；重启后锚重新快照（没跑就重新起算）；③ 首次运行后由 `last_run_at` 接管节奏
+//!    （`fired + every` 仍晚于现在就按它）。
 //! 2. **不重叠**：每个 job 有一把运行互斥标志，上一次运行没结束时再到期只记一行
 //!    `overlap skipped: {job}` 日志（不落运行行）。
 //! 3. **失败必通知**：非 `success` 的终态（含 `TaskRunner` 的基础设施错误）都升一条
@@ -18,7 +21,7 @@
 //!（`Preauthorized { unsafe_ops: false }`，危险操作一律拒绝）+ [`PolicyOnlyApproval`]（策略已
 //! 判定，被问到就拒绝）；限额取 `job.limits_json`（经每轮配置传给 `TaskRunner`）。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -68,6 +71,10 @@ pub struct SchedulerLoop {
     /// 没有 job 到期时的重扫周期（秒）。生产装配恒为 [`RESCAN_SECS`]；测试专用构造器
     /// `with_rescan_secs` 可把它调短，在秒级复现「间隔 > 重扫周期」的调度滑移。
     rescan_secs: i64,
+    /// 休眠 job（从未运行过、且 `created_at + 间隔` 在首次观察前就已过去的 interval）的首次
+    /// 观察锚：`job id → 首次观察时刻 + 间隔`。进程内快照，不落库——重启后重新快照是刻意的
+    /// 「不补跑」取舍（见模块不变量 ②）。
+    dormant_anchors: Mutex<HashMap<String, i64>>,
 }
 
 impl SchedulerLoop {
@@ -91,6 +98,7 @@ impl SchedulerLoop {
             skills,
             log_dir,
             rescan_secs: RESCAN_SECS,
+            dormant_anchors: Mutex::new(HashMap::new()),
         }
     }
 
@@ -124,7 +132,7 @@ impl SchedulerLoop {
         let mut tasks: Vec<JoinHandle<()>> = Vec::new();
         loop {
             tasks.retain(|task| !task.is_finished());
-            let plan = match self.plan(now_secs()) {
+            let plan = match self.plan(now_secs(), &running) {
                 Ok(plan) => plan,
                 Err(error) => {
                     eprintln!(
@@ -182,7 +190,7 @@ impl SchedulerLoop {
     }
 
     /// 一次扫描：每个 active 且会到期的 job 与它的到期时刻，以及下一次该醒来的时刻。
-    fn plan(&self, now: i64) -> Result<Plan> {
+    fn plan(&self, now: i64, running: &RunningJobs) -> Result<Plan> {
         let jobs = self.db.list_jobs(false)?;
         let mut wake = now.saturating_add(self.rescan_secs);
         let mut due = Vec::new();
@@ -198,15 +206,60 @@ impl SchedulerLoop {
                     continue;
                 }
             };
-            let due_at = due_at(&spec, &job, now);
+            let due_at = self.plan_due(&spec, &job, now);
             if due_at == NEVER_DUE {
                 // 永不到期：既不触发，也不参与「下一次醒来」的计算
+                continue;
+            }
+            if due_at <= now && running.is_running(&job.id) {
+                // 休眠锚已在过去、它的首轮运行还在飞：本轮整个跳过，只按 `min(间隔, 重扫)` 参与
+                // 一次唤醒。若仍把过去的锚算进来，循环会零睡眠空转（日志/查询刷屏），并在运行位
+                // 一释放就立刻补出第二行；唤醒太懒（只按重扫）又会让「间隔 < 重扫」的作业在首轮
+                // 结束后拖到下一个重扫才续拍。
+                let interval = interval_secs(&spec).unwrap_or(self.rescan_secs);
+                wake = wake.min(now.saturating_add(interval.min(self.rescan_secs)));
                 continue;
             }
             wake = wake.min(due_at);
             due.push((job, due_at));
         }
         Ok(Plan { due, wake })
+    }
+
+    /// 规划路径上的到期时刻：在 [`due_at`] 的无状态口径上叠加「休眠作业」的首次观察锚。
+    ///
+    /// 从未运行过的 interval job 若 `created_at + 间隔` 已经过去（守护进程停机期间错过首个
+    /// 到期点），`due_at` 每轮都会给出「now + 间隔」——重扫比间隔短时这个时点永远追不上，
+    /// job 会静默地永不触发。这里在首次观察到它时把锚钉进 [`Self::dormant_anchors`]
+    /// （= 首次观察 + 间隔）并打一行日志，此后每轮复用同一锚：一个循环生命周期内只在锚点触发
+    /// 一次，不补跑、也不会因重扫漂移。锚不落库，重启后重新快照。新鲜作业（首个到期点未到，
+    /// 锚在 `created_at`）、跑过的作业（`last_run_at` 接管）与 cron 一律维持 [`due_at`] 的口径。
+    fn plan_due(&self, spec: &ScheduleSpec, job: &JobRecord, now: i64) -> i64 {
+        let computed = due_at(spec, job, now);
+        // 解析入口已保证间隔放得进 i64；cron（或越界兜底值）一律维持无状态口径
+        let Some(every) = interval_secs(spec) else {
+            return computed;
+        };
+        if job.last_run_at.is_some() || computed == NEVER_DUE {
+            return computed;
+        }
+        // 休眠判定与 `next_due`/`due_at` 完全同一口径（秒级）：`created_at + 间隔 ≤ 现在` 正是
+        // `due_at` 触发「now + every」兜底的条件。用毫秒判会漏掉「到期点落在当前这一秒内」的
+        // 作业——那种作业每轮同样只会拿到 now + every，照样静默永不触发。
+        if job.created_at.div_euclid(1_000).saturating_add(every) > now {
+            return computed;
+        }
+        let mut anchors = self
+            .dormant_anchors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *anchors.entry(job.id.clone()).or_insert_with(|| {
+            eprintln!(
+                "warning: job {} 从未运行且已过首个到期点，按首次观察 + interval 起算（不补跑）",
+                job.name
+            );
+            now.saturating_add(every)
+        })
     }
 
     /// 搬进 spawned 任务的共享依赖。
@@ -220,6 +273,14 @@ impl SchedulerLoop {
             skills: Arc::clone(&self.skills),
             log_dir: self.log_dir.clone(),
         }
+    }
+}
+
+/// interval 的间隔秒数；cron（或手工构造的越界值，解析入口已挡住）给 `None`。
+fn interval_secs(spec: &ScheduleSpec) -> Option<i64> {
+    match spec {
+        ScheduleSpec::Interval { every_secs } => i64::try_from(*every_secs).ok(),
+        ScheduleSpec::Cron(_) => None,
     }
 }
 
@@ -415,6 +476,11 @@ struct RunningJobs {
 }
 
 impl RunningJobs {
+    /// 该 job 是否已有运行在飞（休眠锚的在飞跳过用；与 [`Self::try_acquire`] 共享同一标志表）。
+    fn is_running(&self, job_id: &str) -> bool {
+        self.lock().contains(job_id)
+    }
+
     /// 抢占某个 job 的运行位；该 job 已有运行在飞时返回 `None`（重叠 → 跳过）。
     fn try_acquire(&self, job_id: &str) -> Option<RunningGuard> {
         let mut in_flight = self.lock();
@@ -1198,6 +1264,118 @@ mod tests {
         assert!(
             elapsed >= Duration::from_secs(2),
             "首次执行必须在一个间隔边界之后（实际 {elapsed:?}）"
+        );
+
+        stop_loop(cancel, running).await;
+    }
+
+    /// 把 job 的 `created_at` 拨到过去（模拟「`created_at + 间隔` 在守护进程启动前就已过去」
+    /// 的休眠 job）。生产代码没有也不需要这种回拨接口；测试直读库改写时间戳。
+    fn rewind_job_created_at(db: &Db, job_id: &str, created_at_ms: i64) {
+        db.with_conn(|conn| {
+            conn.execute_batch(&format!(
+                "UPDATE jobs SET created_at = {created_at_ms} WHERE id = '{job_id}'"
+            ))
+        })
+        .unwrap();
+    }
+
+    /// P4-T8 Wave A 判别用例（RED）：休眠的 interval job——`created_at + 间隔` 在守护进程启动前
+    /// 就已过去（守护进程停机期间创建，或停机 ≥ 一个间隔）——修复前每轮扫描都把它现算成
+    /// `now + every`（重扫 1s < 间隔 3s）并跳过，永远不触发；修复后首次观察即钉锚，~3s 触发。
+    #[tokio::test]
+    async fn a_dormant_interval_job_fires_after_the_first_observation() {
+        let env = Env::new("dormant", vec![success_event("ok")]);
+        let job_id = env.add_job("dormant", "interval", "3s");
+        // created_at = now − 2·interval：启动循环时首个到期点（created+3s）已经过去
+        rewind_job_created_at(&env.db, &job_id, now_millis() - 6_000);
+
+        let cancel = CancellationToken::new();
+        let started = tokio::time::Instant::now();
+        let running = spawn_loop(env.scheduler().with_rescan_secs(1), cancel.clone());
+
+        wait_for(
+            Duration::from_secs(6),
+            "休眠 job 的首次运行（修复前永不触发）",
+            || !env.runs(&job_id).is_empty(),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(2),
+            "首次执行必须在一个间隔边界之后（实际 {elapsed:?}）"
+        );
+
+        stop_loop(cancel, running).await;
+    }
+
+    /// 快照语义（不依赖时序）：休眠 job 的锚只在首次观察时钉一次，之后的重扫一律复现同一时刻；
+    /// 新鲜作业（首个到期点未到）与跑过的作业（`last_run_at` 接管）都不走这条路径。
+    #[test]
+    fn a_dormant_anchor_is_snapshotted_once_and_reused_across_scans() {
+        let env = Env::new("dormant-unit", Vec::new());
+        let scheduler = env.scheduler();
+        let spec = parse_schedule("interval", "60s").unwrap();
+        let t0: i64 = 1_700_000_000;
+        // created_at = t0 − 120s：首个到期点（created+60）已过 → 休眠
+        let job = job_at((t0 - 120) * 1_000, None);
+        assert_eq!(
+            due_at(&spec, &job, t0),
+            t0 + 60,
+            "无状态口径的兜底是 now + every"
+        );
+
+        let first = scheduler.plan_due(&spec, &job, t0);
+        assert_eq!(first, t0 + 60, "首次观察时锚 = 首次观察 + 间隔");
+        // 两个重扫周期之后再扫：必须复现同一锚（无状态口径会给 t0+91 / t0+121，永远追不上）
+        assert_eq!(scheduler.plan_due(&spec, &job, t0 + 31), first);
+        assert_eq!(scheduler.plan_due(&spec, &job, t0 + 61), first);
+
+        // 新鲜作业：首个到期点还没到（锚在 created_at），不进入休眠快照
+        let fresh = job_at(t0 * 1_000, None);
+        assert_eq!(scheduler.plan_due(&spec, &fresh, t0), t0 + 60);
+        // 跑过的作业：`last_run_at` 接管节奏，休眠快照不参与
+        let ran = job_at((t0 - 120) * 1_000, Some(t0 * 1_000));
+        assert_eq!(scheduler.plan_due(&spec, &ran, t0), t0 + 60);
+    }
+
+    /// 休眠 job 只触发一次、绝不补跑：首次触发后节奏移交 `last_run_at`（下一轮 = 上轮结束 +
+    /// 间隔），重扫窗口内不得多出第二行。
+    ///
+    /// 重启（新循环实例、同一份库）不设专项用例：锚不落库、重启即重新快照，这是刻意的
+    /// 「不补跑」取舍；`last_run_at` 路径的重启语义由 `a_restart_does_not_run_the_missed_ticks`
+    /// 覆盖。
+    #[tokio::test]
+    async fn a_dormant_interval_job_fires_once_then_follows_last_run() {
+        let env = Env::new("dormant-cadence", vec![success_event("ok")]);
+        let job_id = env.add_job("dormant", "interval", "3s");
+        rewind_job_created_at(&env.db, &job_id, now_millis() - 6_000);
+
+        let cancel = CancellationToken::new();
+        let running = spawn_loop(env.scheduler().with_rescan_secs(1), cancel.clone());
+
+        wait_for(Duration::from_secs(6), "首次运行", || {
+            !env.runs(&job_id).is_empty()
+        })
+        .await;
+        wait_for(Duration::from_secs(4), "首轮收尾", || {
+            env.runs(&job_id)[0].ended_at.is_some()
+        })
+        .await;
+        // 首轮结束后紧接着一个多扫周期：只该有那一行（快照不得在重扫时变成补跑）
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        assert_eq!(env.runs(&job_id).len(), 1, "首次触发后不得补跑");
+
+        // 下一轮 = 首轮结束时刻 + 间隔
+        wait_for(Duration::from_secs(6), "第二轮运行", || {
+            env.runs(&job_id).len() >= 2
+        })
+        .await;
+        let runs = env.runs(&job_id);
+        let gap = runs[1].started_at - runs[0].ended_at.unwrap();
+        assert!(
+            gap >= 2_000,
+            "第二轮必须在上轮结束 + 一个间隔（秒级取整）之后（实际 {gap}ms）"
         );
 
         stop_loop(cancel, running).await;

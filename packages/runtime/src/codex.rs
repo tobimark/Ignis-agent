@@ -149,10 +149,7 @@ async fn drive(
             return Some(done(
                 RunStatus::Failed,
                 None,
-                Some(format!(
-                    "无法启动 codex 内核（{}）：{err}；请确认已安装 codex CLI 并在 PATH 中",
-                    program.display()
-                )),
+                Some(spawn_error_text(program, &err)),
             ));
         }
     };
@@ -308,6 +305,22 @@ async fn drive(
     }
 }
 
+/// spawn 失败的人话：只有 `NotFound`（没装 / 不在 PATH）给安装提示；其余失败保留底层错误，
+/// 附一条通用排查提示——渲染后的 prompt 是单个 argv 元素，超过 Linux 的 `MAX_ARG_STRLEN`
+/// （128 KiB）时 spawn 会以 `E2BIG` 失败，把已装好的 CLI 说成「请确认已安装」是误导。
+fn spawn_error_text(program: &Path, err: &std::io::Error) -> String {
+    match err.kind() {
+        std::io::ErrorKind::NotFound => format!(
+            "无法启动 codex 内核（{}）：{err}；请确认已安装 codex CLI 并在 PATH 中",
+            program.display()
+        ),
+        _ => format!(
+            "无法启动 codex 内核（{}）：{err}；若提示参数过长，请缩短任务或历史，或改用 native 内核",
+            program.display()
+        ),
+    }
+}
+
 /// 已识别的 codex 事件：只留本适配器用得上的形状，其余字段不解析。
 #[derive(Debug, PartialEq)]
 enum CodexEvent {
@@ -443,6 +456,38 @@ mod tests {
         assert_eq!(
             parse_line(r#"{"type":"turn.failed","error":"stream ended"}"#),
             Some(CodexEvent::TurnFailed { message: None })
+        );
+    }
+
+    /// spawn 失败文案：只有 `NotFound` 才提示「安装 CLI」；其余失败（典型是 prompt 超
+    /// `MAX_ARG_STRLEN` 的 `E2BIG`）保留底层错误并给缩短任务/历史的提示。
+    #[test]
+    fn spawn_error_text_keeps_the_install_hint_only_for_not_found() {
+        let program = Path::new("/usr/bin/codex");
+        let missing = std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No such file or directory (os error 2)",
+        );
+        let text = spawn_error_text(program, &missing);
+        assert!(text.contains("os error 2"), "{text}");
+        assert!(
+            text.contains("请确认已安装 codex CLI 并在 PATH 中"),
+            "{text}"
+        );
+
+        let too_long = std::io::Error::new(
+            std::io::ErrorKind::ArgumentListTooLong,
+            "Argument list too long (os error 7)",
+        );
+        let text = spawn_error_text(program, &too_long);
+        assert!(text.contains("os error 7"), "应保留底层错误：{text}");
+        assert!(
+            !text.contains("请确认已安装"),
+            "非 ENOENT 不得再提示安装：{text}"
+        );
+        assert!(
+            text.contains("缩短任务或历史"),
+            "应给出真正的排查提示：{text}"
         );
     }
 }

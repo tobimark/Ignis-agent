@@ -71,6 +71,9 @@ C_WAIT="${IGNIS_ACCEPT_C_WAIT:-180}"
 RESTART_SETTLE="${IGNIS_ACCEPT_RESTART_SETTLE:-6}"
 RESTART_BASELINE_WAIT="${IGNIS_ACCEPT_RESTART_BASELINE_WAIT:-180}"
 readonly TASKS_GATE_PCT=80
+# 与 gateway 的 `ignis_gateway::RESCAN_SECS` 对齐：Demo C 的 note 判定用——间隔 ≤ 这个窗口时，
+# 「>30s 的首次到期」路径不会被本次运行覆盖（见 demo_c_once 的 expr note）。
+readonly RESCAN_SECS=30
 
 # ── 运行期状态 ────────────────────────────────────────────────────────────────
 RUN_ROOT=""
@@ -187,6 +190,21 @@ gate() { # <PASS|FAIL|SKIP|DRY> <名称> <细节>
 have() { command -v "$1" >/dev/null 2>&1; }
 
 first_line() { printf '%s' "${1%%$'\n'*}"; }
+
+# interval 表达式 `<正整数><s|m|h>` → 秒；认不出的形状给空串（Demo C 的 note 判定用）
+interval_secs_of() { # <expr>
+  local expr="$1" num="" unit=""
+  case "$expr" in
+    *s|*m|*h) num="${expr%?}"; unit="${expr: -1}" ;;
+    *) return 0 ;;
+  esac
+  case "$num" in ''|*[!0-9]*) return 0 ;; esac
+  case "$unit" in
+    s) printf '%s' "$((10#$num))" ;;
+    m) printf '%s' "$((10#$num * 60))" ;;
+    h) printf '%s' "$((10#$num * 3600))" ;;
+  esac
+}
 
 # 展示用的端点：剥掉 URL 里的 user:pass@（端点偶尔带凭据，不落进结果文件）
 redact_url() {
@@ -371,9 +389,12 @@ stop_daemon_hard() { # <home>：先走 daemon stop（幂等），仍活着就按
   return 0
 }
 
-cleanup() {
-  local code=$?
+# 退出码捕获：正常路径（main 的 exit / `set -e`）由 EXIT trap 原样带出；INT/TERM 路径显式给
+# 128+信号——中断时 `$?` 可能停在 0，不能让「没验证完的中断」伪装成退出 0。
+cleanup() { # <退出码>（省略时取 $?）
+  local code="${1:-$?}"
   trap - EXIT INT TERM
+  # 清理顺序不变：先按 pidfile 停掉自己拉起的守护进程，再处理临时目录
   if [ -n "${TRACK_FILE:-}" ] && [ -f "$TRACK_FILE" ]; then
     while IFS= read -r home; do
       [ -n "$home" ] || continue
@@ -705,9 +726,11 @@ demo_c_once() {
   if [ "$(count "$home/ignis.db" "SELECT COUNT(*) FROM approvals WHERE task_id='$create_id' AND tool='schedule_create'")" -lt 1 ]; then
     FAILURES="${FAILURES}schedule_create 没有审批留痕; "
   fi
-  local job_id="" job_status=""
+  local job_id="" job_status="" job_kind="" job_expr=""
   job_id="$(q "$home/ignis.db" "SELECT id FROM jobs ORDER BY created_at DESC, id DESC LIMIT 1")"
   job_status="$(q "$home/ignis.db" "SELECT status FROM jobs WHERE id='$job_id'")"
+  job_kind="$(q "$home/ignis.db" "SELECT schedule_kind FROM jobs WHERE id='$job_id'")"
+  job_expr="$(q "$home/ignis.db" "SELECT schedule_expr FROM jobs WHERE id='$job_id'")"
   if [ -z "$job_id" ]; then
     FAILURES="${FAILURES}没有落库的调度任务; "
   else
@@ -786,7 +809,17 @@ demo_c_once() {
   key_scan "$home" >/dev/null 2>&1 || ks=$?
   if [ "$ks" -eq 1 ]; then FAILURES="${FAILURES}日志里出现 API key 原文; "; fi
 
-  local detail="job=active run=${run_status:-none} kind=${run_kind:-none} alert=${alert_count:-0} tokens=${run_tin:-0}/${run_tout:-0} jsonl=${JSONL_BYTES}B skills=${skills:-none}"
+  # 详情行记录 job 的调度表达式；间隔 ≤ 重扫窗口（RESCAN_SECS）时，「>30s 的首次到期」路径
+  # 不会被本次运行覆盖——表达式由模型自选，这里只记一条 note，不判 FAIL。
+  local rescan_note="" every_secs=""
+  if [ "$job_kind" = "interval" ]; then
+    every_secs="$(interval_secs_of "$job_expr")"
+    if [ -n "$every_secs" ] && [ "$every_secs" -le "$RESCAN_SECS" ]; then
+      rescan_note=" note: 间隔 ${job_expr} ≤ ${RESCAN_SECS}s 重扫窗口，>30s 首次到期路径未被本次运行覆盖（模型自选表达式，不判 FAIL）"
+    fi
+  fi
+
+  local detail="job=active expr=${job_kind:-none}/${job_expr:-none} run=${run_status:-none} kind=${run_kind:-none} alert=${alert_count:-0} tokens=${run_tin:-0}/${run_tout:-0} jsonl=${JSONL_BYTES}B skills=${skills:-none}${rescan_note}"
   if [ -z "$FAILURES" ]; then
     record PASS "$name" "$detail 停止后无残留"
     C_PASS=$((C_PASS + 1))
@@ -1176,7 +1209,38 @@ print_summary() {
     "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT" "$SKIP_GATE_COUNT" "$DRY_COUNT" "$SECONDS"
 }
 
-write_results() {
+# 结论判定（唯一来源）：main 的退出码与结果文件的结论行共用同一套口径，避免两处漂开。
+verdict_rc() {
+  if [ "$DRY_RUN" = 1 ]; then printf '0'; return 0; fi
+  if [ "$FAIL_COUNT" -gt 0 ]; then printf '1'; return 0; fi
+  if [ "$SKIP_GATE_COUNT" -gt 0 ]; then printf '1'; return 0; fi
+  printf '0'
+}
+
+# 结论行（结果文件引用 <rc>）：与 verdict_rc 同一判定
+verdict_line() { # <rc>
+  case "$1" in
+    0)
+      if [ "$DRY_RUN" = 1 ]; then
+        printf 'dry-run：没有执行任何断言（不是通过）'
+      else
+        printf '验收通过：PASS=%d FAIL=0 SKIP=%d' "$PASS_COUNT" "$SKIP_COUNT"
+      fi
+      ;;
+    *)
+      if [ "$FAIL_COUNT" -gt 0 ]; then
+        printf '验收未通过：FAIL=%d（SKIP=%d 不算通过）' "$FAIL_COUNT" "$SKIP_COUNT"
+      elif [ "$SKIP_GATE_COUNT" -gt 0 ]; then
+        printf '验收不完整：%s 未运行（门槛 SKIP=%d）——跳过不等于通过' "${SKIP_GATE_NAMES:-某条门槛}" "$SKIP_GATE_COUNT"
+      else
+        printf '未走完汇总（中断或意外路径），按未验证处理'
+      fi
+      ;;
+  esac
+}
+
+write_results() { # <退出码>：汇总 + 最终结论一并写盘（结论行与退出码同源）
+  local rc="${1:-0}"
   if [ "$DRY_RUN" = 1 ]; then
     log "dry-run：未写结果文件（真实运行会写 $RESULTS_PATH）"
     return 0
@@ -1196,9 +1260,12 @@ write_results() {
     while IFS=$'\t' read -r status name detail; do
       printf '%-5s %-30s %s\n' "$status" "$name" "$detail"
     done <"$ITEMS_FILE"
+    printf '```\n\n## 结论\n\n```\n'
+    printf 'exit=%s %s\n' "$rc" "$(verdict_line "$rc")"
     printf '```\n\n## 说明\n\n'
     printf -- '- SKIP 不是 PASS：每一行 SKIP 都带原因（例如本机未安装 uv）；门槛级 SKIP 会把整体结论判成「验收不完整」。\n'
     printf -- '- 退出码 0 只在没有任何 FAIL 且门槛行没有 SKIP 时给出；门槛 SKIP（某条门槛从未被测量）⇒ 退出码 1。本文件由 `harness/acceptance.sh` 自动生成。\n'
+    printf -- '- 上面「结论」行的 `exit=<码>` 与脚本实际退出码同源（`verdict_rc`），不是事后抄写。\n'
     printf -- '- 端点与模型来自环境变量；本文件只记录脱敏后的端点（URL 里的 user:pass@ 会被打码）。\n'
   } >"$RESULTS_PATH"
   log "结果已写入：$RESULTS_PATH"
@@ -1214,7 +1281,11 @@ main() {
   : >"$ITEMS_FILE"
   : >"$GATES_FILE"
   : >"$TRACK_FILE"
-  trap cleanup EXIT INT TERM
+  # 退出码捕获：EXIT 路径原样带出真实状态；INT/TERM 显式给 128+信号（中断不是通过）。
+  # 两者都只经 cleanup（先停守护进程、再清临时目录）收尾。
+  trap 'cleanup "$?"' EXIT
+  trap 'cleanup 130' INT
+  trap 'cleanup 143' TERM
 
   log "模式=$MODE N=$N$([ "$DRY_RUN" = 1 ] && printf '（dry-run）')；临时目录=$RUN_ROOT"
   if ! preflight; then
@@ -1236,21 +1307,20 @@ main() {
   esac
 
   print_summary
-  write_results
+  local verdict=""
+  verdict="$(verdict_rc)"
+  write_results "$verdict"
   if [ "$DRY_RUN" = 1 ]; then
     log "dry-run 结束：流程演练完成，没有任何断言被执行（这不是通过）"
-    exit 0
-  fi
-  if [ "$FAIL_COUNT" -gt 0 ]; then
+  elif [ "$FAIL_COUNT" -gt 0 ]; then
     log "验收未通过：FAIL=$FAIL_COUNT（SKIP=$SKIP_COUNT 不算通过）"
-    exit 1
-  fi
-  if [ "$SKIP_GATE_COUNT" -gt 0 ]; then
+  elif [ "$SKIP_GATE_COUNT" -gt 0 ]; then
     # 门槛级 SKIP：某条门槛从未被测量（典型：无 uv 时 Demo B 整条跳过）——不是通过，也不是 FAIL
     log "验收不完整：${SKIP_GATE_NAMES:-某条门槛} 未运行（门槛 SKIP=$SKIP_GATE_COUNT）——跳过不等于通过，退出码 1"
-    exit 1
+  else
+    log "验收通过：PASS=$PASS_COUNT SKIP=$SKIP_COUNT"
   fi
-  log "验收通过：PASS=$PASS_COUNT SKIP=$SKIP_COUNT"
+  exit "$verdict"
 }
 
 main "$@"
