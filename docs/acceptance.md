@@ -98,8 +98,9 @@ gitignore），需要长期留存时请贴到发布说明或附件里。
 | （运行后填写） | 例：`https://your-endpoint/v1` / `your-model` | `demos 3` / `tasks 20` / `restarts 10` | 例：A 3/3、B SKIP（无 uv）、C 3/3；tasks 17/20；restarts 10/10 | `harness/results-<ts>.md` |
 | 2026-10-16 | `https://api.minimax.cn/v1` / `MiniMax-M2` | `demos 1`（脚本首跑，**不是**门槛达标） | Doctor ✓；A 1/1 PASS；B SKIP（无 uv）；C 0/1 FAIL（真阳性，见下） | `harness/results-20261016-154501.md` |
 | 2026-10-16 | 同上 | `tasks 2`（前两条，**不是**门槛达标） | 2/2 = 100%（N=2 < 20，未计完整门槛）；退出码 0 | `harness/results-20261016-155357.md` |
+| 2026-10-16 | 同上 | `demos 1`（**修复后复验**） | Doctor ✓；A 1/1 PASS；B SKIP（无 uv）；**C 1/1 PASS**（`run=success kind=schedule alert=1`，daemon 停止后无残留）；退出码 0 | `harness/results-20261016-161436.md` |
 
-### 2026-10-16 真机首跑发现：Demo C 触发不了（真阳性）
+### 2026-10-16 真机首跑发现：Demo C 触发不了（真阳性，已修复）
 
 `demos 1` 里 Demo C 的失败不是脚本问题：**从未运行过（`last_run_at` 为 NULL）且间隔 > 重扫窗口
 （`RESCAN_SECS = 30s`）的 interval job 永远不会触发**——`SchedulerLoop::plan()` 每轮用当前 `now`
@@ -116,8 +117,18 @@ Demo C 的「创建 + 审批留痕 + job 落库」也都真实通过，卡在「
 | C | `20s` | NULL | 45s | 20s 触发，共 1 次 |
 
 `apps/cli/tests/demo_c.rs` 用 2 秒间隔，正好覆盖不到这一档；README 与 demo C 的真机步骤是 1 分钟
-示例，恰好命中。修好调度循环（把「从未运行」的首次到期锚在创建时刻，或持久化 next_due）后，
-`demos 3` 才可能三条同时达标。
+示例，恰好命中。修复方向即「把『从未运行』的首次到期锚在创建时刻」；修复落地后 `demos 3` 才可能
+三条同时达标。
+
+**修复（本提交，`fix(gateway): 修复从未运行的 interval 作业永远不会到期`）**：到期计算抽成私有
+`due_at()` 并改为锚点制——interval 从未运行过（`last_run_at` NULL）时锚在 `created_at`：新 job
+的首次到期 = `created_at + 间隔`，重扫不再把到期时刻一次次推后；锚点已过期（停机跨度）仍不补跑
+（`now + every`）；首次运行后由 `last_run_at` 保节奏。两条判别测试：① `due_at` 在 created+1/+31/+59
+三次重扫都报 `created+60`（间隔 60s）；② 循环级用例（重扫 inject 为 1s、间隔 3s、从未运行）
+修复前 8s 内一次不触发（RED）、修复后 ~3s 触发（GREEN）。模块不变量 #1 的措辞同步收紧。真机
+复验：`demos 1` 退出码 0，**Demo C 1/1 PASS**（`run=success`、`kind=schedule`、`alert=1`、daemon
+停止后无残留，`harness/results-20261016-161436.md`）；`cargo test --workspace` 505 passed /
+0 failed / 1 ignored。
 
 脚本自测记录（**不是验收结果**，仅验证脚本逻辑）：2026-10-16 用本地假端点（脚本化 SSE）跑过
 `demos 3`（三场景 3/3）、`tasks 5`（5/5）与 `tasks 20`（7/20，门槛 FAIL、退出码 1）、

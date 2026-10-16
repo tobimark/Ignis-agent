@@ -1,8 +1,11 @@
 //! 调度循环：按 job 的 interval/cron 节奏发起完整 `TaskRunner` 运行。
 //!
 //! 四条不变量（P3 评审重点）：
-//! 1. **无补跑**：每轮的到期时刻都由 `scheduler::next_due` 从「现在」与 `last_run_at` 现算，
-//!    停机期间错过的时点不会被补齐——重启后的首次执行至少在一个间隔之后。
+//! 1. **无补跑（锚在创建/上次运行时刻）**：每轮都从「现在」与锚点现算到期时刻；interval 的锚点
+//!    优先取 `last_run_at`，从未运行过时取 `created_at`——① 新 job 的首次到期 = `created_at + 间隔`，
+//!    重扫（≤ [`RESCAN_SECS`] 一轮）不会把它向后推，间隔大于重扫周期也能准时触发；②
+//!    `created_at + 间隔` 已经过去（停机期间错过的时点）不补跑，重启后的首次执行至少在一个间隔
+//!    之后；③ 首次运行后由 `last_run_at` 接管节奏（`fired + every` 仍晚于现在就按它）。
 //! 2. **不重叠**：每个 job 有一把运行互斥标志，上一次运行没结束时再到期只记一行
 //!    `overlap skipped: {job}` 日志（不落运行行）。
 //! 3. **失败必通知**：非 `success` 的终态（含 `TaskRunner` 的基础设施错误）都升一条
@@ -25,7 +28,7 @@ use ignis_core::alerts::{AlertSink, Notifier};
 use ignis_core::config::Config;
 use ignis_core::memory::MemoryStore;
 use ignis_core::scheduler::{
-    JobProfile, NEVER_DUE, next_due, parse_limits, parse_profile, parse_schedule,
+    JobProfile, NEVER_DUE, ScheduleSpec, next_due, parse_limits, parse_profile, parse_schedule,
 };
 use ignis_core::security::{ApprovalMode, Policy};
 use ignis_core::skills::SkillCatalog;
@@ -62,6 +65,9 @@ pub struct SchedulerLoop {
     skills: Arc<SkillCatalog>,
     /// `TaskRunner` 的任务日志目录（`{home}/logs`）。
     log_dir: PathBuf,
+    /// 没有 job 到期时的重扫周期（秒）。生产装配恒为 [`RESCAN_SECS`]；测试专用构造器
+    /// `with_rescan_secs` 可把它调短，在秒级复现「间隔 > 重扫周期」的调度滑移。
+    rescan_secs: i64,
 }
 
 impl SchedulerLoop {
@@ -84,7 +90,16 @@ impl SchedulerLoop {
             memory,
             skills,
             log_dir,
+            rescan_secs: RESCAN_SECS,
         }
+    }
+
+    /// 测试专用：覆盖重扫周期。生产装配路径（`daemon::run_foreground` → [`SchedulerLoop::new`]）
+    /// 不经过这里，公开行为恒为 [`RESCAN_SECS`]。
+    #[cfg(test)]
+    fn with_rescan_secs(mut self, secs: i64) -> Self {
+        self.rescan_secs = secs;
+        self
     }
 
     /// 跑调度循环直到 `cancel` 触发。
@@ -111,8 +126,11 @@ impl SchedulerLoop {
             let plan = match self.plan(now_secs()) {
                 Ok(plan) => plan,
                 Err(error) => {
-                    eprintln!("warning: 调度扫描失败，{RESCAN_SECS}s 后重试：{error}");
-                    if !sleep_secs(RESCAN_SECS, &cancel).await {
+                    eprintln!(
+                        "warning: 调度扫描失败，{}s 后重试：{error}",
+                        self.rescan_secs
+                    );
+                    if !sleep_secs(self.rescan_secs, &cancel).await {
                         break;
                     }
                     continue;
@@ -165,7 +183,7 @@ impl SchedulerLoop {
     /// 一次扫描：每个 active 且会到期的 job 与它的到期时刻，以及下一次该醒来的时刻。
     fn plan(&self, now: i64) -> Result<Plan> {
         let jobs = self.db.list_jobs(false)?;
-        let mut wake = now.saturating_add(RESCAN_SECS);
+        let mut wake = now.saturating_add(self.rescan_secs);
         let mut due = Vec::new();
         for job in jobs {
             let spec = match parse_schedule(&job.schedule_kind, &job.schedule_expr) {
@@ -179,9 +197,7 @@ impl SchedulerLoop {
                     continue;
                 }
             };
-            // interval 的节奏从上次运行起算（库里存毫秒，`next_due` 用秒）；cron 只看表达式
-            let last_fired = job.last_run_at.map(|millis| millis.div_euclid(1_000));
-            let due_at = next_due(&spec, now, last_fired);
+            let due_at = due_at(&spec, &job, now);
             if due_at == NEVER_DUE {
                 // 永不到期：既不触发，也不参与「下一次醒来」的计算
                 continue;
@@ -204,6 +220,22 @@ impl SchedulerLoop {
             log_dir: self.log_dir.clone(),
         }
     }
+}
+
+/// 一个 job 的下一次到期时刻（epoch 秒）。
+///
+/// interval 的锚点优先取 `last_run_at`（跑过），从未运行过时取 `created_at`（创建时刻）——
+/// 把「从未运行」的 job 锚在创建时刻，重扫才不会把到期时刻一次次推后：间隔大于重扫周期
+/// （[`RESCAN_SECS`]）也能在 `created_at + 间隔` 准时触发。锚点已过期时由 `next_due` 的
+/// 「无补跑」口径兜住（给 `now + every`）。cron 不看锚点，只看表达式。库里存毫秒，
+/// `next_due` 用秒。
+fn due_at(spec: &ScheduleSpec, job: &JobRecord, now_secs: i64) -> i64 {
+    // 从没跑过（last_run_at 为 NULL）→ 锚在创建时刻；跑过 → 从上次运行起算
+    let last_fired = job
+        .last_run_at
+        .or(Some(job.created_at))
+        .map(|millis| millis.div_euclid(1_000));
+    next_due(spec, now_secs, last_fired)
 }
 
 /// 一次扫描的结果。
@@ -1080,6 +1112,87 @@ mod tests {
                 max_steps: 5,
                 ..Limits::default()
             }
+        );
+
+        stop_loop(cancel, running).await;
+    }
+
+    /// 一个只带时间字段的 interval job 行：到期锚点计算专用（`created_at` 与 `last_run_at`
+    /// 决定首次与后续的到期时刻）。
+    fn job_at(created_ms: i64, last_run_at_ms: Option<i64>) -> JobRecord {
+        JobRecord {
+            id: "job-due".into(),
+            name: "due".into(),
+            prompt: "检查".into(),
+            schedule_kind: "interval".into(),
+            schedule_expr: "60s".into(),
+            kernel: "native".into(),
+            profile_json: r#"{"tools":["fs_read"],"risk":"elevated"}"#.into(),
+            limits_json: r#"{"max_steps":5}"#.into(),
+            workspace: "/tmp/ignis".into(),
+            status: "active".into(),
+            created_at: created_ms,
+            last_run_at: last_run_at_ms,
+        }
+    }
+
+    /// P4-T6b：到期时刻的锚点。从未运行过的 interval job 锚在 `created_at`——连续重扫必须得到
+    /// 同一个时刻（否则间隔大于重扫周期的 job 永远等不到到期）；跑过之后 `last_run_at` 保节奏。
+    #[test]
+    fn a_never_run_interval_is_anchored_to_its_creation_time() {
+        let created_secs: i64 = 1_700_000_000;
+        let created_ms = created_secs * 1_000;
+        let spec = parse_schedule("interval", "60s").unwrap();
+
+        // 重扫发生在 created+1 / +31 / +59（30s 重扫窗口内）：三次都报同一个 created+60
+        assert_eq!(
+            due_at(&spec, &job_at(created_ms, None), created_secs + 1),
+            created_secs + 60
+        );
+        assert_eq!(
+            due_at(&spec, &job_at(created_ms, None), created_secs + 31),
+            created_secs + 60
+        );
+        assert_eq!(
+            due_at(&spec, &job_at(created_ms, None), created_secs + 59),
+            created_secs + 60
+        );
+
+        // 创建时刻已经过去一整格（守护进程停机跨度）：不补跑，从「现在」重新起算
+        assert_eq!(
+            due_at(&spec, &job_at(created_ms, None), created_secs + 61),
+            created_secs + 121
+        );
+
+        // 跑过一次之后的拍子由 last_run_at 接管：fired + 60 仍晚于现在 → 保持原节奏
+        let ran_at = (created_secs + 60) * 1_000;
+        assert_eq!(
+            due_at(&spec, &job_at(created_ms, Some(ran_at)), created_secs + 90),
+            created_secs + 120
+        );
+    }
+
+    /// P4-T6b 判别用例：重扫周期 1s、间隔 3s、从未运行——修复前每轮 `now + every` 被重扫推后，
+    /// 8s 内一次都不触发；修复后锚在创建时刻，~3s 触发。
+    #[tokio::test]
+    async fn an_interval_longer_than_the_rescan_fires_a_never_run_job() {
+        let env = Env::new("rescan-anchor", vec![success_event("ok")]);
+        let job_id = env.add_job("anchored", "interval", "3s");
+
+        let cancel = CancellationToken::new();
+        let started = tokio::time::Instant::now();
+        let running = spawn_loop(env.scheduler().with_rescan_secs(1), cancel.clone());
+
+        wait_for(
+            Duration::from_secs(8),
+            "首次运行（间隔 3s > 重扫 1s）",
+            || !env.runs(&job_id).is_empty(),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(2),
+            "首次执行必须在一个间隔边界之后（实际 {elapsed:?}）"
         );
 
         stop_loop(cancel, running).await;
