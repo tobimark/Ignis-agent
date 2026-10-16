@@ -6,11 +6,16 @@
 //!    到期 = `created_at + 间隔`，跑过的 job = `last_run_at + 间隔`）时到期时刻就取它，重扫
 //!    （≤ [`RESCAN_SECS`] 一轮）不会把它向后推，间隔大于重扫周期也能准时触发；② 锚点 + 间隔
 //!    已经过去（停机期间错过的时点：重启、升级、崩溃、机器休眠，或 job 创建于上次停机期间）
-//!    **不补跑**：这类过期作业（从未运行过的休眠 job，或 `last_run_at` 已过一整个间隔的跑过
-//!    job）在首次被观察时把锚钉成「首次观察 + 间隔」（进程内快照，见
-//!    [`SchedulerLoop::plan_due`]），此后每轮复用同一锚——一个循环生命周期内它只在那个锚点
-//!    触发一次，重扫既不会推后也不会提前补跑；重启后锚重新快照（没跑就重新起算）；③ 首次
-//!    运行后由 `last_run_at` 接管节奏（`fired + every` 仍晚于现在就按它）。
+//!    **不补跑**，且按间隔是否长于重扫窗口分两档：(a) **间隔 > 重扫窗口**——这类过期作业（从未
+//!    运行过的休眠 job，或 `last_run_at` 已过一整个间隔的跑过 job）每轮重扫都会把到期现算成
+//!    `now + 间隔`，永远追不上（静默地永不触发），所以在首次被观察时把锚钉成「首次观察 + 间隔」
+//!    （进程内快照，见 [`SchedulerLoop::plan_due`]），此后每轮复用同一锚——一个循环生命周期内它
+//!    只在那个锚点触发一次，重扫既不会推后也不会提前补跑；重启后锚重新快照（没跑就重新起算）；
+//!    (b) **间隔 ≤ 重扫窗口**——维持 [`due_at`] 的无状态口径（不钉锚、也不打那行 warning）：唤醒点
+//!    `min(到期点, 现在 + 重扫)` 就是到期点本身（`现在 + 间隔`），循环必然在到期那一刻醒来并触发，
+//!    「滑失」不可能发生；钉锚反而有害——快照值很快成为过去值，`plan` 的在飞分支据此把该 job 从
+//!    `due` 里摘掉，已经排好的那一轮（暂停前在计划里、暂停后才到点的「迟到一轮」）便不再落地；
+//!    ③ 首次运行后由 `last_run_at` 接管节奏（`fired + every` 仍晚于现在就按它）。
 //! 2. **不重叠**：每个 job 有一把运行互斥标志，上一次运行没结束时再到期只记一行
 //!    `overlap skipped: {job}` 日志（不落运行行）。
 //! 3. **失败必通知**：非 `success` 的终态（含 `TaskRunner` 的基础设施错误）都升一条
@@ -75,8 +80,9 @@ pub struct SchedulerLoop {
     rescan_secs: i64,
     /// 过期 interval 作业（锚点 + 间隔 在首次观察前就已过去：从未运行过的休眠 job，或
     /// `last_run_at` 已过一整个间隔的跑过 job——停机后重启、升级、崩溃、机器休眠）的首次观察锚：
-    /// `job id → 首次观察时刻 + 间隔`。进程内快照，不落库——重启后重新快照是刻意的「不补跑」
-    /// 取舍（见模块不变量 ②）。
+    /// `job id → 首次观察时刻 + 间隔`。只收**间隔 > 重扫窗口**的作业：间隔 ≤ 窗口时唤醒点就是
+    /// 到期点，本来就不会滑失，钉锚反而会把已排好的那一轮从计划里摘掉（见模块不变量 ②、`plan_due`）。
+    /// 进程内快照，不落库——重启后重新快照是刻意的「不补跑」取舍（见模块不变量 ②）。
     overdue_anchors: Mutex<HashMap<String, i64>>,
 }
 
@@ -229,15 +235,22 @@ impl SchedulerLoop {
         Ok(Plan { due, wake })
     }
 
-    /// 规划路径上的到期时刻：在 [`due_at`] 的无状态口径上叠加「过期作业」的首次观察锚。
+    /// 规划路径上的到期时刻：在 [`due_at`] 的无状态口径上叠加「过期作业」的首次观察锚——
+    /// **仅当间隔 > 重扫周期**（[`Self::rescan_secs`]）。
     ///
-    /// interval job 的锚点（`last_run_at`，从未运行过时取 `created_at`）`+ 间隔` 已经过去时
-    /// （停机期间错过的时点：重启、升级、崩溃、机器休眠），[`due_at`] 每轮都会给出
+    /// 间隔 > 重扫周期的 interval job：锚点（`last_run_at`，从未运行过时取 `created_at`）`+ 间隔`
+    /// 已经过去时（停机期间错过的时点：重启、升级、崩溃、机器休眠），[`due_at`] 每轮都会给出
     /// 「now + 间隔」——重扫比间隔短时这个时点永远追不上，job 会静默地永不触发。这里在首次
     /// 观察到它时把锚钉进 [`Self::overdue_anchors`]（= 首次观察 + 间隔）并打一行日志，此后每轮
     /// 复用同一锚：一个循环生命周期内只在锚点触发一次，不补跑、也不会因重扫漂移。锚不落库，
     /// 重启后重新快照。节奏未断的作业（锚点 + 间隔 仍晚于现在）与 cron 一律维持 [`due_at`]
     /// 的口径。
+    ///
+    /// 间隔 ≤ 重扫周期的 interval job：**不进快照**，原样返回无状态 `computed`。这类作业的唤醒点
+    /// `min(now + every, now + rescan)` 就是到期点 `now + every`，循环必然在到期那一刻醒来并触发，
+    /// 「永远追不上」的滑失不可能发生；钉锚反而有害——快照值很快成为过去值，[`Self::plan`] 的在飞
+    /// 分支据此把该 job 从 `due` 里摘掉，已经排好的那一轮（暂停前在计划里、暂停后才到点的
+    /// 「迟到一轮」）就不再落地（demo_c 暂停/恢复 e2e 钉的就是这一轮）。
     fn plan_due(&self, spec: &ScheduleSpec, job: &JobRecord, now: i64) -> i64 {
         let computed = due_at(spec, job, now);
         // 解析入口已保证间隔放得进 i64；cron 与越界兜底值（哨兵）一律维持无状态口径
@@ -245,6 +258,10 @@ impl SchedulerLoop {
             return computed;
         };
         if computed == NEVER_DUE {
+            return computed;
+        }
+        // 间隔不大于重扫窗口：无状态口径不会滑失（唤醒点 = 到期点），不钉锚、不告警
+        if every <= self.rescan_secs {
             return computed;
         }
         // 过期判定与 `next_due`/`due_at` 完全同一口径（秒级）：锚点 + 间隔 ≤ 现在 正是 `due_at`
@@ -1523,6 +1540,98 @@ mod tests {
         assert!(
             (started_at - beat_ms).abs() <= 1_000,
             "首次运行应落在 last_run_at + 间隔（{beat_ms}）附近，实际 {started_at}"
+        );
+
+        stop_loop(cancel, running).await;
+    }
+
+    // ===== P4-T8 Wave E：过期锚只作用于「间隔 > 重扫窗口」的作业——间隔 ≤ 窗口时唤醒点
+    // `min(现在 + 间隔, 现在 + 重扫)` 就是到期点本身（`现在 + 间隔`），循环必然在到期那一刻醒来并
+    // 触发，「永远追不上」的滑失不可能发生；钉锚反而有害：快照值很快变成过去值，`plan` 的在飞分支
+    // 据此把该 job 从 `due` 里摘掉，已经排好的那一轮（暂停前在计划里、暂停后才到点的「迟到一轮」，
+    // demo_c 暂停步骤的契约）就不再落地。下列用例与上面的 Wave A/C 组互为正反面。 =====
+
+    /// Wave E 判别用例（RED）：间隔 ≤ 重扫窗口的过期作业**不进快照、到期口径维持无状态**。
+    ///
+    /// 判别不依赖时序（同一秒内的两次扫描）：第一次扫描（作业不在飞）修复前后都给出
+    /// `现在 + 间隔`，但修复前顺手把锚钉进快照；第二次扫描（作业在飞，快照值已成过去时）修复前走
+    /// `plan` 的在飞分支，把该 job 从 `due` 里整个摘掉、只留一次唤醒——「暂停前已经排好的那一轮」
+    /// 就是这么丢的。修复后两次扫描都在 `due` 里，且到期点 = 唤醒点。
+    ///
+    /// 「不告警」由快照表为空断言：告警行与快照写入在同一个闭包里（见 `plan_due`），表为空就
+    /// 意味着那行 `warning` 不可能被打印。
+    #[test]
+    fn an_interval_within_the_rescan_window_is_not_snapshotted_and_keeps_its_plan() {
+        let env = Env::new("within-rescan-plan", Vec::new());
+        let job_id = env.add_job("beat", "interval", "2s");
+        // last_run_at = now − 2·间隔：锚点 + 间隔 已过去（Wave C 的过期判定会命中）
+        env.db
+            .touch_job_last_run(&job_id, now_millis() - 4_000)
+            .unwrap();
+        let scheduler = env.scheduler().with_rescan_secs(5);
+        let now = now_secs();
+
+        let idle = RunningJobs::default();
+        let first = scheduler.plan(now, &idle).unwrap();
+        assert_eq!(first.due.len(), 1, "到期作业应排进计划");
+        assert_eq!(
+            first.due[0].1,
+            now + 2,
+            "间隔 ≤ 重扫窗口：到期点 = 无状态口径的 now + every"
+        );
+        assert_eq!(
+            first.wake,
+            now + 2,
+            "唤醒点 = min(到期点, 现在 + 重扫) = 到期点"
+        );
+        assert!(
+            scheduler.overdue_anchors.lock().unwrap().is_empty(),
+            "间隔 ≤ 重扫窗口的作业不得进快照（也不得打那行 warning）"
+        );
+
+        // 一个间隔后的重扫：这一轮已经在飞，下一拍仍须排进 `due`——计划在外的运行（暂停后迟到的
+        // 那一轮）就靠它落地；快照会给出一个过去值，把该 job 整个摘出计划。
+        let in_flight = RunningJobs::default();
+        let guard = in_flight.try_acquire(&job_id).expect("运行位应可抢占");
+        let next = scheduler.plan(now + 2, &in_flight).unwrap();
+        assert_eq!(
+            next.due.len(),
+            1,
+            "在飞作业的下一拍仍须排进计划（快照的过去值会让它消失）"
+        );
+        assert_eq!(next.due[0].1, now + 4, "到期点跟着「现在」走");
+        assert_eq!(next.wake, now + 4);
+        assert!(scheduler.overdue_anchors.lock().unwrap().is_empty());
+        drop(guard);
+    }
+
+    /// 间隔 ≤ 重扫窗口的过期作业照常按拍触发（间隔 2s、重扫 5s）：首轮之后下一拍照落，两轮之间
+    /// 约一个间隔，不会因为重扫窗口（5s）被拖长、也不会退回旧值而停摆。
+    #[tokio::test]
+    async fn an_interval_within_the_rescan_window_fires_on_its_cadence() {
+        let env = Env::new("within-rescan-cadence", vec![success_event("ok")]);
+        let job_id = env.add_job("beat", "interval", "2s");
+        env.db
+            .touch_job_last_run(&job_id, now_millis() - 4_000)
+            .unwrap();
+
+        let cancel = CancellationToken::new();
+        let running = spawn_loop(env.scheduler().with_rescan_secs(5), cancel.clone());
+
+        wait_for(Duration::from_secs(5), "首次运行", || {
+            !env.runs(&job_id).is_empty()
+        })
+        .await;
+        wait_for(Duration::from_secs(6), "第二轮的到期", || {
+            env.runs(&job_id).len() >= 2
+        })
+        .await;
+        let runs = env.runs(&job_id);
+        // 上下界都留了整秒余量：下界防「同一拍重复落行」，上界防「退回旧值 / 拖到重扫窗口」
+        let gap = runs[1].started_at - runs[0].started_at;
+        assert!(
+            (1_200..=4_500).contains(&gap),
+            "两轮之间应约一个间隔（实际 {gap}ms）"
         );
 
         stop_loop(cancel, running).await;
