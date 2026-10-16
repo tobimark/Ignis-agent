@@ -10,7 +10,7 @@
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::Path;
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -150,19 +150,51 @@ const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 上限内的轮询间隔：探测是一条短命令，不值得为它引入通知机制。
 const VERSION_PROBE_POLL: Duration = Duration::from_millis(50);
 
+/// `ETXTBSY`（`Text file busy`）的裸错误码：Linux 与 BSD/macOS 同为 26，`std::io::ErrorKind`
+/// 里没有稳定变体可用。
+const ETXTBSY: i32 = 26;
+
+/// 瞬时 [`ETXTBSY`] 的重试次数：刚写完的脚本紧接着被 exec 时，内核可能还没收掉写者的文件
+/// 描述符——全量并行测试下探到真实 CLI 时会撞见，`cargo` 对刚构建的二进制同样重试。
+const VERSION_PROBE_RETRIES: u32 = 2;
+
+/// 两次尝试之间的等待：写者通常只差一两个时钟滴答就关掉 fd。
+const VERSION_PROBE_RETRY_DELAY: Duration = Duration::from_millis(30);
+
+/// 起 `{binary} --version` 子进程（stdin 接空设备、两条输出管道）。
+///
+/// 失败一律把 io 错误原样交回调用方（文案还是 `error.to_string()`，与不重试时逐字一致），只有
+/// [`ETXTBSY`] 例外——它是「exec 一个刚写完的文件」的瞬时状态，与调用方给的条件无关（本机全量
+/// 并行测试里我们自己的测试脚本就这么撞过）。这类错误重试 [`VERSION_PROBE_RETRIES`] 次、每次
+/// 隔 [`VERSION_PROBE_RETRY_DELAY`]；仍失败就是真失败，如实报。
+fn spawn_version_probe(binary: &Path) -> std::io::Result<Child> {
+    let mut retries = VERSION_PROBE_RETRIES;
+    loop {
+        match Command::new(binary)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => return Ok(child),
+            Err(error) if error.raw_os_error() == Some(ETXTBSY) && retries > 0 => {
+                retries -= 1;
+                std::thread::sleep(VERSION_PROBE_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// 跑 `{binary} --version`，取首个非空输出行作为版本短串。
 ///
 /// stdout 优先，它空时退到 stderr：有的 CLI 把版本打到 stderr，不该因此被判「不可用」；接受的
 /// 假 ✓ 模式是 stderr 上的启动噪声（如 `warning: ...`）会被读成版本。stdin 接空设备、整轮上限
 /// [`VERSION_PROBE_TIMEOUT`]，超时就杀掉子进程并按「不可用」如实报（与退出码非零/没有输出同形）。
+/// spawn 只在瞬时 [`ETXTBSY`] 上重试（见 [`spawn_version_probe`]）。
 fn probe_version(binary: &Path) -> Result<String, String> {
-    let mut child = Command::new(binary)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| error.to_string())?;
+    let mut child = spawn_version_probe(binary).map_err(|error| error.to_string())?;
     let deadline = Instant::now() + VERSION_PROBE_TIMEOUT;
     loop {
         match child.try_wait() {
@@ -452,6 +484,50 @@ mod tests {
             "#!/bin/sh\nprintf '\\n\\n%s\\n' 'codex-cli 1.2.3' >&2\n",
         );
         assert_eq!(probe_version(&padded).unwrap(), "codex-cli 1.2.3");
+    }
+
+    /// 刚写完的脚本紧接着被 exec 的瞬时 `ETXTBSY`：重试过后仍失败就把这个错误如实交出来；
+    /// 写者一收掉、同一条路径立刻读出版本。
+    ///
+    /// 只握着写 fd 的那一半钉的是「诚实」：每次尝试都注定失败（Linux 上握着写 fd 时 exec 回
+    /// 26，是确定性的），重试有没有都该在这里报同一个错。钉「重试确实存在」的是耗时——给错的
+    /// 调用要等过一段重试间隔才报错，没有重试就会立刻返回（负载只会让耗时更长，不会误伤）。
+    #[test]
+    fn probe_version_retries_a_transient_etxtbsy_and_then_reports_it_honestly() {
+        let dir = TempDir::new("probe-etxtbsy");
+        let script = dir.path().join("etxtbsy");
+        fs::write(&script, "#!/bin/sh\nprintf '%s\\n' 'codex-cli 1.2.3'\n").unwrap();
+        set_executable(&script);
+
+        // 写 fd 一直握着：exec 确定性地失败，重试只是把这同一次失败问了第三遍
+        let writer = fs::OpenOptions::new().write(true).open(&script).unwrap();
+        let started = Instant::now();
+        let error = spawn_version_probe(&script).expect_err("握着写 fd 时 exec 必失败");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            error.raw_os_error(),
+            Some(ETXTBSY),
+            "重试耗尽后要把 ETXTBSY 原样带出来，不吞也不换说法：{error:?}"
+        );
+        assert!(
+            error.to_string().contains("Text file busy"),
+            "交给用户的还是内核给的那句：{error:?}"
+        );
+        // 规格给的重试间隔下界（档位 20–50ms）：至少要真的等过一次重试间隔才放弃
+        assert!(
+            elapsed >= Duration::from_millis(20),
+            "给错后要等过重试间隔再报错，没有重试就会立刻返回（实测 {elapsed:?}）"
+        );
+        assert_eq!(
+            probe_version(&script).unwrap_err(),
+            error.to_string(),
+            "对外文案就是 io 错误的 Display，与不重试时逐字一致"
+        );
+
+        // 写者收掉后同一条路径立刻成功：上面那次失败确实是瞬时条件，不是探测自己坏了
+        drop(writer);
+        assert_eq!(probe_version(&script).unwrap(), "codex-cli 1.2.3");
     }
 
     /// `base_url` 不可达按内核分级：选中外部内核（Ignis 不访问该端点）只给 `!`、doctor 退出 0；
