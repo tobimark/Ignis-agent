@@ -1,0 +1,20 @@
+# Ignis 调度守护进程的 systemd 用户单元示例。
+#
+# 安装与使用见同目录 README.md；单元里 `%h` 是 systemd 展开的用户家目录。
+[Unit]
+Description=Ignis scheduler daemon
+After=network-online.target
+
+[Service]
+Type=simple
+# --foreground：不脱离终端，日志走 journald；SIGTERM 后优雅退出（等在飞运行收尾）
+ExecStart=%h/.local/bin/ignis daemon start --foreground
+Environment=IGNIS_HOME=%h/.ignis
+Restart=on-failure
+# 模型端点与密钥也可以在这里用环境变量给出（不要把密钥写进仓库）：
+# Environment=IGNIS_BASE_URL=https://your-endpoint/v1
+# Environment=IGNIS_MODEL=your-model
+# Environment=IGNIS_API_KEY=...
+
+[Install]
+WantedBy=default.target

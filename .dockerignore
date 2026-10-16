@@ -1,0 +1,6 @@
+target/
+.git/
+.superpowers/
+.commandcode/
+.agents/
+skills-lock.json
