@@ -29,8 +29,8 @@ const ERR_TASK_TIMEOUT: &str = "task_timeout";
 /// token 预算耗尽（`Limits::token_budget`，按累计 in+out 计）。
 const ERR_TOKEN_BUDGET: &str = "token_budget";
 /// 墙钟上限的兜底：`Instant + Duration` 溢出会 panic，而 panic 会吞掉唯一的 `Done`；
-/// 超过一年的超时按一年算——对一次任务而言与「不限时」等价。
-const MAX_TASK_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+/// 超过一年的超时按一年算——对一次任务而言与「不限时」等价。外置内核适配器复用同一兜底。
+pub(crate) const MAX_TASK_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 /// native 内核：注入 OpenAI 兼容客户端，按统一 `Runtime` 协议跑执行循环。
 ///

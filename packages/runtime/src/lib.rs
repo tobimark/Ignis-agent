@@ -3,6 +3,8 @@
 //! [`RuntimeEvent`] 的 serde 形状即任务日志（JSONL）的格式，属于跨模块契约，不得随意改动。
 //! [`openai`] 是 native 内核用的 OpenAI 兼容模型客户端，其形状同样属于跨模块契约。
 //! [`native`] 是 native 内核的执行循环，其事件序列与上限语义同样是跨模块契约。
+//! [`codex`] 是 codex CLI 兼容内核，其事件映射逐条对照探测记录
+//! （`docs/spikes/2026-10-15-external-kernels-probe.md`）。
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -11,6 +13,7 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+pub mod codex;
 pub mod native;
 pub mod openai;
 

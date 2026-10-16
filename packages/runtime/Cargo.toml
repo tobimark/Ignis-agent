@@ -7,6 +7,10 @@ rust-version.workspace = true
 [features]
 test-support = []
 
+[dev-dependencies]
+# 集成测试（tests/fake_cli.rs）要构造 RunRequest，借用自家的 `test-support` 替身执行器
+ignis-runtime = { path = ".", features = ["test-support"] }
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -14,6 +18,8 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
+# 外置内核取消/超时按进程组 SIGKILL（与 core 的 shell 工具同一套做法）
+libc = { workspace = true }
 # OpenAI 兼容流式客户端（SSE 读流用 `stream` feature）
 reqwest = { workspace = true }
 thiserror = { workspace = true }
