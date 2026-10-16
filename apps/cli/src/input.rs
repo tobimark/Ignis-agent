@@ -76,4 +76,33 @@ mod tests {
             vec!["ok\n", "\u{FFFD}\u{FFFD} bad\n", "y\n"]
         );
     }
+
+    /// 「可继续的坏字节」与「真正的读取错误」是两回事：后者仍要上抛（标志位只承担前者）。
+    #[test]
+    fn io_errors_still_propagate() {
+        struct Failing;
+        impl std::io::Read for Failing {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("boom"))
+            }
+        }
+        let mut reader = std::io::BufReader::new(Failing);
+        assert!(read_line_lossy(&mut reader).is_err());
+    }
+
+    /// EOF 前的最后一行没有换行符也必须作为一行交出（如 `printf '\200'` 的形态）。
+    #[test]
+    fn final_line_without_newline_counts_as_a_line() {
+        let mut valid_tail = Cursor::new(b"tail".to_vec());
+        assert_eq!(
+            read_line_lossy(&mut valid_tail).unwrap().unwrap(),
+            ("tail".to_string(), true)
+        );
+
+        let mut invalid_tail = Cursor::new(b"\x80".to_vec());
+        assert_eq!(
+            read_line_lossy(&mut invalid_tail).unwrap().unwrap(),
+            ("\u{FFFD}".to_string(), false)
+        );
+    }
 }
