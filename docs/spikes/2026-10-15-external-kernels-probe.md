@@ -217,3 +217,152 @@ MM_KEY=<键> codex exec --json -C "$(mktemp -d)" --sandbox workspace-write --ski
 
 若 `turn.completed` / `turn.failed` 的形状与本节不符，改 `packages/runtime/src/codex.rs` 的映射、本文件、
 再改夹具脚本——三处一起动（并给新形状补一条用例）。
+
+---
+
+# claude 实测记录（T2，2026-10-16 本机）
+
+T2 的 `packages/runtime/src/claude.rs` 按本节映射实现；上面 codex 小节的所有结论不变。
+**键只经环境变量传入，不落盘、不入命令行、不进日志**；下面记的是开关取值与事件形状，不记键。
+
+## 结论摘要
+
+| 项 | 结论 |
+|---|---|
+| CLI 版本 | `2.1.274 (Claude Code)`（经 `~/.bun/bin/claude` 软链到 `@anthropic-ai/claude-code-linux-x64`） |
+| `-p` / `--print` | 存在（非交互；`-p` 下跳过工作区信任对话框） |
+| `--output-format` | 存在，取值 `text` \| `json` \| `stream-json`；**`-p` + `stream-json` 必须同时给 `--verbose`**——实测不带 `--verbose` 直接报错退出：`Error: When using --print, --output-format=stream-json requires --verbose` |
+| `--permission-mode` | 存在，取值 `acceptEdits` \| `auto` \| `bypassPermissions` \| `manual` \| `dontAsk` \| `plan`；**T2 采用 `manual`**（见下「权限档位」） |
+| `--model` | 存在；`ClaudeRuntime` 只在 `model` 为 `Some` 时追加 `--model <值>` |
+| 认证 | `ANTHROPIC_API_KEY` 被采纳（真机 `system/init` 回报 `apiKeySource:"ANTHROPIC_API_KEY"`）；`ANTHROPIC_BASE_URL` 指向 Anthropic 兼容端点即可（本轮用 `https://api.minimax.cn/anthropic`）。二进制里也有 `ANTHROPIC_AUTH_TOKEN`，本轮未用 |
+| 本机配置陷阱 | 用户级 claude 配置会**覆盖进程环境里的 base_url**：不隔离时请求根本没到指定端点（表现为其它上游的 429 `Go usage limit exceeded` / 400 `Upstream request failed: Model is unavailable`）。复测必须 `CLAUDE_CONFIG_DIR=<空目录>` 隔离（见下「本机配置隔离」） |
+| 端到端真机跑通 | **已完成**：适配器本身在真 claude 上跑出 `ToolExec` + `TextDelta` + `Done{Success}`（7.4s）；另在「端点不可达」轮跑出 `Done{LimitReached, task_timeout}`（20.0s，整组被杀、零残留进程） |
+| 事件 schema 来源 | ① `claude --help` 的开关取值；② 三条真实轨迹（成功文本轮、工具轮、API 失败轮）的逐行 JSONL；③ 本地 mock 端点抓下的请求形状（确认 CLI 打的是 `POST /v1/messages?beta=true`） |
+| 对适配器的影响 | 映射按真机形状实现：`assistant.message.content[]` 的 `text` → `TextDelta`、`tool_use` → `ToolExec`（只观察）；`result.is_error` 判成败；`system` / `user` 行一律跳过。`result.usage` 真机**稳定存在**（每轮都有），但 T2 仍不出 `Usage` 事件（`Capabilities{usage:false}`），只作跟进项（见「仍未取得的验证」） |
+
+## 实测命令（脱敏）
+
+```sh
+claude --version            # 2.1.274 (Claude Code)
+claude --help               # --output-format / --permission-mode / --model 取值见上表
+MM_KEY=<键> CLAUDE_CONFIG_DIR=<空目录> ANTHROPIC_BASE_URL=<Anthropic 兼容端点> \
+  ANTHROPIC_API_KEY="$MM_KEY" \
+  claude -p --verbose --output-format stream-json --permission-mode manual --model MiniMax-M2 "说一句 ok"
+```
+
+## 真实轨迹 1：成功文本轮（退出码 0）
+
+```jsonl
+{"type":"system","subtype":"init","model":"MiniMax-M2","permissionMode":"default","apiKeySource":"ANTHROPIC_API_KEY","claude_code_version":"2.1.274","cwd":"…","session_id":"<uuid>","tools":[…],"slash_commands":[…],"skills":[…],"mcp_servers":[],"…":"（其余字段略）"}
+{"type":"system","subtype":"thinking_tokens","estimated_tokens":2,"estimated_tokens_delta":2,"session_id":"<uuid>","uuid":"<uuid>"}
+{"type":"assistant","message":{"id":"…","type":"message","role":"assistant","model":"MiniMax-M2","content":[{"type":"thinking","thinking":"…","signature":"…"}],"usage":{…}},"parent_tool_use_id":null,"session_id":"<uuid>","uuid":"<uuid>"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"OK"}],"…":"（usage/session_id/uuid 等略）"}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":1,"permission_denials":[],"result":"OK","terminal_reason":"completed","duration_ms":…,"total_cost_usd":…,"usage":{…},"modelUsage":{…},"session_id":"<uuid>"}
+```
+
+要点：**一行一个 JSON 对象、顶层有 `type`**；`system`/`thinking_tokens` 每轮很多条（纯噪音）；
+`assistant` 的正文在 `message.content[]`（Anthropic Messages 形状的**内容块数组**，
+`thinking` / `text` / `tool_use`）；`result` 是终局行，带 `usage` / `modelUsage` / `total_cost_usd`。
+
+## 真实轨迹 2：工具轮（退出码 0；prompt 要求 `ls -la` 并总结）
+
+```jsonl
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"先看看目录"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"call_function_t04wskutg6ro_1","name":"Bash","input":{"command":"ls -la","description":"List files in current directory"}}]}}
+{"type":"user","message":{"role":"user","content":[{"tool_use_id":"call_function_t04wskutg6ro_1","type":"tool_result","content":"total 4\n…\n-rw-rw-r-- 1 tobi tobi 6 … a.txt","is_error":false}]},"tool_use_result":{"stdout":"total 4\n…"},"parent_tool_use_id":null,"session_id":"<uuid>"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"这是一个空目录，只包含一个名为 `a.txt` 的小文件（6字节）。"}]}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":2,"permission_denials":[],"result":"这是一个空目录，只包含一个名为 `a.txt` 的小文件（6字节）。","terminal_reason":"completed"}
+```
+
+要点：`tool_use` 块的字段逐字为 `type` / `id` / `name` / `input`（`Bash` 的 `input.command` 就是那行
+命令）；**工具结果走 `type:"user"` 行**（`tool_result` 块，另有 `tool_use_result` 明细），
+所以「工具执行结果」在 claude 侧根本不经过 Ignis 的执行器。
+
+## 真实轨迹 3：API 失败轮（退出码 1）
+
+```jsonl
+{"type":"system","subtype":"init","model":"glm-5.3-flash","permissionMode":"default","apiKeySource":"ANTHROPIC_API_KEY","claude_code_version":"2.1.274","…":"（略）"}
+{"type":"assistant","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"API Error: Request rejected (429) · Go usage limit exceeded"}]},"error":"rate_limit","is_api_error_message":true,"session_id":"<uuid>"}
+{"type":"result","subtype":"success","is_error":true,"num_turns":1,"api_error_status":429,"terminal_reason":"api_error","result":"API Error: Request rejected (429) · Go usage limit exceeded","…":"（usage/modelUsage 等略）"}
+```
+
+（这一轮是本机未隔离配置时打歪到别的上游得到的——错误文案是那条上游的原话，形状本身是真实
+schema；另一轮 400 的同形状轨迹文案是 `API Error: 400 Upstream request failed: Model is unavailable.`，
+已逐字收进夹具的 `REAL_FAIL`。）要点：**失败以 `result.is_error == true` 表达，`result` 文本就是原因**；
+`subtype` 仍是 `"success"`，**不能拿 subtype 判成败**。
+
+## 权限档位
+
+- 取值（`--help` 逐字）：`acceptEdits`、`auto`、`bypassPermissions`、`manual`、`dontAsk`、`plan`。
+- **T2 采用 `--permission-mode manual`**：真机 `system/init` 把它回报成 `permissionMode:"default"`——
+  即 CLI 自己的默认档，正是任务书钉的「只读/默认」档。`bypassPermissions`（绕过全部权限检查）与
+  `acceptEdits`（自动接受编辑）会自行放宽权限，适配器不取；`plan` 实测也能读（`ls -la` 跑通、
+  不触发审批），但它把轮次锁在「只规划」的立场上，不适合作为要产出交付物的内核基线。
+- 附带确认：`-p` 非交互下没有审批通道（适配器声明 `approvals:false`），实测 `Bash` 在 `manual` 档
+  直接执行；若要更严的基线，`--restricted`（去掉跑代码的工具、把文件工具锁进工作目录）与
+  `--permission-prompts none`（无人应答即自动拒绝）是后续候选，本轮不改命令行。
+
+## 本机配置隔离（复测必读）
+
+本机的用户级 claude 配置会覆盖进程环境里的 `ANTHROPIC_BASE_URL` / 凭据，**不隔离时隔离层之外的
+请求根本到不了指定端点**：`--debug` 也看不到，返回的是别条上游的错误（429 `Go usage limit exceeded`、
+400 `Upstream request failed: Model is unavailable`）；把 base_url 指到本地 mock 端口时，mock **一个
+请求都没收到**。加 `CLAUDE_CONFIG_DIR=<空临时目录>` 后立刻正常：mock 收到了
+`POST /v1/messages?beta=true`（带一长串 `anthropic-beta: claude-code-20250219,…` 测试标记、
+`x-api-key`、`user-agent: claude-cli/2.1.274 (external, sdk-cli)`），真端点也正常回 200。
+
+（另一条无关噪音：stderr 上的 `[claude-code:unrecognized_model] {"model":"…","query_source":"sdk"}`，
+是 CLI 自己不认识自定义模型名的提示，不影响运行；适配器按「stderr 只取首行」展示。）
+
+## 真机轨迹 ↔ 适配器映射对照
+
+| 真机行 | 适配器处置 | 对得上？ |
+|---|---|---|
+| `system` / `init`、`system` / `thinking_tokens`（每轮很多条） | 未知顶层语义 → 静默跳过 | ✓ |
+| `assistant` + `content[].type == "thinking"` | 不映射的内容块 → 跳过 | ✓ |
+| `assistant` + `content[].type == "text"` | `TextDelta`（块里的 `text`） | ✓ |
+| `assistant` + `content[].type == "tool_use"` | `ToolExec`（name = 块类型名 `tool_use`、summary = 工具名 + 一行参数提示、args = 原始块） | ✓ |
+| `user` + `content[].type == "tool_result"`（工具结果回流） | 未知顶层类型 → 跳过（不回流到执行器） | ✓ |
+| `result`（`is_error:false`） | `Done{Success, summary = result 文本}`；`usage` 不出事件（`usage:false`） | ✓ |
+| `result`（`is_error:true`） | `Done{Failed, 「claude 报告失败：<首行原因>」}` | ✓ |
+| 非 JSON 行 / 未知类型 / 未知内容块 | 跳过 | ✓ |
+
+三条真实轨迹里没有适配器会漏掉的行；夹具脚本 `packages/runtime/tests/fixtures/fake-claude.sh` 的
+主形态（文本轮、工具轮、`result.is_error` 轮、流结束无终局）与真机逐字一致，另补了 `is_error`
+字段缺失、终局后挂起、非零退出、取消/超时挂起等异常形态。
+
+## 适配器端到端真机跑
+
+同一端点、同一套命令（键只经环境变量，`CLAUDE_CONFIG_DIR=<空目录>` 隔离），
+`ClaudeRuntime::new(<临时工作区>, Some("MiniMax-M2"))` 跑 prompt「运行 ls -la …」：
+
+```
+EVENT ToolExec { name: "tool_use", summary: "Bash ls -la", args: {…"name":"Bash","input":{"command":"ls -la",…}} }
+EVENT TextDelta { text: "当前目录是空的（只有系统目录 `.` 和 `..`），仅包含一个 6 字节的文本文件 `a.txt`。" }
+EVENT Done { status: Success, summary: Some("当前目录是空的…"), error: None }
+```
+
+7.4s 跑完、零残留进程——`-p --verbose --output-format stream-json --permission-mode manual` 这套真实命令行可用。
+
+另跑一条真机「端点不可达」轮（`ANTHROPIC_BASE_URL=http://127.0.0.1:9/anthropic`、`task_timeout=20`）：
+
+```
+EVENT Done { status: LimitReached, summary: None, error: Some("task_timeout") }
+```
+
+20.05s 收束、零残留 `claude` 进程。这条顺带补上了上面 codex 小节「仍未取得的验证」第 3 条的真机
+对照：**不可达端点前 CLI 只重连、永不进终局**，必须靠 `task_timeout` + 杀整组兜底，杀完进程组干净。
+
+复跑方式：`MM_KEY=<键> CLAUDE_CONFIG_DIR=<空目录> ANTHROPIC_BASE_URL=<端点> cargo test -p ignis-runtime
+--test <一次性 scratch 用例> -- --nocapture`（scratch 跑完即删、不入库——**不入库任何要联网的自动化测试**）。
+
+## 仍未取得的验证（claude 侧）
+
+1. `plan` 之外的档位（`auto` / `dontAsk` / `acceptEdits` / `bypassPermissions`）只按 `--help` 语义判断，
+   没有逐档真机实测——适配器只取默认档，不受影响。
+2. `result.usage` / `modelUsage` / `total_cost_usd` 真机**每轮都在**，但适配器仍不出 `Usage` 事件
+   （`Capabilities{usage:false}`）；要记账需同时改能力声明与映射，留给后续任务。
+3. 真机的**取消**路径（进程组 SIGKILL，非超时）没跑：超时路径已跑通，两者共用同一段
+   `terminate` 代码，取消只多一个 `CancellationToken` 触发点。
+4. 真机 `stderr` 噪音只做了「首行展示」，没有分类；`system/thinking_tokens` 这类噪音行只做跳过，
+   没有量化它对事件通道的占用（每轮十几条，容量 64 足够）。
