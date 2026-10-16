@@ -10,14 +10,8 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use ignis_runtime::RunStatus;
 
+use crate::commands::kernel::KERNELS;
 use crate::{commands, repl};
-
-/// 三个执行内核：`--kernel` 的值域、`/kernel` 的校验与 [`commands::mk_runtime`] 共用一份口径。
-pub const KERNELS: [&str; 3] = ["native", "codex", "claude"];
-
-/// 主路径内核：`--kernel` 与配置 `default_kernel` 都没给时回落的默认值（完整工具与审批，
-/// 见设计文档 §6.3）。
-pub const NATIVE_KERNEL: &str = KERNELS[0];
 
 /// `ignis`：本地个人 AI Agent。
 #[derive(Debug, Parser)]
@@ -77,7 +71,7 @@ pub enum Command {
         #[command(subcommand)]
         command: SkillsCommand,
     },
-    /// 环境自检（home/config/api_key/base_url/workspace/db）
+    /// 环境自检（home/config/api_key/base_url/workspace/db + codex/claude 探测）
     Doctor,
     /// 调度守护进程（start / stop / status）
     Daemon {
@@ -237,8 +231,8 @@ pub struct AlertsCommand {
 
 /// 解析参数后分发：错误一律经 `anyhow::Result` 上抛给 `main`。
 ///
-/// `--kernel` 的值域由 clap 把关、配置里的 `default_kernel` 由 [`commands::resolve_kernel`] 补齐
-/// 并同样过白名单，两侧共用一份 [`KERNELS`]；内核可用性由 [`commands::Session::new`] 校验。
+/// `--kernel` 的值域由 clap 把关、配置里的 `default_kernel` 由 [`commands::kernel::resolve_kernel`]
+/// 补齐并同样过白名单，两侧共用一份 [`KERNELS`]；内核可用性由 [`commands::Session::new`] 校验。
 pub async fn dispatch(cli: &Cli) -> Result<ExitCode> {
     match &cli.command {
         Some(Command::Run { task }) => commands::run::run(cli, task).await,
@@ -246,7 +240,7 @@ pub async fn dispatch(cli: &Cli) -> Result<ExitCode> {
         Some(Command::Config { command }) => commands::config::run(command),
         Some(Command::Memory { command }) => commands::memory::run(cli, command),
         Some(Command::Skills { command }) => commands::skills::run(command),
-        Some(Command::Doctor) => commands::doctor::run(),
+        Some(Command::Doctor) => commands::doctor::run(cli),
         Some(Command::Daemon { command }) => commands::daemon::run(command).await,
         Some(Command::Schedule { command }) => commands::schedule::run(command),
         Some(Command::Alerts(command)) => commands::alerts::run(command),
@@ -287,15 +281,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn kernel_whitelist_is_the_three_kernels() {
-        // 值域与 `/kernel` 共用一份口径：三个名字逐字钉住，native 是默认值
-        assert_eq!(KERNELS, ["native", "codex", "claude"]);
-        assert_eq!(NATIVE_KERNEL, KERNELS[0]);
-    }
-
     /// `--kernel` 是**可选项**：不给就得是 `None`（由配置 `default_kernel` 兜底，spec §6.1 的
-    /// 「默认取配置」），给了才取值；非法取值仍在解析期被拒绝（值域与 `/kernel` 共用 KERNELS）。
+    /// 「默认取配置」），给了才取值；非法取值仍在解析期被拒绝（值域与 `/kernel` 共用 KERNELS，
+    /// 见 `commands::kernel` 里逐字钉住的那份用例）。
     #[test]
     fn kernel_flag_is_optional_and_validated_by_the_parser() {
         let omitted =

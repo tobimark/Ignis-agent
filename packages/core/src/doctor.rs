@@ -1,6 +1,8 @@
-//! 环境自检：`ignis doctor` 的六项检查。
+//! 环境自检：`ignis doctor` 的六项检查（外部内核探测由 CLI 追加在它们之后）。
 //!
 //! 检查项与顺序就是 CLI 的输出契约：home → config → api_key → base_url → workspace → db。
+//! 每项有 [`CheckLevel`]：只有 `Fail` 让 `ignis doctor` 以非零退出码收场，`Warn` 只逐行提示
+//! （「缺外部内核 CLI」「选了外部内核时缺 Ignis 密钥」都不该拦住整套自检）。
 //! 除 `base_url` 的 TCP 连接外都是本地读取，因此整个模块保持同步；会按需创建数据目录与
 //! 数据库文件，这与 `Db::open` 的既有行为一致。
 
@@ -17,13 +19,24 @@ use crate::config::{Config, ConfigError, config_path};
 /// `base_url` 检查的 TCP 连接超时。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 单项自检的级别：决定报告行首的记号与 `ignis doctor` 的退出码。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckLevel {
+    /// 通过（报告行 `✓`）。
+    Ok,
+    /// 警告：只提示、不影响退出码（报告行 `!`）。
+    Warn,
+    /// 失败：需要处理，`ignis doctor` 以退出码 1 收场（报告行 `✗`）。
+    Fail,
+}
+
 /// 单项自检的结论。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckResult {
-    /// 检查项名，固定六项之一。
+    /// 检查项名（六项基本检查；外部内核项与 `kernel` 由 CLI 追加）。
     pub name: &'static str,
-    /// 是否通过。
-    pub ok: bool,
+    /// 级别：`Warn` 不改变退出码。
+    pub level: CheckLevel,
     /// 人话结论；失败时给出可操作的原因。
     pub detail: String,
 }
@@ -33,11 +46,18 @@ pub struct CheckResult {
 /// `loaded` 是调用方加载的**生效**配置（含环境变量覆盖）：配置解析失败本身也是一个结论，
 /// 所以这里收 `Result` 而不是 `&Config`——解析失败时相关检查如实报 ✗，而不是让 doctor
 /// 直接以 `error:` 退出。
-pub fn run_checks(home: &Path, loaded: &Result<Config, ConfigError>) -> Vec<CheckResult> {
+///
+/// `ignis_key_required` 是生效内核的凭据需求：只有 native 需要 Ignis 的模型凭据，两个外部内核
+/// 用各自 CLI 的凭据——缺 key 时前者 `Fail`、后者只 `Warn`（`--kernel codex` 照跑）。
+pub fn run_checks(
+    home: &Path,
+    loaded: &Result<Config, ConfigError>,
+    ignis_key_required: bool,
+) -> Vec<CheckResult> {
     vec![
         check_home(home),
         check_config(home, loaded),
-        check_api_key(loaded),
+        check_api_key(loaded, ignis_key_required),
         check_base_url(loaded),
         check_workspace(loaded),
         check_db(home),
@@ -70,8 +90,11 @@ fn check_config(home: &Path, loaded: &Result<Config, ConfigError>) -> CheckResul
     }
 }
 
-/// `api_key`：配置里的值或模型环境变量至少有一个非空（只看有没有，不看值）。
-fn check_api_key(loaded: &Result<Config, ConfigError>) -> CheckResult {
+/// `api_key`：Ignis 自己的密钥只有 native 内核需要（外部内核用各自 CLI 的凭据）。
+///
+/// `ignis_key_required` 为真（选中 native）时缺它是 `Fail`：第一次请求就会 401；为假时降级为
+/// `Warn`——只配了外部内核的用户不该被这一条挡在门外。
+fn check_api_key(loaded: &Result<Config, ConfigError>, ignis_key_required: bool) -> CheckResult {
     const NAME: &str = "api_key";
     let Ok(config) = loaded else {
         return unavailable(NAME);
@@ -88,10 +111,17 @@ fn check_api_key(loaded: &Result<Config, ConfigError>) -> CheckResult {
     if std::env::var(env).is_ok_and(|key| !key.trim().is_empty()) {
         return ok(NAME, format!("环境变量 {env} 已配置"));
     }
-    fail(
-        NAME,
-        format!("未配置 API key（设置 {env} 或 config.json 的 api_key）"),
-    )
+    if ignis_key_required {
+        fail(
+            NAME,
+            format!("未配置 API key（native 内核需要；设置 {env} 或 config.json 的 api_key）"),
+        )
+    } else {
+        warn(
+            NAME,
+            "未配置 API key（仅 native 内核需要；当前外部内核用自身 CLI 的凭据）".to_string(),
+        )
+    }
 }
 
 /// `base_url`：能 TCP 连上 `model.base_url` 的主机与端口。
@@ -137,7 +167,15 @@ fn check_db(home: &Path) -> CheckResult {
 fn ok(name: &'static str, detail: String) -> CheckResult {
     CheckResult {
         name,
-        ok: true,
+        level: CheckLevel::Ok,
+        detail,
+    }
+}
+
+fn warn(name: &'static str, detail: String) -> CheckResult {
+    CheckResult {
+        name,
+        level: CheckLevel::Warn,
         detail,
     }
 }
@@ -145,7 +183,7 @@ fn ok(name: &'static str, detail: String) -> CheckResult {
 fn fail(name: &'static str, detail: String) -> CheckResult {
     CheckResult {
         name,
-        ok: false,
+        level: CheckLevel::Fail,
         detail,
     }
 }
@@ -256,6 +294,14 @@ mod tests {
         results.iter().map(|result| result.name).collect()
     }
 
+    /// 单项检查结论（六项的位置按 `run_checks` 的顺序钉住，这里按名字取用）。
+    fn check<'a>(results: &'a [CheckResult], name: &str) -> &'a CheckResult {
+        results
+            .iter()
+            .find(|result| result.name == name)
+            .unwrap_or_else(|| panic!("缺少 {name} 检查：{results:?}"))
+    }
+
     #[test]
     fn doctor_reports_unreachable_base_url() {
         let home = TempDir::new("unreachable");
@@ -268,17 +314,18 @@ mod tests {
             ..Config::default()
         };
 
-        let results = run_checks(home.path(), &Ok(config));
+        let results = run_checks(home.path(), &Ok(config), true);
 
         assert_eq!(
             names(&results),
             ["home", "config", "api_key", "base_url", "workspace", "db"]
         );
-        let check = results
-            .iter()
-            .find(|result| result.name == "base_url")
-            .expect("base_url 检查");
-        assert!(!check.ok, "127.0.0.1:1 不该被判为可达：{check:?}");
+        let check = check(&results, "base_url");
+        assert_eq!(
+            check.level,
+            CheckLevel::Fail,
+            "127.0.0.1:1 不该被判为可达：{check:?}"
+        );
         assert!(
             check.detail.contains("127.0.0.1:1"),
             "失败详情要带上出问题的地址：{}",
@@ -307,18 +354,68 @@ mod tests {
             ..Config::default()
         };
 
-        let results = run_checks(&home, &Ok(config));
+        let results = run_checks(&home, &Ok(config), true);
 
         assert_eq!(
             names(&results),
             ["home", "config", "api_key", "base_url", "workspace", "db"]
         );
         for result in &results {
-            assert!(result.ok, "{} 检查失败：{}", result.name, result.detail);
+            assert_eq!(
+                result.level,
+                CheckLevel::Ok,
+                "{} 检查未通过：{}",
+                result.name,
+                result.detail
+            );
         }
         // 检查本身把缺失的数据目录与数据库建了起来
         assert!(home.is_dir(), "{}", home.display());
         assert!(home.join("ignis.db").is_file(), "{}", home.display());
         drop(listener);
+    }
+
+    /// 缺 Ignis 密钥只对 native 是硬门槛：选中 native 时 `Fail`；选中外部内核（用各自 CLI 的
+    /// 凭据）时降级为 `Warn`——只点了 codex/claude 的用户不该被这一条挡在门外。
+    #[test]
+    fn missing_key_fails_for_native_and_only_warns_for_external_kernels() {
+        let home = TempDir::new("api-key");
+        let workspace = home.path().join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        // 环境变量名取一个不存在的（不走默认的 `OPENAI_API_KEY`），断言与运行者环境无关
+        let config = Config {
+            workspace_root: workspace,
+            model: ModelConfig {
+                base_url: "127.0.0.1:1".into(),
+                api_key_env: "IGNIS_T4_ABSENT_KEY".into(),
+                ..ModelConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let results = run_checks(home.path(), &Ok(config.clone()), true);
+        let key = check(&results, "api_key");
+        assert_eq!(key.level, CheckLevel::Fail, "{key:?}");
+        assert!(key.detail.contains("未配置 API key"), "{key:?}");
+        assert!(key.detail.contains("native 内核需要"), "{key:?}");
+        assert!(key.detail.contains("IGNIS_T4_ABSENT_KEY"), "{key:?}");
+
+        // 外部内核：同一条缺密钥结论降级为警告（退出码不受影响），措辞说明这只与 native 有关
+        let results = run_checks(home.path(), &Ok(config.clone()), false);
+        let key = check(&results, "api_key");
+        assert_eq!(key.level, CheckLevel::Warn, "{key:?}");
+        assert!(key.detail.contains("仅 native 内核需要"), "{key:?}");
+
+        // 有密钥时与内核无关：两种口径都是 ✓
+        let with_key = Config {
+            api_key: Some("test-key".into()),
+            ..config
+        };
+        for ignis_key_required in [true, false] {
+            let results = run_checks(home.path(), &Ok(with_key.clone()), ignis_key_required);
+            let key = check(&results, "api_key");
+            assert_eq!(key.level, CheckLevel::Ok, "{key:?}");
+            assert!(key.detail.contains("api_key 已配置"), "{key:?}");
+        }
     }
 }

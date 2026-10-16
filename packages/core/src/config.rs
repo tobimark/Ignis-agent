@@ -29,7 +29,7 @@ const ENV_API_KEY: &str = "IGNIS_API_KEY";
 pub struct Config {
     /// 工具操作的项目根目录。
     pub workspace_root: PathBuf,
-    /// 默认执行内核，v0.1 只有 `native`。
+    /// 默认执行内核（`native` / `codex` / `claude`）：`--kernel` 未给时生效，非法名报错。
     pub default_kernel: String,
     /// 模型接入：协议、baseUrl、模型名与密钥来源环境变量。
     pub model: ModelConfig,
