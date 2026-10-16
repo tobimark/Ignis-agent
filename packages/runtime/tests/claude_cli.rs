@@ -15,6 +15,7 @@ use ignis_runtime::test_support::MockExecutor;
 use ignis_runtime::{
     ChatMessage, Limits, ModelConfig, Role, RunRequest, RunStatus, Runtime, RuntimeEvent,
 };
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 /// 夹具脚本的绝对路径（`CARGO_MANIFEST_DIR` = `packages/runtime`）。
@@ -54,6 +55,26 @@ impl Drop for TempWorkspace {
     }
 }
 
+/// `STDERR_ORPHAN` 的释放开关：夹具留下的后代进程一直攥着 stderr 写端，直到工作区里出现这个
+/// 文件（另有 60s 自愈上限）。Drop 兜底删除（用例失败 panic 也会释放），免得后代拖住测试。
+struct StderrHolder {
+    release: PathBuf,
+}
+
+impl StderrHolder {
+    fn new(workspace: &Path) -> Self {
+        Self {
+            release: workspace.join(".fake-claude-stderr-release"),
+        }
+    }
+}
+
+impl Drop for StderrHolder {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.release, b"release");
+    }
+}
+
 /// 夹具脚本记下的命令行：开关逐行放在 `.fake-claude-argv`（最后一个是 prompt 的位置参数），
 /// prompt 原样放在 `.fake-claude-prompt`（它自带换行，不能按行读）。
 fn invocation(workspace: &Path) -> (Vec<String>, String) {
@@ -71,6 +92,26 @@ fn pgrep(pattern: &str) -> String {
         .output()
         .expect("pgrep 应可用");
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// 夹具脚本留下的休眠哨兵（数字由工作区路径派生，见 `fake-claude.sh`）：逐个断言没有残留进程。
+///
+/// 哨兵每次运行都不同，所以上一次被 SIGKILL 的运行留下的孤儿不会误伤本次断言（评审 Minor #5）；
+/// 重试窗口是给刚被 SIGKILL / 刚被释放的后代留一点退出与回收的时间。
+async fn assert_no_sleepers(workspace: &Path) {
+    let tag = std::fs::read_to_string(workspace.join(".fake-claude-sleepers"))
+        .expect("夹具脚本应写下休眠哨兵");
+    for sentinel in tag.lines() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pgrep(sentinel).is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "休眠哨兵 {sentinel} 还有残留进程：{}",
+                pgrep(sentinel)
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 }
 
 fn request(system_prompt: &str, content: &str, timeout_secs: u64) -> RunRequest {
@@ -398,8 +439,7 @@ async fn result_is_error_without_reason_reports_a_generic_failure() {
         elapsed < Duration::from_secs(5),
         "失败终局一到手就该收束，不该等满超时，实际 {elapsed:?}"
     );
-    assert_eq!(pgrep("12421"), "", "后台任务逃出了进程组");
-    assert_eq!(pgrep("12422"), "", "前台任务未被终止");
+    assert_no_sleepers(&workspace.path()).await;
 }
 
 /// 终局事件即刻收束读循环：CLI 打完 `result` 后不退出（后台/前台 sleep 挂住），
@@ -435,8 +475,54 @@ async fn result_short_circuits_a_cli_that_does_not_exit() {
         elapsed < Duration::from_secs(5),
         "终局一到手就该收束，不该等满超时，实际 {elapsed:?}"
     );
-    assert_eq!(pgrep("12411"), "", "后台任务逃出了进程组");
-    assert_eq!(pgrep("12412"), "", "前台任务未被终止");
+    assert_no_sleepers(&workspace.path()).await;
+}
+
+/// 后代进程攥住继承的 stderr 写端（评审 #1）：CLI 正常退出、`result` 已到手，stderr 却等不到
+/// EOF——收尾必须有上限，本轮必须以 `Success` 收束，而不是把调用方无限期地挂住。
+/// 夹具用 `setsid` 把后代送出进程组，所以只有有界的 stderr 收尾能救它（进程组 SIGKILL 追不到）。
+#[tokio::test]
+async fn bounded_stderr_reap_finishes_a_run_whose_descendant_holds_stderr() {
+    let workspace = TempWorkspace::new("stderr-orphan");
+    let holder = StderrHolder::new(&workspace.path());
+    let runtime = ClaudeRuntime::with_command(fake_claude(), workspace.path(), None);
+
+    let started = Instant::now();
+    let events = timeout(
+        Duration::from_secs(6),
+        collect(
+            &runtime,
+            request("sys", "STDERR_ORPHAN", 60),
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("stderr 收尾无上限时事件流永远不会结束（评审 #1）：6s 内必须收全");
+    let elapsed = started.elapsed();
+
+    // 恰好一条 `Done`、是最后一条，且结论是 `Success`：终局已经产出，不该被后代拖成失败或超时
+    assert_eq!(
+        events,
+        vec![
+            RuntimeEvent::TextDelta {
+                text: "完成了但 stderr 写端还开着".into()
+            },
+            RuntimeEvent::Done {
+                status: RunStatus::Success,
+                summary: Some("完成了但 stderr 写端还开着".into()),
+                error: None,
+            },
+        ]
+    );
+    assert_eq!(terminal(&events), &events[1]);
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "有界收尾必须在上限内收束，实际 {elapsed:?}"
+    );
+
+    // 释放后代（不释放的话它会攥着 stderr 到 60s 自愈上限），随后断言没有残留进程
+    drop(holder);
+    assert_no_sleepers(&workspace.path()).await;
 }
 
 /// 真机失败轨迹（逐字回放 2026-10-16 的探测：assistant 文本 = API 错误 + `result.is_error:true` +
@@ -521,8 +607,7 @@ async fn cancel_kills_the_process_group_and_reports_aborted() {
         elapsed < Duration::from_secs(5),
         "取消应立即返回，实际 {elapsed:?}"
     );
-    assert_eq!(pgrep("12391"), "", "后台任务逃出了进程组");
-    assert_eq!(pgrep("12392"), "", "前台任务未被终止");
+    assert_no_sleepers(&workspace.path()).await;
 }
 
 /// 墙钟超时：与 native 同款标记（`task_timeout`），同样杀整组。
@@ -557,6 +642,5 @@ async fn task_timeout_kills_the_process_group_and_reports_limit_reached() {
         elapsed < Duration::from_secs(5),
         "1 秒超时应很快返回，实际 {elapsed:?}"
     );
-    assert_eq!(pgrep("12401"), "", "后台任务逃出了进程组");
-    assert_eq!(pgrep("12402"), "", "前台任务未被终止");
+    assert_no_sleepers(&workspace.path()).await;
 }

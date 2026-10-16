@@ -12,40 +12,33 @@
 //! 所有异常路径都收束成恰好一条 [`RuntimeEvent::Done`]：非零退出 / 流结束而未见成功终局 →
 //! `Failed` + 人话；取消 → `Aborted`；墙钟到点 → `LimitReached` + `task_timeout`（与 native
 //! 同一枚标记字符串）。`turn.completed` / `turn.failed` 一到手就停止读流——之后只给进程 2s
-//! （`TERMINAL_REAP_GRACE`）的退出收尾时间，免得「已完成却不退出」被拖成超时、真实失败原因被丢掉。
-//! 未知行静默跳过，容忍 CLI 的 schema 漂移。
+//! （[`cli_process::TERMINAL_REAP_GRACE`]）的退出收尾时间，免得「已完成却不退出」被拖成超时、
+//! 真实失败原因被丢掉。未知行静默跳过，容忍 CLI 的 schema 漂移。
+//!
+//! 与 claude 逐字相同的进程/事件基础设施在 [`cli_process`] 里（含 stderr 收尾的上限，评审 #1）。
 
 use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use futures::stream;
 use tokio::io::{AsyncBufReadExt as _, BufReader};
-use tokio::process::{Child, ChildStderr, Command};
-use tokio::sync::mpsc::{Sender, channel};
+use tokio::process::Command;
+use tokio::sync::mpsc::Sender;
 use tokio::time::{sleep_until, timeout};
 use tokio_util::sync::CancellationToken;
 
+use crate::cli_process::{
+    REAP_GRACE, TERMINAL_REAP_GRACE, done, emit, event_stream, exit_text, kill_process_group,
+    role_label, spawn_stderr_drain, take_stderr_head, terminate,
+};
 use crate::native::{ERR_TASK_TIMEOUT, MAX_TASK_TIMEOUT};
 use crate::{
-    BoxStream, Capabilities, ChatMessage, Limits, Role, RunRequest, RunStatus, Runtime,
-    RuntimeEvent,
+    BoxStream, Capabilities, ChatMessage, Limits, RunRequest, RunStatus, Runtime, RuntimeEvent,
 };
 
-/// 事件通道容量（与 native 一致）：消费者慢只会让循环在发送处等待，不会无界缓冲。
-const EVENT_CHANNEL: usize = 64;
 /// 沙箱档位（任务书钉死）：`--help` 的可选值只有 `read-only` / `workspace-write` /
 /// `danger-full-access`，这里取「能干活、又不出工作区」的那档，适配器不自行放宽。
 const SANDBOX_MODE: &str = "workspace-write";
-/// stderr 首行的展示上限（字符）：够定位问题，又不至于把整段日志塞进 `Done.error`。
-const STDERR_HEAD_CHARS: usize = 200;
-/// 收尸上限：进程组已被 SIGKILL，但管道写端可能还攥在逃逸的孙进程手里（同 `shell_run` 的
-/// 教训：无上限地等会把事件流拖住）。
-const REAP_GRACE: Duration = Duration::from_secs(5);
-/// 拿到终局事件之后的收尸上限：终局已经把答案给了，进程只剩退出收尾；给一段短限度的等待就
-/// 按已得的终局判定——等满 [`REAP_GRACE`]（更别说 `task_timeout`）会把「已完成却不退出」的
-/// CLI 拖成超时，并丢掉真实的 `turn.failed` 原因。
-const TERMINAL_REAP_GRACE: Duration = Duration::from_secs(2);
 /// `command_execution` 条目映射成 `ToolExec` 时的名字（探测记录里的条目类型名）。
 const COMMAND_ITEM: &str = "command_execution";
 
@@ -97,15 +90,14 @@ impl Runtime for CodexRuntime {
         req: RunRequest,
         cancel: CancellationToken,
     ) -> BoxStream<'static, RuntimeEvent> {
-        let (tx, rx) = channel(EVENT_CHANNEL);
         let program = self.program.clone();
         let workspace = self.workspace.clone();
         let model = self.model.clone();
         let prompt = render_prompt(&req.system_prompt, &req.messages);
         let limits = req.limits;
-        tokio::spawn(async move {
-            // 终局事件只发一次：`drive` 返回的 `Some` 一定是 `Done`，`None` 表示接收端已断开
-            if let Some(event) = drive(
+        // 事件管道是共享的：终局事件只发一次（驱动返回的 `Some` 一定是 `Done`）
+        event_stream(move |tx| async move {
+            drive(
                 &program,
                 &workspace,
                 model.as_deref(),
@@ -115,13 +107,7 @@ impl Runtime for CodexRuntime {
                 &tx,
             )
             .await
-            {
-                let _ = tx.send(event).await;
-            }
-        });
-        Box::pin(stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|event| (event, rx))
-        }))
+        })
     }
 }
 
@@ -191,7 +177,7 @@ async fn drive(
         ));
     };
     // stderr 必须有人一直读：CLI 会往这里写重连/告警日志，管道写满会把子进程卡死
-    let stderr_task = tokio::spawn(drain_stderr(stderr));
+    let stderr_task = spawn_stderr_drain(stderr);
 
     // 墙钟上限：与 native 同样的溢出兜底（`Instant + Duration` 溢出会 panic）
     let deadline =
@@ -280,7 +266,8 @@ async fn drive(
         // 没能在收尾上限内退出：兜底杀整组（`kill_on_drop` 只管直接子进程）
         kill_process_group(pid);
     }
-    let stderr_head = stderr_task.await.ok().flatten();
+    // stderr 收尾带上限（评审 #1）：后代还攥着继承来的写端时，无界地等会把已完成的一轮挂死
+    let stderr_head = take_stderr_head(stderr_task).await;
 
     match (turn_end, status) {
         // 终局失败事件：CLI 自己给了原因，优先用它；连原因都没给（schema 漂移）也照样是失败，
@@ -297,7 +284,7 @@ async fn drive(
         (Some(TurnEnd::Completed), Some(status)) if !status.success() => Some(done(
             RunStatus::Failed,
             None,
-            Some(exit_text(&status, stderr_head.as_deref())),
+            Some(exit_text("codex", &status, stderr_head.as_deref())),
         )),
         // 见过 `turn.completed` 即成功；收尸没跟上（`status` 为 `None`）也不改变这个结论
         (Some(TurnEnd::Completed), _) => Some(done(RunStatus::Success, last_text, None)),
@@ -312,7 +299,7 @@ async fn drive(
         (None, Some(status)) => Some(done(
             RunStatus::Failed,
             None,
-            Some(exit_text(&status, stderr_head.as_deref())),
+            Some(exit_text("codex", &status, stderr_head.as_deref())),
         )),
         (None, None) => Some(done(
             RunStatus::Failed,
@@ -402,92 +389,10 @@ fn render_prompt(system_prompt: &str, messages: &[ChatMessage]) -> String {
     format!("{system_prompt}\n\n{rendered}")
 }
 
-/// 角色名：与 [`Role`] 的 serde 名逐字一致，外置内核读得懂。
-fn role_label(role: Role) -> &'static str {
-    match role {
-        Role::System => "system",
-        Role::User => "user",
-        Role::Assistant => "assistant",
-        Role::Tool => "tool",
-    }
-}
-
-/// 唯一的终局事件：所有退出路径都经这里取 `Done`，由 [`Runtime::run`] 的任务发一次。
-fn done(status: RunStatus, summary: Option<String>, error: Option<String>) -> RuntimeEvent {
-    RuntimeEvent::Done {
-        status,
-        summary,
-        error,
-    }
-}
-
-/// 失败人话：退出码（被信号终止时没有退出码）+ stderr 首行（有则带上）。
-fn exit_text(status: &ExitStatus, stderr_head: Option<&str>) -> String {
-    let code = match status.code() {
-        Some(code) => format!("退出码 {code}"),
-        None => "被信号终止".to_string(),
-    };
-    match stderr_head {
-        Some(head) => format!("codex {code}：{head}"),
-        None => format!("codex {code}"),
-    }
-}
-
-/// 读完 stderr 并留首行（截断）：一直读到 EOF，避免写端因管道满而卡死。
-async fn drain_stderr(stderr: ChildStderr) -> Option<String> {
-    let mut lines = BufReader::new(stderr).lines();
-    let mut head = None;
-    while let Ok(Some(line)) = lines.next_line().await {
-        let line = line.trim();
-        if head.is_none() && !line.is_empty() {
-            head = Some(truncate(line, STDERR_HEAD_CHARS));
-        }
-    }
-    head
-}
-
-/// 按字符截断，附省略号（`char_indices` 保证切点落在字符边界上）。
-fn truncate(text: &str, limit: usize) -> String {
-    match text.char_indices().nth(limit) {
-        Some((end, _)) => format!("{}…", &text[..end]),
-        None => text.to_string(),
-    }
-}
-
-/// 终止整组并收尸：直接子进程被 SIGKILL 后立刻可收，上限只为防异常情况下无限地等。
-///
-/// 收尸（`wait`）别省：只杀不等会留下僵尸进程，等 tokio 的孤儿回收队列兜底不及时。
-async fn terminate(child: &mut Child, pid: u32) {
-    kill_process_group(pid);
-    let _ = timeout(REAP_GRACE, child.wait()).await;
-}
-
-/// 对子进程所在进程组发 SIGKILL（负 pid 即「该组全部进程」）；进程已退出时失败无副作用。
-fn kill_process_group(pid: u32) {
-    #[cfg(unix)]
-    // SAFETY: pid 取自本进程刚 spawn 的子进程，`kill` 只发信号、不触碰内存，
-    // 目标不存在或已退出时也只是返回错误码。
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
-    }
-    #[cfg(not(unix))]
-    let _ = pid; // 非 Unix 没有进程组语义，仅由 `kill_on_drop(true)` 兜底
-}
-
-/// 发一个事件；`false` 表示接收端已断开（循环随即收摊）。
-///
-/// 发送后让出一次执行权，事件消费者（以及按下取消的人）才有机会插进来。
-async fn emit(tx: &Sender<RuntimeEvent>, event: RuntimeEvent) -> bool {
-    if tx.send(event).await.is_err() {
-        return false;
-    }
-    tokio::task::yield_now().await;
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Role;
 
     /// 逐行映射：探测记录里的已知行各归其位，未知/不映射的行一律 `None`。
     #[test]
@@ -577,12 +482,5 @@ mod tests {
             render_prompt("你是 Ignis", &messages),
             "你是 Ignis\n\nuser: 说一句 ok\n\ntool: a.txt"
         );
-    }
-
-    /// stderr 首行按字符截断（多字节安全），短行不加工。
-    #[test]
-    fn truncates_stderr_head_on_char_boundaries() {
-        assert_eq!(truncate("短", 200), "短");
-        assert_eq!(truncate("中文一行", 2), "中文…");
     }
 }

@@ -10,6 +10,8 @@
 #                   缺失原因也走「失败」而不是「没见到终局」或超时）
 #   RESULT_NOFLAG   result 不带 is_error 字段（schema 漂移；按失败的安全默认识别）
 #   COMPLETE_HANG   result 成功之后挂起（证明完成的轮次不被拖成超时）
+#   STDERR_ORPHAN   result 成功之后正常退出，但留下一个攥着继承的 stderr 写端的后代进程
+#                   （用 setsid 逃出进程组；证明 stderr 收尾必须有上限，见评审 #1）
 #   STREAM_END      只吐前导事件就正常退出（流结束而未见终局）
 #   FAIL            非零退出 + 两行 stderr（没有 result 终局）
 #   REAL_FAIL       真机失败轨迹逐字回放（assistant 文本 = API 错误 + result.is_error + 退出码 1）
@@ -19,12 +21,28 @@
 #
 # 另外把收到的命令行写进工作区：开关逐行落在 .fake-claude-argv（最后一个是 prompt，
 # 单独原样写进 .fake-claude-prompt，因为它自带换行），测试据此钉住 spawn 的参数与渲染。
+# 挂起分支把休眠哨兵号写进 .fake-claude-sleepers，测试据此断言没有残留进程。
 set -eu
 
 prompt=""
 for arg in "$@"; do
   prompt="$arg"
 done
+
+# 休眠哨兵：由工作区路径派生（每个用例一个新建的临时工作区，故每次运行都是新数字）——
+# 固定数字会被上一次被 SIGKILL 的运行留下的孤儿进程误伤（评审 Minor #5）。
+sentinel=$(printf '%s' "$PWD" | cksum)
+sentinel=${sentinel%% *}
+# 下限抬到 10 位：极小值（0/1）会让「挂起」变成一闪而过，测试就失去意义
+sentinel=$((sentinel % 1000000000 + 1000000000))
+
+# 挂起：后台 + 前台各一个哨兵进程（取消/超时用例只能靠进程组收尸）。哨兵号先写进 tag 文件，
+# 测试据此断言这两个进程都已不在（用派生的数字，孤儿的残留不会误伤新一次运行）。
+hang() {
+  printf '%s\n' "$sentinel" "$((sentinel + 1))" > .fake-claude-sleepers
+  sleep "$sentinel" &
+  sleep "$((sentinel + 1))"
+}
 
 count=$#
 index=0
@@ -49,8 +67,7 @@ case "$prompt" in
 *RESULT_BARE*)
   emit "$init_line"
   emit '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1}'
-  sleep 12421 &
-  sleep 12422
+  hang
   ;;
 *RESULT_NOFLAG*)
   emit "$init_line"
@@ -66,8 +83,22 @@ case "$prompt" in
   emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"用户只是想聊一句"}]}}'
   emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"完成了但进程不退出"}]}}'
   emit '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"完成了但进程不退出"}'
-  sleep 12411 &
-  sleep 12412
+  hang
+  ;;
+# 后代进程攥住继承来的 stderr 写端：真机形态是 `Bash` 工具留下的后台进程、继承 fd 的
+# MCP/helper 子进程。父进程正常退出（不触发进程组 SIGKILL），后代又用 setsid 逃出了本进程组
+# ——只有有界的 stderr 收尾能救这一轮。后代活到工作区里出现 .fake-claude-stderr-release 为止
+# （另有 60s 自愈上限），它的命令行里带着本次运行的哨兵号（`sh -c … <哨兵>`）。
+*STDERR_ORPHAN*)
+  emit "$init_line"
+  emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"完成了但 stderr 写端还开着"}]}}'
+  emit '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"完成了但 stderr 写端还开着"}'
+  printf '%s\n' "$sentinel" > .fake-claude-sleepers
+  setsid sh -c 'i=0
+    while [ ! -e .fake-claude-stderr-release ] && [ "$i" -lt 60 ]; do
+      sleep 1
+      i=$((i + 1))
+    done' "$sentinel" &
   ;;
 *STREAM_END*)
   emit "$init_line"
@@ -107,14 +138,12 @@ case "$prompt" in
 *CANCEL_HANG*)
   emit "$init_line"
   emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"挂起前"}]}}'
-  sleep 12391 &
-  sleep 12392
+  hang
   ;;
 *TIMEOUT_HANG*)
   emit "$init_line"
   emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"挂起前"}]}}'
-  sleep 12401 &
-  sleep 12402
+  hang
   ;;
 *)
   emit "$init_line"
