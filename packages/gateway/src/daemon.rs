@@ -11,7 +11,8 @@
 //! 才算成功——pidfile 里原有的活 pid 可能是复用来的无关进程，拿它报「已启动」是谎报。超时路径
 //! 会把子进程杀干净（`kill` + `wait`）再报错，绝不留下无人管理的守护进程。
 //!
-//! 停止是幂等的：`stop` 对 SIGTERM 之后的进程最多等 5 秒，仍不退出就升级 SIGKILL；本来就没在
+//! 停止是幂等的：`stop` 对 SIGTERM 之后的进程最多等 [`STOP_TIMEOUT`]（12s，在调度循环 10s 的优雅
+//! 收尾之上），仍不退出就升级 SIGKILL；本来就没在
 //! 跑（锁空闲）时直接回 [`StopOutcome::NotRunning`]，不会对可能复用了同一 pid 的无关进程发信号；
 //! 收尾只清「仍写着刚停掉那个 pid」的 pidfile，并发 `daemon start` 换上的新 pidfile 不动。
 //!
@@ -55,8 +56,13 @@ const START_TIMEOUT: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// pidfile 出现后再给子进程的稳定窗口：装配期（配置/密钥/库）立刻失败时不要报「已启动」。
 const SETTLE: Duration = Duration::from_millis(100);
-/// `stop` 等 SIGTERM 生效的上限（brief 钉死 5s），超时升级 SIGKILL。
-const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// `stop` 等 SIGTERM 生效的上限，超时升级 SIGKILL。
+///
+/// 必须**大于**调度循环的 `SHUTDOWN_GRACE`（10s，见 [`crate::r#loop`]）：优雅退出的含义是「等在飞
+/// 运行收尾」，`daemon stop` 若比它先到点，就会把「正在正常收尾的守护进程」SIGKILL 掉——在飞运行
+/// 的任务行与运行行被留在 `running`（要靠下一次启动的清场收），长跑的运行白跑。12s 留了 2s 余量
+/// （收尾轮询、进程退出与 pidfile 清理的时间）。这两个数是一对：改一个必须看另一个。
+const STOP_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// `start` 的结果：成功只有一种——守护进程已经带着 pid 就绪。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,7 +217,8 @@ pub fn start(home: &Path) -> Result<StartOutcome> {
     }
 }
 
-/// 停止守护进程：SIGTERM → 最多等 5 秒 → 仍不退就 SIGKILL，最后清掉 pidfile。
+/// 停止守护进程：SIGTERM → 最多等 [`STOP_TIMEOUT`]（12s，在调度循环的 10s 优雅收尾之上）→ 仍不
+/// 退就 SIGKILL，最后清掉 pidfile。
 ///
 /// 「在跑」以 pidfile 的锁为准（pid 可能被复用，锁空闲时绝不对无关进程发信号）；本来就没在跑时
 /// 直接回 [`StopOutcome::NotRunning`]，调用方按幂等成功处理。锁被持有但 pid 读不出来时回

@@ -11,9 +11,8 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use ignis_core::config::{ensure_home, ignis_home};
-use ignis_storage::{AlertRecord, Db};
+use ignis_storage::{AlertRecord, Db, now_millis};
 
-use super::now_millis;
 use super::task::{format_time, one_line};
 use crate::cli::AlertsCommand;
 

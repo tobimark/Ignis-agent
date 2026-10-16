@@ -15,7 +15,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use anyhow::{Result, bail};
 use ignis_core::alerts::MultiNotifier;
@@ -42,6 +42,8 @@ pub struct Session {
     home: PathBuf,
     /// 本次任务的工作区（`--workspace`，否则配置里的 `workspace_root`）。
     workspace: PathBuf,
+    /// 与运行器/记忆层同一份库：banner 的未读告警计数从这里取，不重新开库。
+    db: Arc<Db>,
     runner: TaskRunner,
     /// 与运行器同一份记忆存储与技能目录（`Arc` 克隆）：banner 计数从这里取，
     /// 不重新开库、也不重新扫描技能目录。
@@ -49,21 +51,6 @@ pub struct Session {
     skills: Arc<SkillCatalog>,
     /// 本会话是否已经做过自拉起提示（每会话至多一次，REPL 跨轮次共享）。
     already_prompted: AtomicBool,
-}
-
-/// 当前 epoch 毫秒（`alerts --read` 的翻牌时刻）。
-///
-/// 时钟早于 epoch（人工设置过系统时间）时退化成 0：翻牌仍要落库，不该因为时钟怪值失败。
-pub(crate) fn now_millis() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(elapsed) => i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
-        Err(_) => 0,
-    }
-}
-
-/// 当前 epoch 秒（`schedule list` 现算 next due 用，与守护进程同一单位）。
-pub(crate) fn now_secs() -> i64 {
-    now_millis().div_euclid(1_000)
 }
 
 /// 工作区解析与校验：`--workspace` 优先，否则配置里的 `workspace_root`；解析出的路径必须是已存在
@@ -152,6 +139,7 @@ impl Session {
         Ok(Self {
             home,
             workspace,
+            db,
             runner,
             memory,
             skills,
@@ -178,6 +166,20 @@ impl Session {
             }
         };
         (skills, memory)
+    }
+
+    /// banner 的未读告警计数（spec §6.1：启动时若有未读告警，顶部横幅提示）。
+    ///
+    /// 读不出来时打一行警告并回 `None`（banner 跳过那一行）：告警收件箱读不动不该拦住 REPL，
+    /// 与记忆计数同一套 fail-soft 口径。
+    pub fn unread_alerts(&self) -> Option<usize> {
+        match self.db.unread_alert_count() {
+            Ok(count) => Some(count),
+            Err(error) => {
+                eprintln!("warning: 读取未读告警计数失败：{error}");
+                None
+            }
+        }
     }
 
     /// 跑一次任务：渲染任务消费 sink 边跑边输出，Ctrl-C 监听任务负责中止本次运行。

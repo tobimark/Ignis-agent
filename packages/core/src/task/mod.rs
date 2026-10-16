@@ -11,14 +11,13 @@ pub mod prompts;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use ignis_runtime::{
     ApprovalHandler, ChatMessage, Role, RunRequest, RunStatus, Runtime, RuntimeEvent, ToolExecutor,
     Usage,
 };
-use ignis_storage::{Db, NewTask, StorageError, TaskLog};
+use ignis_storage::{Db, NewTask, StorageError, TaskLog, now_millis};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
@@ -48,16 +47,6 @@ fn kind_str(kind: TaskKind) -> &'static str {
         TaskKind::Run => "run",
         TaskKind::Repl => "repl",
         TaskKind::Schedule => "schedule",
-    }
-}
-
-/// `tasks.status` 与 JSONL `done.status` 的取值：跨模块契约字符串，逐个显式映射。
-fn status_str(status: RunStatus) -> &'static str {
-    match status {
-        RunStatus::Success => "success",
-        RunStatus::Failed => "failed",
-        RunStatus::Aborted => "aborted",
-        RunStatus::LimitReached => "limit_reached",
     }
 }
 
@@ -258,11 +247,10 @@ impl TaskRunner {
             Arc::clone(&self.db),
             Arc::clone(&self.notifier),
         ));
-        // 调度任务创建：可用工具名清单与守护进程共用一份口径，默认工作区取配置里的根
+        // 调度任务创建：可用工具名清单与守护进程共用一份口径（工作区取本次任务的工作区）
         let scheduler = SchedulerDeps {
             db: Arc::clone(&self.db),
             available_tools: available_tool_names(),
-            default_workspace: self.config.workspace_root.clone(),
         };
         for tool in meta_tools(
             Arc::clone(&self.memory),
@@ -284,13 +272,15 @@ impl TaskRunner {
             // 来源 job id 由守护进程的调度循环经 `TaskRequest` 透传；交互运行没有 job
             req.job_id.clone(),
         ));
-        // 调度运行（`Some(profile)`）：job 的 profile 白名单是执行边界，包在真实执行器外面——
-        // `executor.specs()`（工具表与 system prompt）已经过滤，白名单外的调用在本轮到达内层之前
-        // 就被拒并留痕；`None`（`ignis run` / REPL）原样交给内核，行为与扩展前一致。
+        // 调度运行（`Some(profile)`）：job 的 profile 白名单与风险上限是执行边界，包在真实执行器
+        // 外面——`executor.specs()`（工具表与 system prompt）已经过滤，白名单外的调用、以及
+        // `risk=safe` 时超出上限的调用，都在本轮到达内层之前就被拒并留痕；`None`（`ignis run` /
+        // REPL）原样交给内核，行为与扩展前一致。
         let executor: Arc<dyn ToolExecutor> = match &self.profile {
             Some(profile) => Arc::new(ProfileExecutor::new(
                 tool_runtime,
                 profile.tools.iter().cloned().collect(),
+                profile.risk,
                 Arc::clone(&self.db),
                 task_id.to_string(),
             )),
@@ -364,7 +354,7 @@ impl TaskRunner {
         let error = error.map(|text| self.redactor.redact(&text));
         self.db.finish_task(
             task_id,
-            status_str(status),
+            status.as_str(),
             summary.as_deref(),
             error.as_deref(),
             usage.input_tokens,
@@ -380,7 +370,7 @@ impl TaskRunner {
             json!({
                 "type": "task_end",
                 "task_id": task_id,
-                "status": status_str(status),
+                "status": status.as_str(),
                 "summary": summary,
                 "error": error,
             }),
@@ -410,7 +400,7 @@ impl TaskRunner {
         let message = self.redactor.redact(&error.to_string());
         let _ = self.db.finish_task(
             task_id,
-            status_str(RunStatus::Failed),
+            RunStatus::Failed.as_str(),
             None,
             Some(&message),
             usage.input_tokens,
@@ -424,7 +414,7 @@ impl TaskRunner {
             json!({
                 "type": "task_end",
                 "task_id": task_id,
-                "status": status_str(RunStatus::Failed),
+                "status": RunStatus::Failed.as_str(),
                 "summary": Value::Null,
                 "error": message,
             }),
@@ -462,14 +452,6 @@ fn chat_message(role: Role, content: impl Into<String>) -> ChatMessage {
 /// JSONL 行的 `ts`：RFC 3339（`ignis task show` 靠它渲染时间）。
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
-}
-
-/// epoch 毫秒；时钟早于 epoch（人工设置过系统时间）时退化成 0，保证任务行仍能写入。
-fn now_millis() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(elapsed) => i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
-        Err(_) => 0,
-    }
 }
 
 #[cfg(test)]

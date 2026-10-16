@@ -16,9 +16,8 @@
 mod notifier;
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use ignis_storage::{AlertRecord, Db, NewAlert, StorageError};
+use ignis_storage::{AlertRecord, Db, NewAlert, StorageError, now_millis};
 
 pub use notifier::{MultiNotifier, Notifier, NotifyError};
 
@@ -126,14 +125,6 @@ impl AlertSink {
             eprintln!("warning: 告警投递失败：{error}");
         }
         Ok(RaiseOutcome::Sent(record))
-    }
-}
-
-/// epoch 毫秒；时钟早于 epoch（人工设置过系统时间）时退化成 0，保证告警仍能落库。
-fn now_millis() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(elapsed) => i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
-        Err(_) => 0,
     }
 }
 

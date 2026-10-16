@@ -18,7 +18,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use ignis_core::alerts::{AlertSink, Notifier};
@@ -33,7 +33,7 @@ use ignis_core::task::{TaskKind, TaskRequest, TaskRunner};
 use ignis_runtime::{
     ApprovalDecision, ApprovalHandler, ApprovalRequest, Limits, RunStatus, Runtime,
 };
-use ignis_storage::{Db, JobRecord, NewJobRun};
+use ignis_storage::{Db, JobRecord, NewJobRun, now_millis, now_secs};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -41,7 +41,10 @@ use tokio_util::sync::CancellationToken;
 use crate::Result;
 
 /// 没有任何 job 到期时也最多睡这么久就重新扫一遍：pause/resume/新建最迟在一个扫描周期内生效。
-const RESCAN_SECS: i64 = 30;
+///
+/// `pub` 是刻意的：端到端用例（Demo C）要按这个窗口对齐「暂停/恢复在哪一轮被观察到」的时刻，
+/// 写死一个 30s 的副本会在窗口调整时静默过期。
+pub const RESCAN_SECS: i64 = 30;
 /// 收到取消后等在飞运行收尾的上限（brief 钉死 10s）；超时的直接 abort。
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 /// 收尾轮询步长。
@@ -91,8 +94,14 @@ impl SchedulerLoop {
     /// （`min(最近到期, now + `[`RESCAN_SECS`]`)`）→ 睡到那时 → 执行到期的 job（该 job 已有运行
     /// 在飞时只记一行 `overlap skipped`）。取消后不再接受新运行，等在飞运行收尾（≤10s）再返回。
     pub async fn run(&self, cancel: CancellationToken) -> Result<()> {
-        let swept = self.db.sweep_stale_job_runs(now_millis())?;
-        println!("scheduler: startup sweep collected {swept} stale run(s)");
+        // 启动清场：上一个守护进程被 SIGKILL / 崩溃时留下的行收成终态（`failed` / `interrupted`），
+        // 免得重启后 `job_runs` 与 `tasks` 里挂着永远 `running` 的行、或把错过的时点当成待跑。
+        // pidfile 上的独占锁保证同一 home 只有一个守护进程，这里收掉的每一行都属于自己。
+        let now = now_millis();
+        let swept_runs = self.db.sweep_stale_job_runs(now)?;
+        println!("scheduler: startup sweep collected {swept_runs} stale run(s)");
+        let swept_tasks = self.db.sweep_stale_scheduled_tasks(now)?;
+        println!("scheduler: startup sweep collected {swept_tasks} stale task(s)");
 
         let running = RunningJobs::default();
         // 在飞的调度运行：收尾时按这个清单等（句柄随结束自然收走）
@@ -279,7 +288,8 @@ async fn execute_run(
             if let Err(error) = deps.db.update_job_run_task_id(&run_id, &outcome.id) {
                 eprintln!("warning: 回填运行行的 task_id 失败（{run_id}）：{error}");
             }
-            let status = status_str(outcome.status);
+            // `job_runs.status` 与 `tasks.status` 是同一张表：契约字符串只在 `RunStatus` 一处映射
+            let status = outcome.status.as_str();
             if let Err(error) = deps.db.finish_job_run(
                 &run_id,
                 status,
@@ -351,16 +361,6 @@ async fn raise_failure(deps: &RunDeps, job: &JobRecord, body: Option<&str>, task
         .await
     {
         eprintln!("warning: 失败告警未落库（{}）：{error}", job.id);
-    }
-}
-
-/// `job_runs.status` 的契约字符串（与 `ignis_core::task` 里那份私有映射同一张表）。
-fn status_str(status: RunStatus) -> &'static str {
-    match status {
-        RunStatus::Success => "success",
-        RunStatus::Failed => "failed",
-        RunStatus::Aborted => "aborted",
-        RunStatus::LimitReached => "limit_reached",
     }
 }
 
@@ -463,22 +463,6 @@ impl ApprovalHandler for PolicyOnlyApproval {
     }
 }
 
-/// 当前 epoch 秒；时钟早于 epoch（人工设置过系统时间）时退化成 0，保证循环仍能推进。
-fn now_secs() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(elapsed) => i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX),
-        Err(_) => 0,
-    }
-}
-
-/// 当前 epoch 毫秒（`jobs.last_run_at` / `job_runs` 的时间列）。
-fn now_millis() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(elapsed) => i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
-        Err(_) => 0,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -491,7 +475,7 @@ mod tests {
     use ignis_core::tools::available_tool_names;
     use ignis_runtime::test_support::MockRuntime;
     use ignis_runtime::{BoxStream, Capabilities, RunRequest, RuntimeEvent};
-    use ignis_storage::{AlertRecord, JobRunRecord, NewJob, NewJobRun};
+    use ignis_storage::{AlertRecord, JobRunRecord, NewJob, NewJobRun, NewTask};
 
     use super::*;
 
@@ -991,6 +975,54 @@ mod tests {
         let row = stale(&env);
         assert_eq!(row.error.as_deref(), Some("interrupted"));
         assert!(row.ended_at.is_some());
+
+        stop_loop(cancel, running).await;
+    }
+
+    /// 启动清场也要收 `tasks`：被 SIGKILL 打断的调度运行只有 `job_runs` 被收的话，任务行会永远
+    /// 挂在 `running`（`task list` 里一条永远跑不完的调度任务）。`run` / `repl` 的活行不归它管。
+    #[tokio::test]
+    async fn startup_sweeps_stale_scheduled_task_rows() {
+        let env = Env::new("sweep-tasks", vec![success_event("ok")]);
+        // 遗留在飞调度任务（kind=schedule、status=running）：上一个守护进程被打断时的现场
+        env.db
+            .insert_task(&NewTask {
+                id: "stale-schedule".into(),
+                kind: "schedule".into(),
+                prompt: "检查磁盘".into(),
+                kernel: "native".into(),
+                workspace: env.home.path().display().to_string(),
+                started_at: 1,
+            })
+            .unwrap();
+        // 交互运行的活行（kind=run）：清场不该碰它
+        env.db
+            .insert_task(&NewTask {
+                id: "interactive".into(),
+                kind: "run".into(),
+                prompt: "读一下配置".into(),
+                kernel: "native".into(),
+                workspace: env.home.path().display().to_string(),
+                started_at: 2,
+            })
+            .unwrap();
+
+        let cancel = CancellationToken::new();
+        let running = spawn_loop(env.scheduler(), cancel.clone());
+
+        wait_for(Duration::from_secs(3), "调度任务行被清场", || {
+            env.db
+                .get_task("stale-schedule")
+                .unwrap()
+                .is_some_and(|task| task.status == "failed")
+        })
+        .await;
+        let swept = env.db.get_task("stale-schedule").unwrap().unwrap();
+        assert_eq!(swept.error.as_deref(), Some("interrupted"));
+        assert!(swept.ended_at.is_some());
+        let untouched = env.db.get_task("interactive").unwrap().unwrap();
+        assert_eq!(untouched.status, "running");
+        assert_eq!(untouched.ended_at, None);
 
         stop_loop(cancel, running).await;
     }

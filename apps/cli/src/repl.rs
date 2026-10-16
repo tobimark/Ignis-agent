@@ -60,12 +60,23 @@ impl LineReader for StdinReader {
     }
 }
 
-/// REPL banner：固定 4 行（版本号是 P1 的固定文案，不跟 `CARGO_PKG_VERSION` 联动）。
+/// REPL banner：固定 4 行（版本号是 P1 的固定文案，不跟 `CARGO_PKG_VERSION` 联动），有未读告警时
+/// 追加第 5 行。
 ///
 /// 第 4 行是运行时就绪度：技能目录条数 + active 事实数；一条事实都没有（`memory == 0`，
 /// 也含计数读失败时调用方退回的 0）打 `Memory: off`。
-pub fn banner_lines(workspace: &Path, kernel: &str, skills: usize, memory: usize) -> [String; 4] {
-    [
+///
+/// 第 5 行只在有未读告警时出现（spec §6.1：启动时若有未读告警，顶部横幅提示）：`unread` 为
+/// `Some(n)` 且 `n > 0` 时给 `⚠ {n} unread alerts — run \`ignis alerts\``；`None`（计数读失败，
+/// 调用方已打警告）与 `Some(0)` 都保持 4 行。
+pub fn banner_lines(
+    workspace: &Path,
+    kernel: &str,
+    skills: usize,
+    memory: usize,
+    unread_alerts: Option<usize>,
+) -> Vec<String> {
+    let mut lines = vec![
         "IGNIS v0.1".to_string(),
         "● Ready".to_string(),
         format!("Workspace: {}", workspace.display()),
@@ -73,7 +84,11 @@ pub fn banner_lines(workspace: &Path, kernel: &str, skills: usize, memory: usize
             "Runtime: {kernel} · Skills: {skills} · {}",
             memory_segment(memory)
         ),
-    ]
+    ];
+    if let Some(count) = unread_alerts.filter(|count| *count > 0) {
+        lines.push(format!("⚠ {count} unread alerts — run `ignis alerts`"));
+    }
+    lines
 }
 
 /// banner 的记忆段：有 active 事实给 `Memory: {n} facts`，没有给 `Memory: off`。
@@ -103,8 +118,10 @@ pub async fn run(cli: &Cli) -> Result<ExitCode> {
 
     let session = Session::new(cli)?;
     // 计数来自会话里那份存储/技能目录（与运行器同一份），读库失败只退回 `Memory: off`
+    // 与「不打未读行」（各自已打一行警告）
     let (skills, memory) = session.banner_counts();
-    for line in banner_lines(session.workspace(), &cli.kernel, skills, memory) {
+    let unread = session.unread_alerts();
+    for line in banner_lines(session.workspace(), &cli.kernel, skills, memory, unread) {
         println!("{line}");
     }
 
@@ -172,7 +189,7 @@ mod tests {
 
     #[test]
     fn banner_is_the_four_locked_lines() {
-        let lines = banner_lines(Path::new("/tmp/ws"), "native", 3, 2);
+        let lines = banner_lines(Path::new("/tmp/ws"), "native", 3, 2, None);
 
         assert_eq!(
             lines,
@@ -189,10 +206,31 @@ mod tests {
 
     #[test]
     fn banner_marks_memory_off_when_there_are_no_facts() {
-        let lines = banner_lines(Path::new("/tmp/ws"), "native", 5, 0);
+        let lines = banner_lines(Path::new("/tmp/ws"), "native", 5, 0, None);
 
         assert_eq!(lines[3], "Runtime: native · Skills: 5 · Memory: off");
         assert!(!lines[3].contains("0 facts"), "{lines:?}");
+    }
+
+    /// 未读告警：有就追加第 5 行（点名条数与下一步命令），没有（0 或计数读失败）保持 4 行。
+    #[test]
+    fn banner_appends_an_unread_alerts_line_only_when_there_are_some() {
+        let lines = banner_lines(Path::new("/tmp/ws"), "native", 3, 2, Some(4));
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        assert_eq!(lines[4], "⚠ 4 unread alerts — run `ignis alerts`");
+        // 前四行不受影响
+        assert_eq!(lines[3], "Runtime: native · Skills: 3 · Memory: 2 facts");
+
+        let quiet = banner_lines(Path::new("/tmp/ws"), "native", 3, 2, Some(0));
+        assert_eq!(quiet.len(), 4, "{quiet:?}");
+        assert!(
+            !quiet.iter().any(|line| line.contains("unread")),
+            "{quiet:?}"
+        );
+
+        // 计数读失败（`None`，调用方已打警告）：跳过那一行，banner 形状不变
+        let failed = banner_lines(Path::new("/tmp/ws"), "native", 3, 2, None);
+        assert_eq!(failed, quiet, "读失败与「没有未读」对用户是同一屏");
     }
 
     #[test]

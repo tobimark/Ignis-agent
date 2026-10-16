@@ -1,8 +1,9 @@
 //! `ignis daemon start|stop|status`（外加隐藏的 `daemon run --foreground`）与任务结束后的自拉起提示。
 //!
 //! 进程生命周期本身在 `ignis-gateway` 里（自守护 re-exec、pidfile + `flock` 单实例锁、SIGTERM
-//! 优雅退出），这一层只做文案与退出码。`start`/`stop` 都是阻塞调用（等 pidfile 就绪 / 等进程
-//! 退出），交给 `tokio::task::spawn_blocking` 跑，不占着 async 线程。
+//! 优雅退出），这一层只做文案与退出码。`start` 默认自守护：阻塞调用（等 pidfile 就绪），交给
+//! `tokio::task::spawn_blocking` 跑，不占着 async 线程；`start --foreground` 与 `run --foreground`
+//! 是同一个前台入口（systemd 的 `ExecStart` 写的是前者），直接阻塞到 SIGTERM/SIGINT。
 //!
 //! 自拉起：`ignis run` / REPL 跑完一轮后，若本轮出现过 `schedule_create` 而守护进程没在跑，
 //! 交互模式问一次「现在启动吗」，非交互模式只打一行提示；每会话至多一次。
@@ -29,7 +30,10 @@ const START_HINT: &str =
 pub async fn run(command: &DaemonCommand) -> Result<ExitCode> {
     let home = ignis_home();
     match command {
-        DaemonCommand::Start => match start_daemon(&home).await? {
+        // 前台运行：与 `run --foreground` 同一个实现（spec §6.9 的 ExecStart 走这条），
+        // 不退出直到收到 SIGTERM/SIGINT
+        DaemonCommand::Start { foreground: true } => daemon::run_foreground(&home).await?,
+        DaemonCommand::Start { foreground: false } => match start_daemon(&home).await? {
             StartOutcome::Started { pid } => println!("daemon started (pid {pid})"),
         },
         DaemonCommand::Stop => match stop_daemon(&home).await? {
@@ -76,7 +80,8 @@ async fn start_daemon(home: &Path) -> Result<StartOutcome> {
     Ok(outcome?)
 }
 
-/// `daemon::stop` 同样阻塞：SIGTERM 之后最多等 5s，必要时升级 SIGKILL。
+/// `daemon::stop` 同样阻塞：SIGTERM 之后最多等 12s（在调度循环 10s 的优雅收尾之上），必要时升级
+/// SIGKILL。
 async fn stop_daemon(home: &Path) -> Result<StopOutcome> {
     let home = home.to_path_buf();
     let outcome = tokio::task::spawn_blocking(move || daemon::stop(&home))

@@ -7,7 +7,9 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ignis_storage::{AlertRecord, Db, JobRecord, JobRunRecord, NewAlert, NewJob, NewJobRun};
+use ignis_storage::{
+    AlertRecord, Db, JobRecord, JobRunRecord, NewAlert, NewJob, NewJobRun, NewTask,
+};
 
 /// 唯一临时目录：测试可能并发执行，目录名带进程号与纳秒时间戳。
 fn temp_dir(name: &str) -> PathBuf {
@@ -175,6 +177,59 @@ fn migration_003_creates_the_schedule_tables_and_bumps_user_version() {
         vec!["dedup_key", "created_at"]
     );
     assert_eq!(index_columns(&db, "idx_alerts_read"), vec!["read_at"]);
+    drop(db);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// v2 → v3 升级：一个只跑到 002 的库（`user_version = 2`，没有 003 的三张表）打开后应建出
+/// `jobs` / `job_runs` / `alerts`、把 `user_version` 推到 3，且 001/002 期间的既有数据（这里：
+/// 一条任务行）一条不少。手工回退版本号 + 删表就是「旧版 ignis 写的库」的最小复现。
+#[test]
+fn a_v2_database_upgrades_to_v3_and_keeps_earlier_rows() {
+    let dir = temp_dir("upgrade");
+    let path = dir.join("ignis.db");
+
+    // 先开一个最新库，写入 001 时代的任务行，再把 003 的成果抹掉并退回版本号 2
+    let db = Db::open(&path).unwrap();
+    let task = NewTask {
+        id: "task-1".into(),
+        kind: "run".into(),
+        prompt: "旧版本写下的任务".into(),
+        kernel: "native".into(),
+        workspace: "/w".into(),
+        started_at: 42,
+    };
+    db.insert_task(&task).unwrap();
+    db.with_conn(|c| {
+        c.execute_batch(
+            "DROP TABLE jobs;
+             DROP TABLE job_runs;
+             DROP TABLE alerts;
+             PRAGMA user_version = 2",
+        )
+    })
+    .unwrap();
+    // 前提：003 的三张表确实不在了（否则这条用例什么也没验证）
+    for table in ["jobs", "job_runs", "alerts"] {
+        assert!(!object_exists(&db, "table", table), "{table} 应已被删掉");
+    }
+    assert_eq!(user_version(&db), 2);
+    drop(db);
+
+    // 再打开：003 重新应用，版本推到 3，旧数据仍在
+    let db = Db::open(&path).unwrap();
+    assert_eq!(user_version(&db), 3);
+    for table in ["jobs", "job_runs", "alerts"] {
+        assert!(object_exists(&db, "table", table), "{table} 缺失");
+    }
+    let row = db.get_task("task-1").unwrap().expect("旧任务行应还在");
+    assert_eq!(row.status, "running");
+    assert_eq!(row.prompt, "旧版本写下的任务");
+    assert_eq!(row.started_at, 42);
+    // 新表可用：升级之后 003 的 DAO 能正常读写
+    db.insert_job(&job("job-1")).unwrap();
+    assert_eq!(job_ids(&db.list_jobs(false).unwrap()), ["job-1"]);
     drop(db);
 
     std::fs::remove_dir_all(&dir).unwrap();

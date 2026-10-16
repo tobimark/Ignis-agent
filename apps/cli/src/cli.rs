@@ -166,8 +166,12 @@ pub enum SkillsCommand {
 /// 退出码，实现在 [`commands::daemon`]。
 #[derive(Debug, Subcommand)]
 pub enum DaemonCommand {
-    /// 启动守护进程（后台自守护）
-    Start,
+    /// 启动守护进程（默认后台自守护；`--foreground` 时为前台运行）
+    Start {
+        /// 前台运行调度循环（systemd 的 `ExecStart` 用这条：不脱离终端，SIGTERM 后优雅退出）
+        #[arg(long)]
+        foreground: bool,
+    },
     /// 停止守护进程（幂等：没在跑也是成功）
     Stop,
     /// 查看守护进程状态

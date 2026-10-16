@@ -9,7 +9,6 @@
 //! 自动干什么」，交互运行弹一次确认、`--yes` 预授权、无人值守直接拒绝。真正限制 job 能干什么的
 //! 是它自己的 profile 白名单（执行时由 [`crate::tools::ProfileExecutor`] 兜底）。
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -26,15 +25,13 @@ use crate::scheduler::{
 /// `schedule_create` 的注入依赖。
 ///
 /// CLI 与守护进程装配 [`super::meta_tools`] 时构造它：`available_tools` 取
-/// [`super::available_tool_names()`]（两侧因此共用同一份「可用工具」口径），`default_workspace`
-/// 取配置里的 `workspace_root`。工具执行时的工作区以 [`ToolCtx::workspace`] 为准。
+/// [`super::available_tool_names()`]（两侧因此共用同一份「可用工具」口径）。工具执行时的工作区以
+/// [`ToolCtx::workspace`] 为准（不另存默认工作区：调度任务的工作区就是创建它的那次运行的工作区）。
 pub struct SchedulerDeps {
     /// 落 `jobs` 行的库。
     pub db: Arc<Db>,
     /// 可用工具名清单：新 job 的 profile 白名单必须 ⊆ 它，否则当场拒绝。
     pub available_tools: Vec<String>,
-    /// CLI / 守护进程的默认工作区（配置里的 `workspace_root`）。
-    pub default_workspace: PathBuf,
 }
 
 /// 不传 `tools` 时的默认白名单：读两个文件工具 + 跑脚本 + 通知用户。
@@ -98,7 +95,17 @@ impl Tool for ScheduleCreate {
 
     async fn run(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String, ToolError> {
         let name = required_str(args, "name")?;
+        if name.trim().is_empty() {
+            return Err(ToolError::message(
+                "参数 `name` 不能是空白：给这个调度任务一个能认出它的短名字（如 disk-watch）",
+            ));
+        }
         let prompt = required_str(args, "prompt")?;
+        if prompt.trim().is_empty() {
+            return Err(ToolError::message(
+                "参数 `prompt` 不能是空白：调度任务每次到期都要执行它，必须是一条自包含的指令",
+            ));
+        }
         let schedule = required_str(args, "schedule")?.trim();
         let tools = tools_arg(args)?;
         let risk = risk_arg(args)?;
@@ -317,7 +324,6 @@ mod tests {
             registry.register(Box::new(ScheduleCreate::new(SchedulerDeps {
                 db: Arc::clone(&db),
                 available_tools: available_tool_names(),
-                default_workspace: dir.path().to_path_buf(),
             })));
             let approval = ScriptedApproval::new(decisions);
             let runtime = ToolRuntime::new(
@@ -595,6 +601,31 @@ mod tests {
         assert!(output.contains("cron"), "{output}");
         assert!(output.contains("0 9 * * 1-5"), "{output}");
         assert!(env.jobs().is_empty());
+    }
+
+    /// 空白 `name` / 空白 `prompt`：拒掉（中文错误），且不落 job 行——空白名字的任务在
+    /// `schedule list` 里认不出来，空白 prompt 的 job 到点只会跑一条空指令。
+    #[tokio::test]
+    async fn blank_name_and_prompt_are_rejected() {
+        let env = Env::preauthorized();
+
+        for (args, needle) in [
+            (
+                json!({"name": "   ", "prompt": "干活", "schedule": "10m"}),
+                "参数 `name` 不能是空白",
+            ),
+            (
+                json!({"name": "x", "prompt": " \n\t ", "schedule": "10m"}),
+                "参数 `prompt` 不能是空白",
+            ),
+        ] {
+            let result = env.call(args.clone()).await;
+            assert!(!result.ok, "{args}");
+            let output = result.output.unwrap();
+            assert!(output.contains(needle), "{args}: {output}");
+        }
+
+        assert!(env.jobs().is_empty(), "空白参数不落行");
     }
 
     /// 参数形态错误一律中文，且不落 job 行。

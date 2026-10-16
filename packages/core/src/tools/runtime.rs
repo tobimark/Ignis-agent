@@ -9,14 +9,13 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use ignis_runtime::{
     ApprovalDecision, ApprovalHandler, ApprovalRequest, Limits, RiskLevel, ToolCall, ToolExecutor,
     ToolResult, ToolSpec,
 };
-use ignis_storage::{Db, NewApproval, StorageError};
+use ignis_storage::{Db, NewApproval, StorageError, now_millis};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -294,15 +293,6 @@ fn mode_name(mode: ApprovalMode) -> &'static str {
         ApprovalMode::Interactive => "interactive",
         ApprovalMode::Preauthorized { .. } => "preauthorized",
         ApprovalMode::Unattended => "unattended",
-    }
-}
-
-/// epoch 毫秒；时钟早于 epoch（人工设置过系统时间）时退化成 0，保证记录仍能写入。profile 拒绝
-/// 留痕（[`crate::tools::ProfileExecutor`]）共用同一份时间口径。
-pub(crate) fn now_millis() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(elapsed) => i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
-        Err(_) => 0,
     }
 }
 

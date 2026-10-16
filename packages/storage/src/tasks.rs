@@ -125,6 +125,24 @@ impl Db {
             rows.collect()
         })
     }
+
+    /// 把遗留的 `kind = 'schedule'` 且 `status = 'running'` 的任务行收成 `failed` /
+    /// `error = 'interrupted'`（`ended_at` 写 `now`），返回收掉的条数。
+    ///
+    /// 只有守护进程在启动清场时调用：`kind = 'schedule'` 只有它写，pidfile 上的独占锁又保证同一个
+    /// home 只有一个守护进程——所以这里收掉的每一行都是「上一个守护进程被 SIGKILL / 崩溃时留下的」
+    /// 调度任务（`job_runs` 由 [`Db::sweep_stale_job_runs`] 收，这一行不随着一起收就会永远挂着
+    /// `running`）。`run` / `repl` 的任务行不归它管：那两类的收尾在各自的进程里。
+    pub fn sweep_stale_scheduled_tasks(&self, now: i64) -> Result<usize> {
+        let swept = self.with_conn(|c| {
+            c.prepare_cached(
+                "UPDATE tasks SET status = 'failed', error = 'interrupted', ended_at = ?1
+                 WHERE kind = 'schedule' AND status = 'running'",
+            )?
+            .execute(params![now])
+        })?;
+        Ok(swept)
+    }
 }
 
 #[cfg(test)]
@@ -245,5 +263,42 @@ mod tests {
         assert_eq!(limited.len(), 2);
         assert_eq!(limited[0].id, "02");
         assert_eq!(limited[1].id, "03");
+    }
+
+    /// 启动清场只收 `kind = 'schedule'` 的 `running` 行：`run` / `repl` 的活行与已经收尾的行
+    /// 一个字段都不动。
+    #[test]
+    fn sweep_stale_scheduled_tasks_collects_only_running_schedule_rows() {
+        let db = Db::open_in_memory().unwrap();
+        // 上一个守护进程被 SIGKILL 留下的调度任务：运行行被别的 sweep 收了，这一行还挂着
+        let mut stale = new_task("01", 10);
+        stale.kind = "schedule".into();
+        db.insert_task(&stale).unwrap();
+        // 交互运行（kind=run）的活行：不归它管
+        db.insert_task(&new_task("02", 20)).unwrap();
+        // 已经收尾的调度任务：不动
+        let mut done = new_task("03", 30);
+        done.kind = "schedule".into();
+        db.insert_task(&done).unwrap();
+        db.finish_task("03", "success", Some("done"), None, 1, 2, false, 40)
+            .unwrap();
+
+        assert_eq!(db.sweep_stale_scheduled_tasks(99).unwrap(), 1);
+        // 再扫一遍没有可收的行
+        assert_eq!(db.sweep_stale_scheduled_tasks(100).unwrap(), 0);
+
+        let swept = db.get_task("01").unwrap().unwrap();
+        assert_eq!(swept.status, "failed");
+        assert_eq!(swept.error.as_deref(), Some("interrupted"));
+        assert_eq!(swept.ended_at, Some(99));
+
+        let untouched = db.get_task("02").unwrap().unwrap();
+        assert_eq!(untouched.status, "running");
+        assert_eq!(untouched.ended_at, None);
+
+        let finished = db.get_task("03").unwrap().unwrap();
+        assert_eq!(finished.status, "success");
+        assert_eq!(finished.summary.as_deref(), Some("done"));
+        assert_eq!(finished.ended_at, Some(40));
     }
 }

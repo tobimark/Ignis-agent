@@ -31,6 +31,7 @@ use common::{
     TempDir, copy_dir, ignis_cmd, latest_task, output_text, read_alerts, read_approvals,
     read_job_runs, tool_call,
 };
+use ignis_gateway::RESCAN_SECS;
 use ignis_gateway::daemon::{DaemonStatus, status};
 use ignis_runtime::test_support::{ScriptStep, ScriptedModel};
 use serde_json::json;
@@ -52,8 +53,15 @@ const ALERT_TITLE: &str = "磁盘使用率过高";
 const HANG_COMMAND: &str = "sleep 8";
 /// 轮询步长（任务书钉死 200ms）。
 const POLL: Duration = Duration::from_millis(200);
-/// 恢复时刻的对齐量：见模块头「关键时序」（暂停后迟到那轮 + 23s ≈ 恢复后 9s 见到新一轮）。
-const RESUME_LEAD_MS: i64 = 23_000;
+/// 恢复时刻的对齐量（毫秒）：从迟到那轮的起点算起。
+///
+/// 推导自守护进程自己那个重扫窗口（[`RESCAN_SECS`]，不再写死一个副本）：迟到那轮之后循环把整段
+/// 窗口睡满，恢复点落在**窗口结束前 7s**，所以唤醒时立刻看见 active job，恢复后 7s（≤10s 断言
+/// 留 3s 余量）就见到新一轮。窗口一旦调整，这个量跟着走。
+///
+/// 注意不能落在窗口结束之后：那要等下一个整窗口（`RESCAN_SECS` + 2s 间隔 ≈ 32s）才被观察到，
+/// 10s 的断言会失败——「恢复至今 ≤10s」的语义本身就要求恢复落在当前窗口内。
+const RESUME_LEAD_MS: i64 = RESCAN_SECS * 1000 - 7_000;
 
 /// 夹具 `examples/test-server` 的绝对路径。
 fn test_server_dir() -> PathBuf {

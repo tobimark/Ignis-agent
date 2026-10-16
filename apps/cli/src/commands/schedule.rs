@@ -10,9 +10,8 @@ use std::process::ExitCode;
 use anyhow::{Result, anyhow};
 use ignis_core::config::{ensure_home, ignis_home};
 use ignis_core::scheduler::{NEVER_DUE, next_due, parse_schedule};
-use ignis_storage::{Db, JobRecord, JobRunRecord};
+use ignis_storage::{Db, JobRecord, JobRunRecord, now_secs};
 
-use super::now_secs;
 use super::task::{format_time, one_line, render_table, truncate};
 use crate::cli::ScheduleCommand;
 

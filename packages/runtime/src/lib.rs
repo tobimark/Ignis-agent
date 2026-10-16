@@ -123,6 +123,19 @@ pub enum RunStatus {
     LimitReached,
 }
 
+impl RunStatus {
+    /// 跨模块契约字符串：`tasks.status`、`job_runs.status` 与 JSONL 的 `done.status` 共用同一份
+    /// 取值（与 [`RunStatus`] 的 serde 小写名逐字一致）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RunStatus::Success => "success",
+            RunStatus::Failed => "failed",
+            RunStatus::Aborted => "aborted",
+            RunStatus::LimitReached => "limit_reached",
+        }
+    }
+}
+
 /// 内核事件：JSONL 任务日志直接序列化本类型。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -265,6 +278,15 @@ mod tests {
             serde_json::to_value(&ev).unwrap(),
             json!({"type":"tool_exec","name":"fs_read","summary":"Reading a.txt","args":{"path":"a.txt"}})
         );
+    }
+
+    /// 四个终态的契约字符串逐个钉住（`tasks.status` / `job_runs.status` / JSONL 共用）。
+    #[test]
+    fn run_status_as_str_pins_the_contract_strings() {
+        assert_eq!(RunStatus::Success.as_str(), "success");
+        assert_eq!(RunStatus::Failed.as_str(), "failed");
+        assert_eq!(RunStatus::Aborted.as_str(), "aborted");
+        assert_eq!(RunStatus::LimitReached.as_str(), "limit_reached");
     }
 
     #[test]

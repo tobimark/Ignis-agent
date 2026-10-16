@@ -68,8 +68,10 @@ fn ids(records: &[ignis_storage::FactRecord]) -> Vec<i64> {
     records.iter().map(|rec| rec.id).collect()
 }
 
+/// 002 引入的 facts 表/FTS5 索引/触发器在**当前全部迁移跑完之后**仍然在（名字不点名某一版
+/// 迁移：这里断言的是最新库的形状，迁移 003 只加表、不动 facts）。
 #[test]
-fn migration_002_creates_the_facts_schema_and_bumps_user_version() {
+fn facts_schema_survives_the_latest_migrations() {
     let dir = temp_dir("schema");
     let path = dir.join("ignis.db");
 

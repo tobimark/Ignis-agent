@@ -12,11 +12,10 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use ignis_core::alerts::{Notifier, NotifyError};
-use ignis_storage::AlertRecord;
+use ignis_storage::{AlertRecord, now_secs};
 
 /// 日志渠道：把每条告警追加成日志文件里的一行。
 pub struct LogNotifier {
@@ -167,14 +166,6 @@ fn urgency(severity: &str) -> &'static str {
         "critical" => "critical",
         "warning" => "normal",
         _ => "low",
-    }
-}
-
-/// 当前 epoch 秒；时钟早于 epoch（人工设置过系统时间）时退化成 0。
-fn now_secs() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(elapsed) => i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX),
-        Err(_) => 0,
     }
 }
 

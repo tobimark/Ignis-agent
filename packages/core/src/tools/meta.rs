@@ -280,7 +280,6 @@ mod tests {
             let scheduler = SchedulerDeps {
                 db: Arc::clone(&db),
                 available_tools: available_tool_names(),
-                default_workspace: dir.path().to_path_buf(),
             };
             for tool in meta_tools(memory, skills, alerts, scheduler) {
                 registry.register(tool);
@@ -356,7 +355,6 @@ mod tests {
         let scheduler = SchedulerDeps {
             db: Arc::clone(&db),
             available_tools: available_tool_names(),
-            default_workspace: dir.path().to_path_buf(),
         };
 
         let names: Vec<String> = meta_tools(memory, skills, alerts, scheduler)

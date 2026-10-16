@@ -1,51 +1,81 @@
-//! 调度运行的执行边界：白名单执行器 [`ProfileExecutor`]。
+//! 调度运行的执行边界：白名单 + 风险上限执行器 [`ProfileExecutor`]。
 //!
-//! 调度运行以 `Preauthorized` 策略发起，job 的 profile 白名单是模型能碰到哪几个工具的硬边界：
+//! 调度运行以 `Preauthorized` 策略发起，job 的 profile 是模型能碰到什么的硬边界：
 //! 白名单外的工具既不出现在 [`ProfileExecutor::specs`]（模型看不见），直接调用也会在到达
 //! [`ToolRuntime`] 之前被拒掉，并留一条 `deny` 审批记录（mode = `preauthorized`）——被拒的调用
-//! 永远不执行，也不产生副作用。白名单内的调用原样委托给内层执行器：它自己的策略、审批提示与
-//! 留痕照常生效。
+//! 永远不执行，也不产生副作用。白名单内的调用还要过风险上限：`risk=safe` 的 job 只跑分类为
+//! `Safe` 的调用，`shell_run` / `fs_write` 这类「会改动系统或外发数据」的调用在这里被拒（内层的
+//! 预授权策略本来会放行它们，那是 `risk=elevated` 的语义）。两条边界都留同一形状的 `deny` 记录。
+//! 过了边界的调用原样委托给内层执行器：它自己的策略、审批提示与留痕照常生效。
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ignis_runtime::{ToolCall, ToolExecutor, ToolResult, ToolSpec};
-use ignis_storage::{Db, NewApproval};
+use ignis_runtime::{RiskLevel, ToolCall, ToolExecutor, ToolResult, ToolSpec};
+use ignis_storage::{Db, NewApproval, now_millis};
 use tokio_util::sync::CancellationToken;
 
 use super::ToolRuntime;
-use super::runtime::{now_millis, risk_name};
+use super::runtime::risk_name;
+use crate::scheduler::ProfileRisk;
 
-/// 白名单执行器：包住一个 [`ToolRuntime`]，把「job 允许干什么」钉在它前面。
+/// 执行边界执行器：包住一个 [`ToolRuntime`]，把「job 允许干什么」钉在它前面。
 pub struct ProfileExecutor {
     inner: Arc<ToolRuntime>,
     allowed: HashSet<String>,
+    /// job profile 的风险上限：`Safe` 时白名单内的非 `Safe` 调用同样被拒。
+    risk: ProfileRisk,
     db: Arc<Db>,
     task_id: String,
 }
 
 impl ProfileExecutor {
-    /// 包装内层执行器：`allowed` 是 job profile 的工具白名单，`db` / `task_id` 供白名单外的拒绝
-    /// 留痕（`approvals` 行的字段与执行器本体同源）。
+    /// 包装内层执行器：`allowed` / `risk` 是 job profile 的工具白名单与风险上限，`db` /
+    /// `task_id` 供两条拒绝路径留痕（`approvals` 行的字段与执行器本体同源）。
     pub fn new(
         inner: Arc<ToolRuntime>,
         allowed: HashSet<String>,
+        risk: ProfileRisk,
         db: Arc<Db>,
         task_id: String,
     ) -> Self {
         Self {
             inner,
             allowed,
+            risk,
             db,
             task_id,
         }
     }
 
-    /// 白名单外的调用：拒绝 + 留痕；记录写不进去时必须说清楚审计失败，不能回「已记录」的假话
-    /// （拒绝本身不依赖写成功——本来就执行不了）。
-    fn deny(&self, call: &ToolCall) -> ToolResult {
-        let summary = format!("profile 拒绝：{}", call.name);
+    /// 白名单外的调用。
+    fn deny_outside_allowlist(&self, call: &ToolCall) -> ToolResult {
+        self.deny(
+            call,
+            format!("profile 拒绝：{}", call.name),
+            format!("该任务 profile 不允许工具 `{}`（已记录）", call.name),
+        )
+    }
+
+    /// 白名单内、但超出 profile 风险上限（`risk=safe`）的调用。
+    fn deny_over_risk(&self, call: &ToolCall) -> ToolResult {
+        self.deny(
+            call,
+            format!("profile 风险上限拒绝：{}", call.name),
+            format!(
+                "该任务 profile 风险上限为 safe，拒绝 `{}`（已记录）",
+                call.name
+            ),
+        )
+    }
+
+    /// 两条边界的统一拒绝路径：留一条 `deny` / `preauthorized` 记录（`risk` 记该调用的真实分类，
+    /// 不是编出来的等级）并把人话拒绝理由交回模型。
+    ///
+    /// 记录写不进去时必须说清楚审计失败，不能回「已记录」的假话（拒绝本身不依赖写成功——本来就
+    /// 执行不了）。
+    fn deny(&self, call: &ToolCall, summary: String, message: String) -> ToolResult {
         let approval = NewApproval {
             task_id: self.task_id.clone(),
             tool: call.name.clone(),
@@ -59,10 +89,7 @@ impl ProfileExecutor {
         match self.db.insert_approval(&approval) {
             Ok(()) => ToolResult {
                 ok: false,
-                output: Some(format!(
-                    "该任务 profile 不允许工具 `{}`（已记录）",
-                    call.name
-                )),
+                output: Some(message),
             },
             Err(error) => ToolResult {
                 ok: false,
@@ -89,7 +116,12 @@ impl ToolExecutor for ProfileExecutor {
     async fn execute(&self, call: ToolCall, cancel: CancellationToken) -> ToolResult {
         // 白名单外的调用不落到内层：内层连「未知工具」这条错误路径都不会被走到
         if !self.allowed.contains(&call.name) {
-            return self.deny(&call);
+            return self.deny_outside_allowlist(&call);
+        }
+        // 风险上限：分类口径与内层闸门同一份（`ToolRuntime::classify_call`），`risk=safe` 的 job
+        // 里白名单放行的 shell_run / fs_write 在这里就被拒，不会因为预授权策略而悄悄跑起来
+        if self.risk == ProfileRisk::Safe && self.inner.classify_call(&call) != RiskLevel::Safe {
+            return self.deny_over_risk(&call);
         }
         self.inner.execute(call, cancel).await
     }
@@ -110,6 +142,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::ProfileExecutor;
+    use crate::scheduler::ProfileRisk;
     use crate::security::{ApprovalMode, Policy, Redactor};
     use crate::tools::{Tool, ToolCtx, ToolError, ToolRuntime, default_registry};
 
@@ -203,14 +236,20 @@ mod tests {
             }
         }
 
-        /// 按给定的工具白名单包一层。
+        /// 按给定的工具白名单包一层；风险上限默认 `elevated`（`schedule_create` 的默认值）。
         fn profiled(&self, allowed: &[&str]) -> ProfileExecutor {
+            self.profiled_as(allowed, ProfileRisk::Elevated)
+        }
+
+        /// 指定风险上限包一层（`risk=safe` 的执行边界用例）。
+        fn profiled_as(&self, allowed: &[&str], risk: ProfileRisk) -> ProfileExecutor {
             ProfileExecutor::new(
                 Arc::clone(&self.inner),
                 allowed
                     .iter()
                     .map(|name| (*name).to_owned())
                     .collect::<HashSet<String>>(),
+                risk,
                 Arc::clone(&self.db),
                 TASK_ID.to_string(),
             )
@@ -345,6 +384,76 @@ mod tests {
             (rows[0].decision.as_str(), rows[0].mode.as_str()),
             ("allow", "preauthorized")
         );
+    }
+
+    /// `risk=safe` 的 job：白名单里的非 Safe 调用（`shell_run`）也被拒——分类口径与内层闸门同一份，
+    /// 拒绝留一条 `deny` / `preauthorized` 记录（risk 记真实等级 `elevated`），且不碰内层。
+    #[tokio::test]
+    async fn a_safe_profile_denies_an_allowlisted_non_safe_call() {
+        let env = Env::new();
+        let executor = env.profiled_as(&["shell_run"], ProfileRisk::Safe);
+
+        let denied = execute(
+            &executor,
+            call("shell_run", json!({"command": "touch side-effect.txt"})),
+        )
+        .await;
+
+        assert!(!denied.ok);
+        assert_eq!(
+            denied.output.as_deref(),
+            Some("该任务 profile 风险上限为 safe，拒绝 `shell_run`（已记录）")
+        );
+        assert!(
+            !env.dir.path().join("side-effect.txt").exists(),
+            "被拒的调用不得落到内层（命令真的没跑）"
+        );
+        let rows = env.approvals();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tool, "shell_run");
+        assert_eq!(rows[0].summary, "profile 风险上限拒绝：shell_run");
+        assert_eq!(rows[0].decision, "deny");
+        assert_eq!(rows[0].mode, "preauthorized");
+        assert_eq!(rows[0].risk, "elevated");
+        assert!(rows[0].decided_at > 0);
+    }
+
+    /// `risk=elevated`（默认）：白名单里的 `shell_run` 照常委托到内层，内层的预授权记录照旧。
+    #[tokio::test]
+    async fn an_elevated_profile_allows_an_allowlisted_non_safe_call() {
+        let env = Env::new();
+        let executor = env.profiled_as(&["shell_run"], ProfileRisk::Elevated);
+
+        let ok = execute(&executor, call("shell_run", json!({"command": "echo hi"}))).await;
+
+        assert!(ok.ok, "{:?}", ok.output);
+        let output = ok.output.unwrap();
+        assert!(output.contains("exit code: 0"), "{output}");
+        assert!(output.contains("hi"), "{output}");
+        // 放行路径不再多写 profile 记录：只有内层那条 allow/preauthorized
+        let rows = env.approvals();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tool, "shell_run");
+        assert_eq!(
+            (rows[0].decision.as_str(), rows[0].mode.as_str()),
+            ("allow", "preauthorized")
+        );
+    }
+
+    /// `risk=safe` 的白名单内 Safe 调用（`fs_read`）不受风险上限影响：照常执行。
+    #[tokio::test]
+    async fn a_safe_profile_allows_a_safe_call() {
+        let env = Env::new();
+        std::fs::write(env.dir.path().join("a.txt"), "hello").unwrap();
+        let executor = env.profiled_as(&["fs_read"], ProfileRisk::Safe);
+
+        let ok = execute(&executor, call("fs_read", json!({"path": "a.txt"}))).await;
+
+        assert!(ok.ok, "{:?}", ok.output);
+        let output = ok.output.unwrap();
+        assert!(output.contains("hello"), "{output}");
+        // Safe 调用内层不记录（审批表只留需要判定的调用）
+        assert!(env.approvals().is_empty());
     }
 
     /// 审计写不进去时必须说清楚（不能回「已记录」的假话），并且照样不执行。

@@ -25,7 +25,7 @@ mod tasks;
 
 pub use alerts::{AlertRecord, NewAlert};
 pub use approvals::{ApprovalRecord, NewApproval};
-pub use db::{Db, StorageError};
+pub use db::{Db, StorageError, now_millis, now_secs};
 pub use facts::{FactRecord, NewFact};
 pub use jobs::{JobRecord, JobRunRecord, NewJob, NewJobRun};
 pub use logs::TaskLog;

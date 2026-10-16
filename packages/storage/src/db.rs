@@ -41,12 +41,18 @@ pub(crate) type Result<T> = std::result::Result<T, StorageError>;
 
 /// 当前 epoch 毫秒；系统时钟早于 `UNIX_EPOCH` 时取 0（不 panic）。
 ///
-/// 新建行的 `created_at` 等时间戳由 DAO 自己取，调用方不用传时钟。
-pub(crate) fn now_millis() -> i64 {
+/// 新建行的 `created_at` 等时间戳由 DAO 自己取，调用方不用传时钟；上层的调度循环、告警与 CLI
+/// 也复用这一份（`core` / `gateway` / CLI 都依赖 storage，不再各抄一遍 `SystemTime` 换算）。
+pub fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// 当前 epoch 秒（`now_millis()` 向下取整，与 [`now_millis`] 同一把尺子）。
+pub fn now_secs() -> i64 {
+    now_millis().div_euclid(1_000)
 }
 
 /// SQLite 连接持有者：内部为 `Mutex<Connection>`，DAO 一律经 [`Db::with_conn`] 串行访问。
