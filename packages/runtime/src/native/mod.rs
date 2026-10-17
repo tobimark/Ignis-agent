@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::openai::OpenAiClient;
 use crate::openai::assembler::ToolCallAssembler;
+use crate::think::{Piece, ThinkSplitter};
 use crate::{
     BoxStream, Capabilities, ChatMessage, Role, RunRequest, RunStatus, Runtime, RuntimeEvent,
     ToolCall, ToolSpec, Usage,
@@ -246,7 +247,11 @@ async fn drive(
     }
 }
 
-/// 发起一轮请求并消费整条流：文本即时出事件，工具调用分片交给 assembler 收口。
+/// 发起一轮请求并消费整条流：文本即时出事件（经 [`ThinkSplitter`] 分道），工具调用分片交给
+/// assembler 收口。
+///
+/// 正文口径（设计 §6.2）：累积进 `Round::Completed.text` 的**只含正文**——`<think>` 块里的推理
+/// 只走 `ReasoningDelta`，绝不并入 `Done.summary` 或回填给模型的 assistant 消息。
 async fn fetch_round(
     client: &OpenAiClient,
     history: &[ChatMessage],
@@ -261,15 +266,23 @@ async fn fetch_round(
     let mut text = String::new();
     let mut usage = None;
     let mut assembler = ToolCallAssembler::new();
+    let mut splitter = ThinkSplitter::new();
     while let Some(item) = stream.next().await {
         let chunk = match item {
             Ok(chunk) => chunk,
             Err(err) => return Round::Failed(err.to_string()),
         };
+        // 兼容层自带的推理字段直接走推理通道（不经过分割器）
+        if let Some(reasoning) = chunk.reasoning
+            && !emit(tx, RuntimeEvent::ReasoningDelta { text: reasoning }).await
+        {
+            return Round::Detached;
+        }
         if let Some(delta) = chunk.text {
-            text.push_str(&delta);
-            if !emit(tx, RuntimeEvent::TextDelta { text: delta }).await {
-                return Round::Detached;
+            for piece in splitter.push(&delta) {
+                if !emit_piece(tx, &mut text, piece).await {
+                    return Round::Detached;
+                }
             }
         }
         for delta in &chunk.tool_call_deltas {
@@ -284,9 +297,26 @@ async fn fetch_round(
             usage = chunk.usage;
         }
     }
+    // 流结束：待定尾部（半截标记、未闭合推理块的尾巴）按当前通道吐出，一个字都不吞
+    for piece in splitter.finish() {
+        if !emit_piece(tx, &mut text, piece).await {
+            return Round::Detached;
+        }
+    }
     match assembler.finish() {
         Ok(calls) => Round::Completed { text, usage, calls },
         Err(err) => Round::Failed(err.to_string()),
+    }
+}
+
+/// 按通道下发送一个分割片段：正文并进累积文本，推理只走事件。
+async fn emit_piece(tx: &Sender<RuntimeEvent>, text: &mut String, piece: Piece) -> bool {
+    match piece {
+        Piece::Text(part) => {
+            text.push_str(&part);
+            emit(tx, RuntimeEvent::TextDelta { text: part }).await
+        }
+        Piece::Reasoning(part) => emit(tx, RuntimeEvent::ReasoningDelta { text: part }).await,
     }
 }
 
@@ -503,6 +533,118 @@ mod tests {
             }
         );
         assert_eq!(model.requests().len(), 1);
+    }
+
+    /// brief 钉死：内联 `<think>` 块从正文里剥离——推理走 `ReasoningDelta`，正文（事件与
+    /// `Done.summary`）只含正文，任何 `TextDelta` 都不带标记（设计 §6.2 正文口径）。
+    #[tokio::test]
+    async fn inline_think_block_splits_into_reasoning_and_text_channels() {
+        let model = ScriptedModel::start(vec![ScriptStep::Text(
+            "先说明<think>内心戏</think>结论".into(),
+        )]);
+        let executor: Arc<dyn ToolExecutor> = MockExecutor::new(vec![]);
+
+        let events = collect_events(
+            &NativeRuntime::new(client(&model)),
+            request(&model, executor),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let reasoning: String = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::ReasoningDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(text, "先说明结论", "{events:?}");
+        assert_eq!(reasoning, "内心戏", "{events:?}");
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                RuntimeEvent::TextDelta { text } if text.contains("<think")
+            )),
+            "正文通道不得带标记：{events:?}"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&RuntimeEvent::Done {
+                status: RunStatus::Success,
+                summary: Some("先说明结论".into()),
+                error: None,
+            }),
+            "摘要只含正文：{events:?}"
+        );
+    }
+
+    /// brief 钉死：`delta.reasoning_content` 走独立通道，同一轮里整段先于正文到达。
+    #[tokio::test]
+    async fn reasoning_content_streams_before_text_in_same_round() {
+        let model = ScriptedModel::start(vec![ScriptStep::ReasoningText {
+            reasoning: "想一想".into(),
+            text: "答复".into(),
+        }]);
+        let executor: Arc<dyn ToolExecutor> = MockExecutor::new(vec![]);
+
+        let events = collect_events(
+            &NativeRuntime::new(client(&model)),
+            request(&model, executor),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let reasoning_positions: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| matches!(event, RuntimeEvent::ReasoningDelta { .. }))
+            .map(|(index, _)| index)
+            .collect();
+        let text_positions: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| matches!(event, RuntimeEvent::TextDelta { .. }))
+            .map(|(index, _)| index)
+            .collect();
+        let reasoning: String = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::ReasoningDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(reasoning, "想一想", "{events:?}");
+        assert_eq!(text, "答复", "{events:?}");
+        assert!(!reasoning_positions.is_empty() && !text_positions.is_empty());
+        assert!(
+            reasoning_positions.iter().max() < text_positions.iter().min(),
+            "推理应先于正文到达：{events:?}"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&RuntimeEvent::Done {
+                status: RunStatus::Success,
+                summary: Some("答复".into()),
+                error: None,
+            }),
+            "推理不得进摘要：{events:?}"
+        );
     }
 
     /// brief 钉死：工具调用真被执行、结果回填给模型；事件按 index 顺序串行出 `ToolExec`/`ToolResult`。

@@ -27,6 +27,9 @@ const CHAT_PATH: &str = "/v1/chat/completions";
 pub enum ScriptStep {
     /// 纯文本回答：文本拆成 3 个 delta，末块带 `finish_reason: "stop"` 与 usage。
     Text(String),
+    /// 推理 + 正文：先对 `reasoning` 走 `delta.reasoning_content`（拆 3 片），
+    /// 再对 `text` 走 `delta.content`（拆 3 片），末块带 `finish_reason: "stop"` 与 usage。
+    ReasoningText { reasoning: String, text: String },
     /// 文本 + 工具调用：`calls` 为 `(name, args)`，每个调用的 arguments 拆成 3 个分片。
     ToolCalls {
         text: String,
@@ -145,6 +148,9 @@ fn serve(
 fn respond(stream: &mut TcpStream, step: &ScriptStep) {
     match step {
         ScriptStep::Text(text) => write_sse(stream, &text_chunks(text)),
+        ScriptStep::ReasoningText { reasoning, text } => {
+            write_sse(stream, &reasoning_text_chunks(reasoning, text))
+        }
         ScriptStep::ToolCalls { text, calls } => write_sse(stream, &tool_call_chunks(text, calls)),
         ScriptStep::Error { status, body } => {
             let _ = stream.write_all(&http_response(*status, "application/json", body.as_bytes()));
@@ -170,6 +176,22 @@ fn text_chunks(text: &str) -> Vec<Value> {
         .into_iter()
         .map(|part| chunk(json!({"content": part}), None))
         .collect();
+    chunks.push(chunk(json!({}), Some("stop")));
+    chunks
+}
+
+/// 推理 + 正文回答的 chunk 序列：推理走 `delta.reasoning_content`、正文走 `delta.content`，
+/// 各自按 [`fragments`] 拆片；末块带 `finish_reason: "stop"` 与 usage（与纯文本回答同形）。
+fn reasoning_text_chunks(reasoning: &str, text: &str) -> Vec<Value> {
+    let mut chunks: Vec<Value> = fragments(reasoning)
+        .into_iter()
+        .map(|part| chunk(json!({"reasoning_content": part}), None))
+        .collect();
+    chunks.extend(
+        fragments(text)
+            .into_iter()
+            .map(|part| chunk(json!({"content": part}), None)),
+    );
     chunks.push(chunk(json!({}), Some("stop")));
     chunks
 }

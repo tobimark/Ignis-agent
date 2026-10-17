@@ -65,10 +65,12 @@ impl LlmError {
     }
 }
 
-/// 一个流式响应块：文本增量、工具调用增量、结束原因与（末块的）用量。
+/// 一个流式响应块：文本增量、推理增量、工具调用增量、结束原因与（末块的）用量。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatChunk {
     pub text: Option<String>,
+    /// 推理增量（兼容层的 `delta.reasoning_content`）：只走 `ReasoningDelta`，不并入正文。
+    pub reasoning: Option<String>,
     pub tool_call_deltas: Vec<ToolCallDelta>,
     pub finish_reason: Option<String>,
     pub usage: Option<Usage>,
@@ -361,6 +363,12 @@ fn chunk_from_payload(payload: &str) -> Result<Option<ChatChunk>, LlmError> {
         // 有些兼容层会在首个块发空 content：空串不算文本增量
         .filter(|text| !text.is_empty())
         .map(str::to_owned);
+    // 推理通道（兼容层的 `delta.reasoning_content`）：非字符串忽略，空串不算增量
+    let reasoning = delta
+        .and_then(|delta| delta.get("reasoning_content"))
+        .and_then(Value::as_str)
+        .filter(|reasoning| !reasoning.is_empty())
+        .map(str::to_owned);
     let tool_call_deltas = match delta {
         Some(delta) => tool_call_deltas(delta)?,
         None => Vec::new(),
@@ -370,11 +378,17 @@ fn chunk_from_payload(payload: &str) -> Result<Option<ChatChunk>, LlmError> {
         .and_then(Value::as_str)
         .map(str::to_owned);
     let usage = value.get("usage").and_then(parse_usage);
-    if text.is_none() && tool_call_deltas.is_empty() && finish_reason.is_none() && usage.is_none() {
+    if text.is_none()
+        && reasoning.is_none()
+        && tool_call_deltas.is_empty()
+        && finish_reason.is_none()
+        && usage.is_none()
+    {
         return Ok(None);
     }
     Ok(Some(ChatChunk {
         text,
+        reasoning,
         tool_call_deltas,
         finish_reason,
         usage,
@@ -442,7 +456,7 @@ mod tests {
     use crate::test_support::{ScriptStep, ScriptedModel, ScriptedModelHandle};
     use crate::{ChatMessage, ModelConfig, Role, ToolCall, ToolSpec, Usage};
 
-    use super::{ChatChunk, LlmError, OpenAiClient, request_body};
+    use super::{ChatChunk, LlmError, OpenAiClient, chunk_from_payload, request_body};
 
     /// 指向脚本化假模型的客户端：退避压到 1ms，测试不睡真时间。
     fn client(model: &ScriptedModelHandle) -> OpenAiClient {
@@ -534,6 +548,64 @@ mod tests {
             requests[0]["tools"][0]["function"]["parameters"]["required"],
             json!(["path"])
         );
+    }
+
+    /// brief 钉死：`delta.reasoning_content` → `ChatChunk.reasoning`，与正文分字段下发。
+    #[tokio::test]
+    async fn reasoning_content_streams_into_its_own_field() {
+        let model = ScriptedModel::start(vec![ScriptStep::ReasoningText {
+            reasoning: "想".into(),
+            text: "答".into(),
+        }]);
+        let chunks: Vec<Result<ChatChunk, LlmError>> = client(&model)
+            .stream_chat(&[message(Role::User, "hi")], &tools(), "sys")
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        let chunks: Vec<ChatChunk> = chunks.into_iter().collect::<Result<_, _>>().unwrap();
+
+        let reasoning: String = chunks
+            .iter()
+            .filter_map(|chunk| chunk.reasoning.clone())
+            .collect();
+        let text: String = chunks
+            .iter()
+            .filter_map(|chunk| chunk.text.clone())
+            .collect();
+        assert_eq!(reasoning, "想", "推理应进自己的字段：{chunks:?}");
+        assert_eq!(text, "答");
+        assert_eq!(
+            chunks.last().unwrap().finish_reason.as_deref(),
+            Some("stop")
+        );
+    }
+
+    /// `reasoning_content` 的容错：非字符串忽略；空串不算增量（与 `content` 同口径）。
+    #[test]
+    fn reasoning_content_shapes_are_tolerated() {
+        let parse = |delta: &str| {
+            chunk_from_payload(&format!(
+                r#"{{"choices":[{{"index":0,"delta":{delta},"finish_reason":null}}]}}"#
+            ))
+        };
+
+        // 同一块里各归各的字段
+        let parsed = parse(r#"{"reasoning_content":"想","content":"答"}"#)
+            .unwrap()
+            .expect("应解析出 chunk");
+        assert_eq!(parsed.reasoning.as_deref(), Some("想"));
+        assert_eq!(parsed.text.as_deref(), Some("答"));
+
+        // 非字符串不是格式错误，忽略即可
+        let parsed = parse(r#"{"reasoning_content":123,"content":"答"}"#)
+            .unwrap()
+            .expect("应解析出 chunk");
+        assert_eq!(parsed.reasoning, None);
+        assert_eq!(parsed.text.as_deref(), Some("答"));
+
+        // 空串不算增量：整块没有新信息 → 跳过
+        assert!(parse(r#"{"reasoning_content":""}"#).unwrap().is_none());
     }
 
     /// 工具调用分片走完整链路：客户端取 `delta.tool_calls` → assembler 拼回调用。

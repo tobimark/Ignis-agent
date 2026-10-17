@@ -7,6 +7,8 @@
 //! （`docs/spikes/2026-10-15-external-kernels-probe.md`）；[`claude`] 是 claude CLI 兼容内核，
 //! 同一份探测记录里也有它的小节。[`cli_process`] 是两个外部 CLI 内核共用的内部进程/事件基础设施，
 //! [`render`] 则是它们共用的 canonical 会话渲染（两者都不属于对外契约）。
+//! [`think`] 是 native 内核的推理分道分割器：把模型内联的 `<think>` / `<thinking>` 块从
+//! 正文通道里剥出来（推理只走 `reasoning_delta`，正文口径见设计 §6.2）。
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -21,6 +23,7 @@ pub mod codex;
 pub mod native;
 pub mod openai;
 pub mod render;
+pub mod think;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
