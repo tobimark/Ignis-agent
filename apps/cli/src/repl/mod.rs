@@ -1,7 +1,10 @@
-//! 无子命令时的交互式 REPL：banner、提示词、斜杠命令与逐行任务。
+//! 无子命令时的交互式 REPL：banner、提示词、斜杠命令（[`crate::commands::slash`]）与逐行任务。
 //!
 //! 输入读取走 [`LineReader`] 这一层薄接口：[`StdinReader`] 只做「写提示词 + 读一行」，
 //! 将来换成 rustyline（历史与行编辑）只需要在这里加一个实现，REPL 主循环不用动。
+//!
+//! 分类只走 `slash::parse` 一条路：空行跳过、`/…` 是本地命令（未知命令只在本地报错，**不送模型**）、
+//! 其余是任务。
 
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
@@ -15,32 +18,11 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::Cli;
+use crate::commands::slash::{self, Dispatch, Parsed};
 use crate::commands::{Session, kernel_note, spawn_ctrl_c_watcher};
 
 /// 提示词（固定文案）。
 const PROMPT: &str = "❯ ";
-
-/// `/help` 列出的命令：退出、帮助与内核切换。
-const HELP: [&str; 3] = [
-    "/exit  退出 REPL",
-    "/help  显示可用命令",
-    "/kernel [name]  显示或切换执行内核（native|codex|claude）",
-];
-
-/// 一行输入的含义。
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Input {
-    /// 空行/纯空白：跳过，不作为任务。
-    Empty,
-    /// `/exit`：退出 REPL。
-    Exit,
-    /// `/help`：打印可用命令。
-    Help,
-    /// `/kernel`（无参显示当前内核）或 `/kernel <name>`（切换后续任务的内核）。
-    Kernel(Option<String>),
-    /// 其余输入：一次任务的内容。
-    Task(String),
-}
 
 /// 读一行输入的最小接口；REPL 只依赖它，实现可以换（rustyline / 脚本化输入）。
 pub trait LineReader: Send + Sync {
@@ -96,41 +78,6 @@ pub fn banner_lines(
     lines
 }
 
-/// 分类一行输入：空行跳过，三个斜杠命令之外都当作任务内容（去掉行尾换行与首尾空白）。
-///
-/// `/kernel` 只认「单独一条命令」或「命令 + 一个名字」；多出的词与其它未知斜杠输入一样当任务，
-/// 与 `/exit` / `/help` 的既有口径一致。
-fn classify(line: &str) -> Input {
-    let trimmed = line.trim();
-    match trimmed.split_whitespace().collect::<Vec<_>>().as_slice() {
-        [] => Input::Empty,
-        ["/exit"] => Input::Exit,
-        ["/help"] => Input::Help,
-        ["/kernel"] => Input::Kernel(None),
-        ["/kernel", name] => Input::Kernel(Some((*name).to_string())),
-        _ => Input::Task(trimmed.to_string()),
-    }
-}
-
-/// `/kernel` 的输出：当前生效的内核名，非 native 时补上那行能力提示。
-///
-/// 无参显示与切换成功共用同一份文案（提示来自 [`kernel_note`]）：两处措辞分家的话，用户会以为
-/// 切换没生效。
-fn kernel_lines(kernel: &str) -> Vec<String> {
-    let mut lines = vec![format!("kernel: {kernel}")];
-    if let Some(note) = kernel_note(kernel) {
-        lines.push(note);
-    }
-    lines
-}
-
-/// 逐行打印一个命令的输出。
-fn print_lines(lines: &[String]) {
-    for line in lines {
-        println!("{line}");
-    }
-}
-
 /// 启动 REPL；stdin 不是 tty 时拒绝启动（脚本/管道请用 `ignis run`）。
 pub async fn run(cli: &Cli) -> Result<ExitCode> {
     if !io::stdin().is_terminal() {
@@ -181,22 +128,22 @@ pub async fn run(cli: &Cli) -> Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         };
 
-        match classify(&line) {
-            Input::Empty => {}
-            Input::Exit => return Ok(ExitCode::SUCCESS),
-            Input::Help => {
-                for command in HELP {
-                    println!("{command}");
+        // 本地分类：空行跳过；未知命令只在本地报错（v0.1 里它们会被当成任务送给模型）
+        match slash::parse(&line) {
+            Parsed::Empty => {}
+            Parsed::Unknown(name) => eprintln!("{}", slash::unknown_command_line(&name)),
+            Parsed::Command(command, args) => match slash::dispatch(&mut session, command, &args) {
+                Ok(Dispatch::Exit) => return Ok(ExitCode::SUCCESS),
+                Ok(Dispatch::Lines(lines)) => {
+                    for line in lines {
+                        println!("{line}");
+                    }
                 }
-            }
-            // 无参：显示当前内核，非 native 时补一行能力提示
-            Input::Kernel(None) => print_lines(&kernel_lines(session.kernel())),
-            // 有参：校验可用后切换后续任务的内核；不可用就只打错误行，不切换
-            Input::Kernel(Some(name)) => match session.set_kernel(&name) {
-                Ok(kernel) => print_lines(&kernel_lines(kernel)),
+                // 命令自己的错误（内核名非法、取值不对、尚未实现的命令）打到 stderr，
+                // 与 `main` 的错误行同形
                 Err(error) => eprintln!("error: {error}"),
             },
-            Input::Task(prompt) => {
+            Parsed::Task(prompt) => {
                 let outcome = session
                     .run_task(prompt, history.clone(), TaskKind::Repl)
                     .await?;
@@ -273,57 +220,5 @@ mod tests {
         // 计数读失败（`None`，调用方已打警告）：跳过那一行，banner 形状不变
         let failed = banner_lines(Path::new("/tmp/ws"), "native", 3, 2, None);
         assert_eq!(failed, quiet, "读失败与「没有未读」对用户是同一屏");
-    }
-
-    #[test]
-    fn classify_separates_commands_tasks_and_blank_lines() {
-        // stdin 给的行带换行符；空行跳过
-        assert_eq!(classify("\n"), Input::Empty);
-        assert_eq!(classify("   \n"), Input::Empty);
-        assert_eq!(classify("/exit\n"), Input::Exit);
-        assert_eq!(classify("/help\n"), Input::Help);
-        // `/kernel` 无参与带参两种形状；多余空白归一
-        assert_eq!(classify("/kernel\n"), Input::Kernel(None));
-        assert_eq!(
-            classify("/kernel codex\n"),
-            Input::Kernel(Some("codex".to_string()))
-        );
-        assert_eq!(
-            classify("  /kernel   claude  \n"),
-            Input::Kernel(Some("claude".to_string()))
-        );
-        // 多余的词不当命令：与其它未知斜杠输入一样当任务
-        assert_eq!(
-            classify("/kernel codex now\n"),
-            Input::Task("/kernel codex now".to_string())
-        );
-        // 任务内容保留原文（只去掉行尾换行与首尾空白）
-        assert_eq!(
-            classify("把 README 翻译成中文\n"),
-            Input::Task("把 README 翻译成中文".to_string())
-        );
-        assert_eq!(classify("/unknown\n"), Input::Task("/unknown".to_string()));
-    }
-
-    #[test]
-    fn help_lists_the_three_commands() {
-        let help = HELP.join("\n");
-        assert!(help.contains("/exit"), "{help}");
-        assert!(help.contains("/help"), "{help}");
-        // 内核切换必须可发现：无参形状与三个取值都写在帮助里
-        assert!(help.contains("/kernel [name]"), "{help}");
-        assert!(help.contains("native|codex|claude"), "{help}");
-    }
-
-    /// `/kernel` 的两行输出：当前内核名 + 非 native 的那行能力提示（与 `--kernel` 路径同一份文案）。
-    #[test]
-    fn kernel_lines_pair_the_current_kernel_with_its_capability_note() {
-        assert_eq!(kernel_lines("native"), ["kernel: native"]);
-
-        assert_eq!(kernel_lines("codex").len(), 2);
-        assert_eq!(kernel_lines("codex")[0], "kernel: codex");
-        // 提示行与 `commands::kernel_note` 是同一条（两处措辞分家 = 用户以为切换没生效）
-        assert_eq!(kernel_lines("codex")[1], kernel_note("codex").unwrap());
-        assert_eq!(kernel_lines("claude")[1], kernel_note("claude").unwrap());
     }
 }

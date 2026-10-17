@@ -12,7 +12,7 @@ use crate::commands::{Session, kernel_note};
 ///
 /// 内核失败、触限与用户中止都不是 CLI 错误：它们照常返回 `Ok`，只是退出码不同。
 pub async fn run(cli: &Cli, task: &str) -> Result<ExitCode> {
-    let session = Session::new(cli)?;
+    let mut session = Session::new(cli)?;
     // 选定非 native 内核时先把能力边界说清楚（工具、记忆写、用量各少什么）
     if let Some(note) = kernel_note(session.kernel()) {
         println!("{note}");
