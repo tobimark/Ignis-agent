@@ -10,7 +10,9 @@
 //!   而且输入行会由终端回显、与 `ignis` 自己的重绘叠在一起——这几条用例断言的是编辑器画出的
 //!   那一份；
 //! - **位置敏感的断言看「标记之后」**：`Pty::expect` 每次从流头重扫，拿已经出现过的串当断言会
-//!   假命中（按 ↑ 召回的「❯ 第二次」在提交那一帧就出现过），所以那一类走 [`expect_after`]。
+//!   假命中（按 ↑ 召回的「❯ 第二次」在提交那一帧就出现过），所以那一类走 [`expect_after`]；
+//!   补全的候选列表与 `/help` 的输出**逐字相同**，认不出标记，那一类走 [`expect_after_offset`]
+//!   ——按发送前的流长切窗口。
 
 #![cfg(unix)]
 
@@ -103,6 +105,36 @@ fn output_after(pty: &Pty, marker: &str) -> String {
     match text.rfind(marker) {
         Some(at) => text[at + marker.len()..].to_string(),
         None => panic!("输出里没有 {marker:?}：\n{text}"),
+    }
+}
+
+/// 等 `needle` 出现在 `offset` 之后**新写出的字节**里；`offset` 是发送前取的 `pty.output().len()`。
+///
+/// 为什么不能用 [`expect_after`]：Tab 的候选列表（`/` 的候选）与 `/help` 的输出**逐字相同**（同一份
+/// `group_lines`），认不出任何一个只属于列表的标记——`/help` 那次里已经出现过 `/memory` 与
+/// `INTELLIGENCE`，`❯ /` 那类输入行帧也早在打 `/he` 时就画过。于是只能按位置切窗口：窗口里的命中
+/// 只可能来自发送那一刻之后写出的内容（pty 的字节按序到达，先写出的只可能落在 `offset` 左侧；
+/// 调用点的 `/kernel [name]` 是 `/help` 的最后一行，它之后写出的只有那一行的尾巴与提示符帧，
+/// 两者都不含待查的 needle，所以「晚到的旧输出落进窗口」这条假阳性通道也是关着的）。
+fn expect_after_offset(pty: &Pty, offset: usize, needle: &str) {
+    let deadline = Instant::now() + PTY_TIMEOUT;
+    loop {
+        let text = pty.output();
+        // 快照记的是解码后的字节长：两次快照之间，尾巴上那半截多字节序列补齐后这段的长度会变，
+        // 所以从 `offset` 起往后找一个字符边界再切片（越界就取空窗口）——只许往后挪，绝不回退。
+        let start = (offset..=text.len())
+            .find(|at| text.is_char_boundary(*at))
+            .unwrap_or(text.len());
+        if text[start..].contains(needle) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "等待第 {offset} 字节之后的 {needle:?} 超时（{}s）：\n{text}",
+                PTY_TIMEOUT.as_secs()
+            );
+        }
+        std::thread::sleep(POLL_INTERVAL);
     }
 }
 
@@ -342,8 +374,13 @@ fn pty_tab_completes_a_unique_prefix_and_lists_candidates() {
     pty.expect("/kernel [name]"); // `/help` 的命令行
 
     pty.send("/\t"); // 行首 `/` 有多个候选：列出行
-    pty.expect("/memory");
-    pty.expect("INTELLIGENCE");
+    // 候选列表的内容与上面 `/help` 的输出逐字相同，`Pty::expect` 从流头重扫就会被那一份满足
+    // （列表不渲染也绿）：先记下流长，只在 `/\t` 之后新写出的字节里找（见 [`expect_after_offset`]）。
+    // `/kernel [name]` 是 `/help` 的最后一行，它之后 CLI 写过的只有那一行的尾巴与提示符帧，
+    // 两者都不含这两个 needle——晚到的旧输出替不了列表。
+    let offset = pty.output().len();
+    expect_after_offset(&pty, offset, "/memory");
+    expect_after_offset(&pty, offset, "INTELLIGENCE");
 
     pty.send("\x15"); // Ctrl+U 清掉 `/`
     pty.send("/nope\r");
