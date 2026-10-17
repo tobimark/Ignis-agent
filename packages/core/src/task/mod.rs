@@ -3,8 +3,8 @@
 //! [`TaskRunner::run`] 的一次运行：生成 task id → 写 `tasks` 行（`running`）与 JSONL 首行
 //! `task_start` → 向记忆层取已知事实（失败只警告，见 [`TaskRunner::run`] 的说明）、把内置工具与
 //! 元工具组装成 [`ToolRuntime`]，连事实与技能目录一起交给 [`prompts::build_system_prompt`]
-//! → 消费内核事件（每行带 `ts` 且整行过 [`Redactor`] 后落盘，同时转发给 sink、累加用量、记下
-//! 真正加载过的技能并数出本轮的 `ToolExec` 条数）→ 终态时 `finish_task` 并补 JSONL 收尾行
+//! → 消费内核事件（每行带 `ts` 且整行过 [`Redactor`] 后落盘；转发给 sink 的是同一道脱敏后的
+//! 副本，而用量累加、技能去重与工具计数读原始事件）→ 终态时 `finish_task` 并补 JSONL 收尾行
 //! `task_end`（与首行 `task_start` 对称；内核自己的 `Done` 事件已落成一行 `done`，收尾行不能与
 //! 它同名）。
 
@@ -315,7 +315,8 @@ impl TaskRunner {
         let mut stream = self.runtime.run(request, cancel).await;
         while let Some(event) = stream.next().await {
             self.append_jsonl(log, task_id, serde_json::to_value(&event)?)?;
-            let _ = sink.send(event.clone());
+            // 转发的副本先过脱敏器（渲染面：CLI 终端 / 将来的 TUI）；下面的记账继续读原始事件
+            let _ = sink.send(self.redact_for_sink(&event));
 
             match &event {
                 RuntimeEvent::Usage {
@@ -449,6 +450,48 @@ impl TaskRunner {
         let line = self.redactor.redact(&serde_json::to_string(&record)?);
         log.append(task_id, &serde_json::from_str(&line)?)?;
         Ok(())
+    }
+
+    /// 转发给 sink 的事件副本：整条事件过 [`Redactor`]（与 JSONL 落盘同一手法——
+    /// `serde_json` 往返，递归替换每个字符串值里的密钥），CLI 渲染器等 sink 消费者不再可能
+    /// 打印已知密钥（spec §2.3 的反目标）。
+    ///
+    /// 只改这一份副本：用量累加、技能去重与工具计数继续读原始事件，记账不受替换影响。
+    fn redact_for_sink(&self, event: &RuntimeEvent) -> RuntimeEvent {
+        let Ok(mut value) = serde_json::to_value(event) else {
+            // 同一枚事件此前已在 `append_jsonl` 成功序列化过一次，这里理论上不可达；万一发生
+            // 也转发原事件：宁可少一道替换，不能 panic，也不能把事件从 UI 流里吞掉。
+            return event.clone();
+        };
+        redact_strings(&self.redactor, &mut value);
+        match serde_json::from_value(value) {
+            Ok(redacted) => redacted,
+            Err(_) => {
+                // 脱敏只替换字符串内容、不动事件形状，解析回来同样理论上不可达；回退与上
+                // 一段相同：转发原事件、不 panic（落盘面另有 JSONL 整行脱敏兜底）。
+                event.clone()
+            }
+        }
+    }
+}
+
+/// 递归脱敏一个 JSON 值：只替换字符串叶子（对象键是事件字段名，不可能携带密钥），
+/// 数组与对象的形状原样保留。
+fn redact_strings(redactor: &Redactor, value: &mut Value) {
+    match value {
+        Value::String(text) => *text = redactor.redact(text),
+        Value::Array(items) => {
+            for item in items {
+                redact_strings(redactor, item);
+            }
+        }
+        Value::Object(fields) => {
+            for field in fields.values_mut() {
+                redact_strings(redactor, field);
+            }
+        }
+        // 数字 / 布尔 / Null 不带可替换的文本
+        Value::Number(_) | Value::Bool(_) | Value::Null => {}
     }
 }
 
@@ -1071,6 +1114,105 @@ mod tests {
         assert_eq!(report.lines[1]["args"]["command"], json!("echo ***"));
         assert_eq!(report.lines[2]["output"], json!("***\n"));
         assert_eq!(report.outcome.status, RunStatus::Success);
+    }
+
+    /// F1：转发给 sink 的事件（渲染面：CLI 终端 / 将来的 TUI）先过脱敏器——已知密钥不许
+    /// 到达任何 sink 消费者。事件里每一种携带文本的字段都应被替换成 `***`。
+    #[tokio::test]
+    async fn forwarded_events_are_redacted_for_sink_consumers() {
+        let env = Env::new(
+            "sink-redacted",
+            vec![
+                RuntimeEvent::TextDelta {
+                    text: "答复里带 sk-test-secret".into(),
+                },
+                RuntimeEvent::ReasoningDelta {
+                    text: "推理里带 sk-test-secret".into(),
+                },
+                RuntimeEvent::ToolExec {
+                    name: "shell_run".into(),
+                    summary: "Running: echo sk-test-secret".into(),
+                    args: json!({"command": "echo sk-test-secret"}),
+                    call_id: "call_1".into(),
+                },
+                RuntimeEvent::ToolResult {
+                    name: "shell_run".into(),
+                    ok: false,
+                    output: Some("sk-test-secret\n第二行".into()),
+                    call_id: "call_1".into(),
+                },
+                success(Some("ok")),
+            ],
+            Some("sk-test-secret"),
+        );
+
+        let report = env.run(env.request("run")).await;
+
+        assert_eq!(report.forwarded.len(), 5);
+        match &report.forwarded[0] {
+            RuntimeEvent::TextDelta { text } => assert_eq!(text, "答复里带 ***"),
+            other => panic!("第 0 条应为 TextDelta：{other:?}"),
+        }
+        match &report.forwarded[1] {
+            RuntimeEvent::ReasoningDelta { text } => assert_eq!(text, "推理里带 ***"),
+            other => panic!("第 1 条应为 ReasoningDelta：{other:?}"),
+        }
+        match &report.forwarded[2] {
+            RuntimeEvent::ToolExec { summary, args, .. } => {
+                assert_eq!(summary, "Running: echo ***");
+                assert_eq!(args["command"], json!("echo ***"));
+            }
+            other => panic!("第 2 条应为 ToolExec：{other:?}"),
+        }
+        match &report.forwarded[3] {
+            RuntimeEvent::ToolResult { output, .. } => {
+                assert_eq!(output.as_deref(), Some("***\n第二行"));
+            }
+            other => panic!("第 3 条应为 ToolResult：{other:?}"),
+        }
+        // 整体兜底：转发出去的每一条序列化后都不含密钥
+        for event in &report.forwarded {
+            let raw = serde_json::to_string(event).unwrap();
+            assert!(!raw.contains("sk-test-secret"), "{raw}");
+        }
+    }
+
+    /// F1：只替换转发的副本——用量累加、技能去重与工具计数继续读原始事件，记账不因脱敏变形。
+    #[tokio::test]
+    async fn sink_copy_is_redacted_while_bookkeeping_uses_the_original_events() {
+        let env = Env::new(
+            "sink-only",
+            vec![
+                tool_exec("load_skill", json!({ "name": "my-skill" })),
+                tool_exec("shell_run", json!({ "command": "echo sk-test-secret" })),
+                RuntimeEvent::Usage {
+                    input_tokens: 7,
+                    output_tokens: 5,
+                    estimated: false,
+                },
+                success(Some("done")),
+            ],
+            Some("sk-test-secret"),
+        );
+
+        let report = env.run(env.request("run")).await;
+
+        // 记账读原始事件：工具计数仍是 2、`load_skill` 照常记进技能、用量原样累加
+        assert_eq!(report.outcome.tool_calls, 2);
+        assert_eq!(report.outcome.skills_used, ["my-skill"]);
+        assert_eq!(
+            report.outcome.usage,
+            Usage {
+                input_tokens: 7,
+                output_tokens: 5,
+                estimated: false,
+            }
+        );
+        // 同一个环境的 sink 副本里，携带密钥的那条已被替换
+        match &report.forwarded[1] {
+            RuntimeEvent::ToolExec { args, .. } => assert_eq!(args["command"], json!("echo ***")),
+            other => panic!("第 1 条应为 ToolExec：{other:?}"),
+        }
     }
 
     /// M1：`tasks` 列与交给命令层的错误同样要脱敏——`ignis task show/list` 直接打印它们，
