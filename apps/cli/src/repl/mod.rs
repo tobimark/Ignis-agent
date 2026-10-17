@@ -24,7 +24,7 @@ use crate::cli::Cli;
 use crate::commands::slash::{self, Dispatch, Parsed};
 use crate::commands::{Session, kernel_note, spawn_ctrl_c_watcher};
 use crate::editor::raw::{self, RawMode};
-use crate::editor::reader::EditorLineReader;
+use crate::editor::reader::{EditorLineReader, INVALID_WARNING};
 
 /// 提示词（固定文案）。
 const PROMPT: &str = "❯ ";
@@ -50,7 +50,8 @@ impl LineReader for StdinReader {
             return Ok(None); // EOF（Ctrl-D）时读到 0 字节
         };
         if !valid {
-            eprintln!("warning: 输入含非法 UTF-8 字节，已按替换字符处理（检查终端编码或输入法）");
+            // 与编辑器那条路同一份英文文案（界面 chrome；行为不变，只是语言收口）
+            eprintln!("{INVALID_WARNING}");
         }
         Ok(Some(line))
     }

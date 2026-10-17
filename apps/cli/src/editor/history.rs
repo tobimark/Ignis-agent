@@ -44,7 +44,10 @@ impl History {
             Ok(entries) => entries,
             Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(err) => {
-                eprintln!("warning: 读取历史文件 {} 失败：{err}", path.display());
+                eprintln!(
+                    "warning: failed to read history file {}: {err}",
+                    path.display()
+                );
                 Vec::new()
             }
         };
@@ -123,7 +126,10 @@ impl History {
             return;
         };
         if let Err(err) = append_line(path, line) {
-            eprintln!("warning: 写入历史文件 {} 失败：{err}", path.display());
+            eprintln!(
+                "warning: failed to append to history file {}: {err}",
+                path.display()
+            );
         }
     }
 
@@ -133,7 +139,10 @@ impl History {
             return;
         };
         if let Err(err) = rewrite_all(path, &self.entries) {
-            eprintln!("warning: 重写历史文件 {} 失败：{err}", path.display());
+            eprintln!(
+                "warning: failed to rewrite history file {}: {err}",
+                path.display()
+            );
         }
     }
 }

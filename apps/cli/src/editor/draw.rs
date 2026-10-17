@@ -10,13 +10,14 @@
 //! {continuation}第二行\r\n  其余行带续行提示
 //! \x1b[{n}A              光标上移 `行数 - 光标行`
 //! \r                     回到列 0
-//! \x1b[{m}C              光标右移 `display_width(prefix) + 光标行内已显示宽度`
+//! \x1b[{m}C              光标右移 `display_width(光标行的标记) + 光标行内已显示宽度`
 //! ```
 //!
 //! 三条钉死的口径：
 //!
 //! - **列数一律按显示宽度**（`render::width` 的 `display_width` / `char_width`）：`你` 占 2 列，
-//!   按字节数或字符数算都会让中日韩文本的光标错位。
+//!   按字节数或字符数算都会让中日韩文本的光标错位；光标行的标记宽度取该行实际用的那个
+//!   （首行 `prefix`、续行 `continuation`，两者宽度可以不同）。
 //! - **不写行尾填充空格**：旧内容由 `\r\x1b[J` 清掉，每行只画「标记 + 原文」，光标靠相对移动归位。
 //! - **上移/右移次数为 0 时省略整条序列**（防御性：提示符为空且光标在段首）。
 //!
@@ -34,8 +35,8 @@ const CLEAR: &str = "\r\x1b[J";
 /// 拼一帧重绘串：`text` 按 `\n` 拆行（首行 `prefix`、其余行 `continuation`），光标按列数归位。
 ///
 /// `cursor` 是字符下标（与 `state::EditorState::cursor` 同口径）：它在哪一行，帧的最后就把光标
-/// 移到那一行的列 `display_width(prefix) + 光标行内已显示宽度`。`cursor` 超出 `text` 时按末尾
-/// 处理（防御性；状态机不会给出这种下标）。
+/// 移到那一行的列 `display_width(那一行的标记) + 光标行内已显示宽度`（续行用 `continuation` 的
+/// 宽度算，不借前缀的）。`cursor` 超出 `text` 时按末尾处理（防御性；状态机不会给出这种下标）。
 pub fn frame(prefix: &str, continuation: &str, text: &str, cursor: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     let cursor = cursor.min(chars.len());
@@ -72,7 +73,13 @@ pub fn frame(prefix: &str, continuation: &str, text: &str, cursor: usize) -> Str
         out.push_str(&format!("\x1b[{up}A"));
     }
     out.push('\r');
-    let columns = display_width(prefix) + columns_in_line;
+    // 光标行的标记宽度：首行是提示符、其余行是续行提示（两者宽度可以不同，不能拿前缀凑）
+    let marker_width = if row == 0 {
+        display_width(prefix)
+    } else {
+        display_width(continuation)
+    };
+    let columns = marker_width + columns_in_line;
     if columns > 0 {
         out.push_str(&format!("\x1b[{columns}C"));
     }
@@ -145,6 +152,27 @@ mod tests {
         assert_eq!(
             frame("❯ ", CONTINUATION, "ab", 2),
             "\r\u{1b}[J❯ ab\r\n\u{1b}[1A\r\u{1b}[4C"
+        );
+    }
+
+    /// 续行的光标列按**续行标记**的宽度算（P5 的 TUI 会传不同宽度的标记），首行仍用提示符宽度。
+    #[test]
+    fn continuation_rows_use_the_continuation_marker_width() {
+        // 前缀 `❯ ` 2 列、续行 `→→ ` 3 列
+        assert_eq!(
+            frame("❯ ", "→→ ", "a\nbc", 2),
+            "\r\u{1b}[J❯ a\r\n→→ bc\r\n\u{1b}[1A\r\u{1b}[3C",
+            "续行行首的光标列 = 续行标记宽度（3），不是前缀宽度（2）"
+        );
+        // 光标在续行的 `b` 之后：3 + 1 = 4
+        assert_eq!(
+            frame("❯ ", "→→ ", "a\nbc", 3),
+            "\r\u{1b}[J❯ a\r\n→→ bc\r\n\u{1b}[1A\r\u{1b}[4C"
+        );
+        // 首行不受续行宽度影响：2 + 1 = 3
+        assert_eq!(
+            frame("❯ ", "→→ ", "a\nbc", 1),
+            "\r\u{1b}[J❯ a\r\n→→ bc\r\n\u{1b}[2A\r\u{1b}[3C"
         );
     }
 

@@ -391,12 +391,13 @@ fn pty_tab_completes_a_unique_prefix_and_lists_candidates() {
     pty.expect("INTERFACE"); // `/help` 的分组标题
     pty.expect("/kernel [name]"); // `/help` 的命令行
 
-    pty.send("/\t"); // 行首 `/` 有多个候选：列出行
     // 候选列表的内容与上面 `/help` 的输出逐字相同，`Pty::expect` 从流头重扫就会被那一份满足
-    // （列表不渲染也绿）：先记下流长，只在 `/\t` 之后新写出的字节里找（见 [`expect_after_offset`]）。
+    // （列表不渲染也绿）：**发送前**记下流长，只在 `/\t` 之后新写出的字节里找（见
+    // [`expect_after_offset`]；偏移取在发送之前，发送到快照之间写出的候选不会被漏掉）。
     // `/kernel [name]` 是 `/help` 的最后一行，它之后 CLI 写过的只有那一行的尾巴与提示符帧，
     // 两者都不含这两个 needle——晚到的旧输出替不了列表。
     let offset = pty.output().len();
+    pty.send("/\t"); // 行首 `/` 有多个候选：列出行
     expect_after_offset(&pty, offset, "/memory");
     expect_after_offset(&pty, offset, "INTELLIGENCE");
 

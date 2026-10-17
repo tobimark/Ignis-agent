@@ -15,6 +15,8 @@
 //! - **Tab**：不交给状态机（它不认识候选），走 [`slash::complete`]。
 //! - **跨提交边界的按键**：一次读取可能同时装下「提交」与它后面的按键（快速输入、粘贴后紧跟
 //!   回车），回车之后的按键存进队列，由下一次 `read_line` 处理——读进来的按键一个都不许丢。
+//! - **按批重绘**：一次读取解出的按键在同一批里处理完，`Event::Redraw` 合并为**至多一帧**
+//!   （粘贴 N 个字符不再写 N 帧）；提交与 EOF 仍当场落笔并返回。
 //! - **raw mode 按读取区间启用**：[`EditorLineReader::read_line`] 进入时进 raw mode、返回前
 //!   析构守卫还原（每一条路径都还原：提交、EOF、错误）——任务执行与交互审批（`InteractiveApproval`
 //!   的按行读）期间终端必须回到 canonical/echo，否则审批提示永远等不到一行、输入也不回显。
@@ -32,8 +34,9 @@ use super::state::{EditorState, Event};
 use crate::commands::slash::{self, Completion};
 use crate::repl::LineReader;
 
-/// 非法 UTF-8 的一行告警（英文 chrome；一次读取至多打一次，取走即清零在解码器里）。
-const INVALID_WARNING: &str = "warning: input contained invalid UTF-8 bytes; replaced with the replacement character (check your terminal encoding or input method)";
+/// 非法 UTF-8 的一行告警（英文 chrome）：编辑器按读取区间至多打一次，v0.1 的回退路径
+/// （[`crate::repl::StdinReader`]）共用同一份文案。
+pub(crate) const INVALID_WARNING: &str = "warning: input contained invalid UTF-8 bytes; replaced with the replacement character (check your terminal encoding or input method)";
 
 /// 清掉当前输入行并回到行首：`\r` 回列 0，`\x1b[J` 从光标清到屏幕底（与帧的开头同形）。
 const CLEAR_LINE: &[u8] = b"\r\x1b[J";
@@ -70,46 +73,52 @@ impl<R: Read, W: Write> EditorReader<R, W> {
         }
     }
 
-    /// 读一行：先画提示符，然后按「读一段字节 → 解成按键 → 逐个交给状态机」的事件循环走。
+    /// 读一行：先画提示符，然后按「取一批按键 → 交给状态机 → 至多重绘一帧」的事件循环走。
     ///
     /// - 提交：把整段文本留在屏幕上（光标在末尾的一帧）再补 `\r\n`，返回 `Ok(Some(text))`；
     /// - `Ctrl+D`（空缓冲）与「读到 0 字节」：返回 `Ok(None)`，且不补换行；
     /// - `ErrorKind::Interrupted`：继续读，不是错误（raw mode 下的阻塞读会被信号打断）；
-    /// - 非法 UTF-8：清掉输入行 → 一行告警 → 照常重绘。
+    /// - 非法 UTF-8：清掉输入行 → 一行告警 → 照常重绘；
+    /// - 一批里的多个重绘请求只落一帧（见模块文档「按批重绘」），提交/EOF 仍当场落笔。
     pub fn read_line(&mut self, prompt: &str) -> io::Result<Option<String>> {
         self.draw(prompt)?;
         loop {
-            // 上一次读取跨过提交边界时留下的按键先处理（提示符已经画好）
-            while let Some(key) = self.pending.pop_front() {
-                match self.key_step(prompt, key)? {
-                    Done::Quiet | Done::Drawn => {}
-                    Done::Submit(text) => return Ok(Some(text)),
-                    Done::Eof => return Ok(None),
-                }
-            }
+            // 这一批要处理的按键：上一次读取跨过提交边界留下的先来（提示符已经画好），
+            // 队列空了才去读一段新字节。
+            let (keys, invalid) = if self.pending.is_empty() {
+                let mut bytes = [0u8; READ_CHUNK];
+                let read = match self.input.read(&mut bytes) {
+                    // EOF / 对端关闭：与 Ctrl+D 同一条路（REPL 自己补换行）
+                    Ok(0) => return Ok(None),
+                    Ok(read) => read,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                };
 
-            let mut bytes = [0u8; READ_CHUNK];
-            let read = match self.input.read(&mut bytes) {
-                // EOF / 对端关闭：与 Ctrl+D 同一条路（REPL 自己补换行）
-                Ok(0) => return Ok(None),
-                Ok(read) => read,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
+                let keys = self.decoder.feed(&bytes[..read]);
+                let invalid = self.decoder.take_invalid();
+                if invalid {
+                    // 告警要落在输入行原来的位置上，所以先清掉它；替换字符已经由解码器插进
+                    // 按键流，批末重绘时会把它一起画出来。
+                    self.warn_invalid()?;
+                }
+                (keys, invalid)
+            } else {
+                (self.pending.drain(..).collect(), false)
             };
 
-            let keys = self.decoder.feed(&bytes[..read]);
-            let invalid = self.decoder.take_invalid();
-            if invalid {
-                // 告警要落在输入行原来的位置上，所以先清掉它；替换字符已经由解码器插进按键流，
-                // 下面照常重绘时会把它一起画出来。
-                self.warn_invalid()?;
-            }
-
-            let mut redrawn = false;
+            // 按批合并重绘：批里有一个按键请求重绘，就在批末画一帧（不是每个按键一帧）。
+            let mut redraw = false;
+            // Tab 的多候选列表已经当场把输入行画回来了：它之后的合并重绘从此刻重新计数。
+            let mut listed = false;
             for (index, key) in keys.iter().enumerate() {
                 match self.key_step(prompt, *key)? {
                     Done::Quiet => {}
-                    Done::Drawn => redrawn = true,
+                    Done::Redraw => redraw = true,
+                    Done::Listed => {
+                        redraw = false;
+                        listed = true;
+                    }
                     Done::Submit(text) => {
                         // 这次读取里回车之后的按键留给下一次 `read_line`（读进来的键一个都不许丢）
                         self.pending.extend(keys[index + 1..].iter().copied());
@@ -121,30 +130,32 @@ impl<R: Read, W: Write> EditorReader<R, W> {
                     }
                 }
             }
-            if invalid && !redrawn {
-                // 告警把输入行清掉了，而这一批按键一个重绘都没触发：补一帧，否则输入行会一直空着
-                // 等下一个按键（替换字符的插入本来就会重绘，这条只是兜底）。
+            if redraw || (invalid && !listed) {
+                // 后半句是兜底：告警把输入行清掉了，而这一批按键一个重绘都没触发——补一帧，
+                // 否则输入行会一直空着等下一个按键（替换字符的插入本来就会请求重绘）。
                 self.draw(prompt)?;
             }
         }
     }
 
     /// 处理一个按键，返回它把这次读取带向哪里：Tab 走补全，其余交给状态机。
+    ///
+    /// 这里只**记录**重绘请求（[`Done::Redraw`]）：落笔由 `read_line` 在批末合并，保证一次
+    /// 读取里的 N 个字符至多写一帧。
     fn key_step(&mut self, prompt: &str, key: Key) -> io::Result<Done> {
         // Tab 不交给状态机（它不认识候选）：补全的结果由这一层落地，所以状态机里那条
         // 「Tab 是 Idle」的分支只在它自己的单测里走到。
         if key == Key::Tab {
             return match slash::complete(&self.state.text()) {
-                // 唯一候选：整行换成它、光标落到末尾
+                // 唯一候选：整行换成它、光标落到末尾（重绘合并到批末）
                 Completion::Accepted(text) => {
                     self.state.replace(&text);
-                    self.draw(prompt)?;
-                    Ok(Done::Drawn)
+                    Ok(Done::Redraw)
                 }
                 // 多候选：清掉输入行、逐行列出、再把输入行画回来（缓冲不变）
                 Completion::Listing(lines) => {
                     self.write_listing(prompt, &lines)?;
-                    Ok(Done::Drawn)
+                    Ok(Done::Listed)
                 }
                 // 没有候选：什么都不写
                 Completion::None => Ok(Done::Quiet),
@@ -152,10 +163,7 @@ impl<R: Read, W: Write> EditorReader<R, W> {
         }
         Ok(match self.state.handle(key) {
             Event::Idle => Done::Quiet,
-            Event::Redraw => {
-                self.draw(prompt)?;
-                Done::Drawn
-            }
+            Event::Redraw => Done::Redraw,
             // 缓冲已经清了：「光标在末尾」的那一帧要用事件里的文本画
             Event::Submit(text) => {
                 self.finish_submit(prompt, &text)?;
@@ -209,8 +217,10 @@ impl<R: Read, W: Write> EditorReader<R, W> {
 enum Done {
     /// 继续读：这个按键没有改屏幕（空操作、没有候选的 Tab）。
     Quiet,
-    /// 继续读：这个按键写过屏幕（重绘帧或候选列表）。
-    Drawn,
+    /// 继续读：这个按键请求重绘（合并到这一批的最后一次绘制，见 `read_line`）。
+    Redraw,
+    /// 继续读：Tab 的多候选列表已经当场写出（含输入行一帧），本批的合并重绘重新计数。
+    Listed,
     /// 提交：`read_line` 返回 `Ok(Some(text))`。
     Submit(String),
     /// EOF：`read_line` 返回 `Ok(None)`。
@@ -439,6 +449,30 @@ mod tests {
 
         let error = reader.read_line(PROMPT).expect_err("读取失败必须上抛");
         assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+    }
+
+    /// 一次读取里的多个按键只落一帧：长粘贴不得按字符数写出 N 帧（按键重绘按读取区间合并）。
+    #[test]
+    fn one_read_batch_writes_at_most_one_redraw_frame() {
+        let dir = TempDir::new("batch");
+        // 50 个字符一次读完（没有回车：下一次读取是 EOF）
+        let text = "a".repeat(50);
+        let (mut reader, out) = editor(text.as_bytes(), &dir.history_path());
+
+        assert_eq!(
+            reader.read_line(PROMPT).unwrap(),
+            None,
+            "没有回车就没有提交"
+        );
+
+        let written = out.text();
+        // 帧的开头都是 `\r\x1b[J`：提示符一帧 + 这批按键合并成一帧
+        let frames = written.matches("\r\u{1b}[J").count();
+        assert_eq!(frames, 2, "50 个字符只该写两帧：{written:?}");
+        assert!(
+            written.ends_with(&draw::frame(PROMPT, CONTINUATION, &text, 50)),
+            "合并的那一帧要画全部 50 个字符：{written:?}"
+        );
     }
 
     /// 粘贴区间里的换行只进缓冲：一段粘贴提交一次，内部换行原样保留（续行提示符画出来）。
