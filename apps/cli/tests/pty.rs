@@ -1,14 +1,18 @@
 //! REPL 的 pty 冒烟用例：真二进制 + 真终端（[`common::pty`]）+ 脚本化假模型。
 //!
-//! 四条纪律：
+//! 五条纪律：
 //!
-//! - **脚本一律纯文本步**：pty 里 stdin 是 tty，带上工具调用就会把审批变成交互提问；
+//! - **工具调用只出现在交互审批那一例**（[`pty_interactive_approval_prompt_works_under_the_editor`]）：
+//!   pty 里 stdin 是 tty，带工具调用的脚本会走交互审批提问——别的用例一律纯文本步，免得把
+//!   审批输出混进要断言的流里；
 //! - **home/workspace 都建在用例自己的 `TempDir` 里**，绝不碰真实的 `~/.ignis`；
 //! - **假模型句柄持有到用例结束**：`ScriptedModelHandle::drop` 停服务，`Pty::drop` 杀子进程
 //!   （用例不主动退出 REPL 的那几条靠它收尾）；
 //! - **打字前先等提示符**：raw mode 生效之前，`\r` 会被行规范译成 `\n`（Enter 变成「插换行」），
 //!   而且输入行会由终端回显、与 `ignis` 自己的重绘叠在一起——这几条用例断言的是编辑器画出的
-//!   那一份；
+//!   那一份。raw 只在**读取区间**里生效（任务运行与审批期间终端回到 canonical + echo），
+//!   所以任务结束后也要先等新的提示符帧（[`wait_for_prompt_after`]）再发按键：任务期间送进
+//!   去的字节由行规范处理——未成行的输入要等换行、Ctrl-D 直接被吃成 EOF 不留给编辑器；
 //! - **位置敏感的断言看「标记之后」**：`Pty::expect` 每次从流头重扫，拿已经出现过的串当断言会
 //!   假命中（按 ↑ 召回的「❯ 第二次」在提交那一帧就出现过），所以那一类走 [`expect_after`]；
 //!   补全的候选列表与 `/help` 的输出**逐字相同**，认不出标记，那一类走 [`expect_after_offset`]
@@ -24,7 +28,7 @@ use std::time::{Duration, Instant};
 use common::TempDir;
 use common::pty::{PTY_TIMEOUT, Pty, PtyOptions};
 use ignis_runtime::test_support::{ScriptStep, ScriptedModel, ScriptedModelHandle};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// 位置敏感断言与请求计数的复查间隔（与夹具的 `expect` 同一条 20ms 轮询口径）。
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -97,6 +101,15 @@ fn expect_after(pty: &Pty, marker: &str, needle: &str) {
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// 等编辑器重新接管提示符：任务运行期间终端是 canonical（raw 只在读取区间里生效），这期间
+/// 送进去的字节由行规范吃掉——没等到新提示符就发 Ctrl-D 会得到「什么都没发生」。
+///
+/// 提示符帧由编辑器在进入 raw mode **之后**画出，所以「`marker` 之后出现 `❯ `」= 下一次读取
+/// 已经开始、raw 已重新生效。
+fn wait_for_prompt_after(pty: &Pty, marker: &str) {
+    expect_after(pty, marker, "❯ ");
 }
 
 /// `marker` 最后一次出现之后的输出（位置敏感断言的现场；`marker` 没出现就用例失败）。
@@ -189,6 +202,7 @@ fn pty_unknown_command_is_rejected_locally_and_never_reaches_the_model() {
     pty.send("/nope\r");
     pty.expect("Unknown command: /nope — /help lists commands");
 
+    wait_for_prompt_after(&pty, "Unknown command: /nope");
     pty.send("\x04"); // 空缓冲的 Ctrl-D = EOF，干净退出
     let code = pty.wait();
     assert_eq!(code, 0, "Ctrl-D 应以 0 退出：\n{}", pty.output());
@@ -266,6 +280,7 @@ fn pty_ctrl_j_edits_a_multi_line_prompt_and_submits_once() {
         "整段两行文本原样交给内核"
     );
 
+    wait_for_prompt_after(&pty, "● Done");
     pty.send("\x04");
     assert_eq!(pty.wait(), 0, "Ctrl-D 应以 0 退出：\n{}", pty.output());
 }
@@ -314,6 +329,7 @@ fn pty_long_paste_does_not_submit_until_enter() {
         "正文 = 粘贴内容剔除 ESC 控制字节后逐字相等"
     );
 
+    wait_for_prompt_after(&pty, "● Done");
     pty.send("\x04");
     assert_eq!(pty.wait(), 0, "Ctrl-D 应以 0 退出：\n{}", pty.output());
 }
@@ -347,7 +363,7 @@ fn pty_up_arrow_recalls_history_and_restores_the_draft() {
     pty.send("\x15"); // Ctrl+U 清掉草稿
     pty.send("第三次\r");
 
-    // 脚本到此用尽（第三次的回答是 500，无关紧要）：断言的是这次提交发出去的正文
+    // 脚本到此用尽：第三次请求会以 500 结束（重试退避合计约 4s）：断言的是这次提交发出去的正文
     let requests = wait_for_requests(&model, 3);
     assert_eq!(
         last_user_message(&requests[2]),
@@ -355,6 +371,8 @@ fn pty_up_arrow_recalls_history_and_restores_the_draft() {
         "Ctrl+U 之后提交的是新输入，不是召回的历史"
     );
 
+    // 第三次任务还在跑（终端是 canonical），等它结束、编辑器重新接管提示符再退出
+    wait_for_prompt_after(&pty, "第三次");
     pty.send("\x04");
     assert_eq!(pty.wait(), 0, "Ctrl-D 应以 0 退出：\n{}", pty.output());
 }
@@ -392,6 +410,7 @@ fn pty_tab_completes_a_unique_prefix_and_lists_candidates() {
         model.requests()
     );
 
+    wait_for_prompt_after(&pty, "Unknown command: /nope");
     pty.send("\x04");
     assert_eq!(pty.wait(), 0, "Ctrl-D 应以 0 退出：\n{}", pty.output());
 }
@@ -433,6 +452,8 @@ fn pty_details_and_model_change_the_next_turn() {
         "会话级模型覆盖要落到下一轮请求体里"
     );
 
+    // 第二轮还在跑（终端是 canonical），等编辑器重新接管提示符再退出
+    wait_for_prompt_after(&pty, "第二句");
     pty.send("\x04");
     assert_eq!(pty.wait(), 0, "Ctrl-D 应以 0 退出：\n{}", pty.output());
 }
@@ -452,6 +473,50 @@ fn pty_dumb_terminal_falls_back_to_line_mode() {
     // 行规范下由终端回显输入，模型的答复走同一条从端：两个都在这一条流里
     pty.expect("答复");
 
+    // 任务可能还没结束（回退路径全程 canonical），等提示符回来再退出
+    wait_for_prompt_after(&pty, "答复");
+    pty.send("\x04");
+    assert_eq!(pty.wait(), 0, "Ctrl-D 应以 0 退出：\n{}", pty.output());
+}
+
+/// 交互审批必须在编辑器下可用（终审 Critical 1 的回归门）：编辑器的 raw mode 只在「读取区间」
+/// 里生效，任务执行（含审批提问）期间终端回到 canonical + echo，审批的按行读等得到回车。
+#[test]
+fn pty_interactive_approval_prompt_works_under_the_editor() {
+    let (mut pty, dir, model) = spawn_repl(
+        "pty-approval",
+        vec![
+            common::tool_call(
+                "fs_write",
+                json!({"path":"approval-test.txt","content":"ok"}),
+            ),
+            ScriptStep::Text("ok".to_string()),
+        ],
+    );
+
+    pty.expect("❯ ");
+    pty.send("写一个文件\r");
+
+    // `fs_write` 是 Ask：交互审批提问 + 读一行；raw mode 若跨读取存活，这一行永远等不到
+    pty.expect("Approval required");
+    pty.send("a\r");
+    pty.expect("● Done");
+
+    let written = dir.join("workspace").join("approval-test.txt");
+    assert!(
+        written.exists(),
+        "审批通过后文件必须写进工作区：{}",
+        pty.output()
+    );
+    assert_eq!(
+        model.requests().len(),
+        2,
+        "工具调用一轮 + 结果回灌一轮：{:#?}",
+        model.requests()
+    );
+
+    // 任务结束后编辑器重新接管提示符，Ctrl-D 干净退出
+    wait_for_prompt_after(&pty, "● Done");
     pty.send("\x04");
     assert_eq!(pty.wait(), 0, "Ctrl-D 应以 0 退出：\n{}", pty.output());
 }

@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use crate::cli::Cli;
 use crate::commands::slash::{self, Dispatch, Parsed};
 use crate::commands::{Session, kernel_note, spawn_ctrl_c_watcher};
-use crate::editor::raw::RawMode;
+use crate::editor::raw::{self, RawMode};
 use crate::editor::reader::EditorLineReader;
 
 /// 提示词（固定文案）。
@@ -83,48 +83,53 @@ pub fn banner_lines(
     lines
 }
 
-/// 回退按行输入时的一行说明（英文 chrome；`reason` 来自 [`choose_reader`] 的第三个返回值）。
+/// 回退按行输入时的一行说明（英文 chrome；`reason` 来自 [`choose_reader`] 的第二个返回值）。
 pub fn fallback_note(reason: &str) -> String {
     format!("note: line editing unavailable ({reason}); using plain line input")
 }
 
 /// 选读取层：终端能承载转义重绘就用行编辑器，否则回退 v0.1 的按行输入。
 ///
-/// 返回 `(读取层, raw mode 守卫, 回退理由)`：编辑器那条路给守卫、理由为空；回退那条路没有守卫、
-/// 理由非空（调用方用 [`fallback_note`] 打印它）。**守卫由调用方持有**，理由见 [`run`] 里的说明。
-pub fn choose_reader(
-    history_path: PathBuf,
-) -> (Arc<dyn LineReader>, Option<RawMode>, Option<String>) {
+/// 返回 `(读取层, 回退理由)`：编辑器那条路理由为空；回退那条路理由非空（调用方用
+/// [`fallback_note`] 打印它）。raw mode 的探针只进入一次就立刻析构还原——真正的守卫由
+/// `EditorLineReader::read_line` 按读取区间进出（任务执行与审批期间终端必须是 canonical/echo）。
+pub fn choose_reader(history_path: PathBuf) -> (Arc<dyn LineReader>, Option<String>) {
     choose_reader_with(
         history_path,
         std::env::var_os("TERM").as_deref(),
+        io::stdout().is_terminal(),
         RawMode::enable,
     )
 }
 
-/// 带 `TERM` 与 termios 注入的变体（与 `raw::RawMode::supported` 同一手法）：用例因此不必改进程
-/// 环境、也不必真的 tty（测试可并行）。
+/// 带 `TERM` / stdout-tty / termios 注入的变体（与 `raw::RawMode::supported` 同一手法）：用例
+/// 因此不必改进程环境、也不必真的 tty（测试可并行）。
 fn choose_reader_with(
     history_path: PathBuf,
     term: Option<&OsStr>,
+    stdout_is_terminal: bool,
     enable: impl FnOnce() -> io::Result<RawMode>,
-) -> (Arc<dyn LineReader>, Option<RawMode>, Option<String>) {
+) -> (Arc<dyn LineReader>, Option<String>) {
     // 哑终端（`TERM` 缺失、空串或 `dumb`）上转义重绘会把屏幕打花：宁可少功能，直接回退
     if !RawMode::supported(term) {
+        return (Arc::new(StdinReader), Some("TERM is dumb".to_string()));
+    }
+    // 编辑器只在终端上重绘：stdout 是管道/文件（`ignis > log`）时回退行模式，
+    // 否则帧的转义序列会原样写进日志
+    if !stdout_is_terminal {
         return (
             Arc::new(StdinReader),
-            None,
-            Some("TERM is dumb".to_string()),
+            Some("stdout is not a terminal".to_string()),
         );
     }
     match enable() {
-        Ok(guard) => (
-            Arc::new(EditorLineReader::new(history_path)),
-            Some(guard),
-            None,
-        ),
+        // 探针只问「进得去吗」：守卫立刻析构还原，终端不在这里停留
+        Ok(guard) => {
+            drop(guard);
+            (Arc::new(EditorLineReader::new(history_path)), None)
+        }
         // termios 进不去（不是 tty、已关闭）：理由就是错误本身，整句由 `fallback_note` 拼
-        Err(error) => (Arc::new(StdinReader), None, Some(error.to_string())),
+        Err(error) => (Arc::new(StdinReader), Some(error.to_string())),
     }
 }
 
@@ -155,17 +160,24 @@ pub async fn run(cli: &Cli) -> Result<ExitCode> {
     }
 
     // 读取层：终端能承载转义重绘就用行编辑器（历史落在 `IGNIS_HOME`/history，目录已由 `Session::new`
-    // 里的 `ensure_home` 建好），否则回退 v0.1 的按行输入并说明一句。
-    //
-    // **guard 必须留在本函数里**：每次读取都在 `next_line` 起的脱离线程里跑，线程持有一份
-    // `Arc<dyn LineReader>` 克隆；把守卫放进读取层的话，它会跟着那份克隆卡在阻塞读里永不析构
-    // ——用户退出后回到 shell 会没有回显。放在这里则 `run` 的每一条退出路径（`?` 提前返回、
-    // 空闲 Ctrl-C、Ctrl-D、`/exit`）都会析构它、把 termios 原样还原。
-    let (reader, _raw_guard, fallback) = choose_reader(ignis_home().join("history"));
+    // 里的 `ensure_home` 建好），否则回退 v0.1 的按行输入并说明一句。raw mode 的守卫不在这里
+    // 跨读取持有：它在 `EditorLineReader::read_line` 里按读取区间进出，任务执行与审批期间
+    // 终端必须是 canonical/echo（审批提示的按行读在 raw mode 下永远等不到一行）。
+    let (reader, fallback) = choose_reader(ignis_home().join("history"));
     if let Some(reason) = fallback.as_deref() {
         println!("{}", fallback_note(reason));
     }
 
+    let outcome = repl_loop(&mut session, reader).await;
+    // 退出兜底：读取跑在 `next_line` 起的脱离线程里，空闲 Ctrl-C 退出时那条线程还阻塞在
+    // `read` 上握着 raw mode 守卫，进程退出不会析构它——按 `editor::raw` 记录的现场做一次
+    // best-effort 还原（没有活跃守卫时是无操作），用户的 shell 不会没回显。
+    raw::restore_terminal();
+    outcome
+}
+
+/// REPL 主循环：读取 → 本地分类 → 命令分发 / 任务；返回值原样交回 [`run`]。
+async fn repl_loop(session: &mut Session, reader: Arc<dyn LineReader>) -> Result<ExitCode> {
     // 跨轮上下文：每次任务结束后换成 `outcome.messages`，内核只带回了最终答复
     let mut history: Vec<ChatMessage> = Vec::new();
 
@@ -193,7 +205,7 @@ pub async fn run(cli: &Cli) -> Result<ExitCode> {
         match slash::parse(&line) {
             Parsed::Empty => {}
             Parsed::Unknown(name) => eprintln!("{}", slash::unknown_command_line(&name)),
-            Parsed::Command(command, args) => match slash::dispatch(&mut session, command, &args) {
+            Parsed::Command(command, args) => match slash::dispatch(session, command, &args) {
                 Ok(Dispatch::Exit) => return Ok(ExitCode::SUCCESS),
                 Ok(Dispatch::Lines(lines)) => {
                     for line in lines {
@@ -251,13 +263,14 @@ mod tests {
     /// `TERM` 缺失 / `dumb` / 空：不碰 termios，回退 v0.1 的按行输入并给理由。
     #[test]
     fn choose_reader_falls_back_when_term_is_dumb() {
-        // 回退路径根本不碰历史，这里只是给一个不指向真实 `~/.ignis` 的占位路径
+        // 回退路径根本不碰历史，这里只是给一个不指向真实 `~/.ignis` 的占位路径；
+        // 探针也不该被调用（否则就不是「不碰 termios」了）
         let history = std::env::temp_dir().join("ignis-cli-repl-fallback-history");
 
         for term in [None, Some(OsStr::new("dumb")), Some(OsStr::new(""))] {
-            let (_reader, guard, reason) =
-                choose_reader_with(history.clone(), term, RawMode::enable);
-            assert!(guard.is_none(), "{term:?} 不该进 raw mode");
+            let (_reader, reason) = choose_reader_with(history.clone(), term, true, || {
+                panic!("{term:?} 是哑终端：不该进 raw mode")
+            });
             let reason = reason.expect("回退必须给理由");
             assert_eq!(reason, "TERM is dumb");
             assert_eq!(
@@ -267,17 +280,31 @@ mod tests {
         }
     }
 
+    /// stdout 不是 tty（`ignis > log`）：转义重绘会原样写进日志，回退行模式，探针同样不跑。
+    #[test]
+    fn choose_reader_falls_back_when_stdout_is_not_a_terminal() {
+        let history = std::env::temp_dir().join("ignis-cli-repl-stdout-history");
+        let (_reader, reason) = choose_reader_with(
+            history,
+            Some(OsStr::new("xterm-256color")),
+            false,
+            || -> io::Result<RawMode> { Err(io::Error::other("探针不该被调用")) },
+        );
+
+        assert_eq!(reason.as_deref(), Some("stdout is not a terminal"));
+    }
+
     /// termios 进不去 raw mode（不是 tty、已关闭）：同样回退，理由取错误的文本。
     #[test]
     fn choose_reader_falls_back_when_termios_fails() {
         let history = std::env::temp_dir().join("ignis-cli-repl-termios-history");
-        let (_reader, guard, reason) = choose_reader_with(
+        let (_reader, reason) = choose_reader_with(
             history,
             Some(OsStr::new("xterm-256color")),
+            true,
             || -> io::Result<RawMode> { Err(io::Error::other("不是 tty")) },
         );
 
-        assert!(guard.is_none(), "进不去 raw mode 就不能用编辑器");
         assert_eq!(reason.as_deref(), Some("不是 tty"));
     }
 

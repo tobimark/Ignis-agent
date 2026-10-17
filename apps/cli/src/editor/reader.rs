@@ -15,6 +15,9 @@
 //! - **Tab**：不交给状态机（它不认识候选），走 [`slash::complete`]。
 //! - **跨提交边界的按键**：一次读取可能同时装下「提交」与它后面的按键（快速输入、粘贴后紧跟
 //!   回车），回车之后的按键存进队列，由下一次 `read_line` 处理——读进来的按键一个都不许丢。
+//! - **raw mode 按读取区间启用**：[`EditorLineReader::read_line`] 进入时进 raw mode、返回前
+//!   析构守卫还原（每一条路径都还原：提交、EOF、错误）——任务执行与交互审批（`InteractiveApproval`
+//!   的按行读）期间终端必须回到 canonical/echo，否则审批提示永远等不到一行、输入也不回显。
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -24,6 +27,7 @@ use std::sync::Mutex;
 use super::draw::{self, CONTINUATION};
 use super::history::History;
 use super::keys::{Decoder, Key};
+use super::raw::RawMode;
 use super::state::{EditorState, Event};
 use crate::commands::slash::{self, Completion};
 use crate::repl::LineReader;
@@ -223,7 +227,8 @@ pub struct EditorLineReader {
 }
 
 impl EditorLineReader {
-    /// 用真实终端与给定的历史文件路径装配（终端形态由调用方先切好：见 `raw::RawMode`）。
+    /// 用真实终端与给定的历史文件路径装配（raw mode 由 [`LineReader::read_line`] 按读取
+    /// 区间自己进出，见 `editor::raw`）。
     pub fn new(history_path: PathBuf) -> EditorLineReader {
         EditorLineReader {
             inner: Mutex::new(EditorReader::new(io::stdin(), io::stdout(), history_path)),
@@ -233,13 +238,24 @@ impl EditorLineReader {
 
 impl LineReader for EditorLineReader {
     /// 提示符由编辑器自己画（REPL 把 `repl::PROMPT` 原样传进来）。
+    ///
+    /// **raw mode 只在本调用期间生效**：进入时 `RawMode::enable`、返回前守卫析构还原，提交、
+    /// EOF、错误三条路径都一样。守卫绝不跨读取存活（也不能存进共享状态：每次读取都在脱离
+    /// 线程里跑，守卫会被卡在阻塞读里永不析构）——任务执行与交互审批因此都在 canonical/echo
+    /// 下运行，`InteractiveApproval` 的按行读等得到回车。
     fn read_line(&self, prompt: &str) -> io::Result<Option<String>> {
-        match self.inner.lock() {
-            Ok(mut editor) => editor.read_line(prompt),
+        let mut editor = match self.inner.lock() {
             // 锁中毒（上一次读取 panic 过）时不能让 REPL 卡死，也不该在这里 panic：
-            // 按读取失败交回，主循环会带着守卫把会话干净地结束掉。
-            Err(_) => Err(io::Error::other("line editor lock poisoned")),
-        }
+            // 按读取失败交回，主循环会把会话干净地结束掉。
+            Ok(editor) => editor,
+            Err(_) => return Err(io::Error::other("line editor lock poisoned")),
+        };
+        // 进不了 raw mode（终端被关掉等）照实上抛：REPL 带着错误结束会话，不硬撑一个
+        // 「按键不回显、Enter 不提交」的编辑器。
+        let _raw = RawMode::enable().map_err(|error| {
+            io::Error::new(error.kind(), format!("failed to enable raw mode: {error}"))
+        })?;
+        editor.read_line(prompt)
     }
 }
 
