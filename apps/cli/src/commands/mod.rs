@@ -25,10 +25,13 @@ use ignis_core::alerts::{MultiNotifier, Notifier};
 use ignis_core::config::{Config, OutputMode, ensure_home, ignis_home, load_config};
 use ignis_core::memory::MemoryStore;
 use ignis_core::security::{ApprovalMode, Policy};
-use ignis_core::session::{HistoryMessage, SessionStore};
+use ignis_core::session::{
+    COMPACT_KEEP_TURNS, EARLIER_SUMMARY_PREFIX, HistoryMessage, SessionStore, render_transcript,
+    split_turns, summarize_turns,
+};
 use ignis_core::skills::SkillCatalog;
 use ignis_core::task::{PromptStats, TaskKind, TaskOutcome, TaskRequest, TaskRunner};
-use ignis_runtime::{ApprovalHandler, ChatMessage, RunStatus, Usage};
+use ignis_runtime::{ApprovalHandler, ChatMessage, Role, RunStatus, Usage};
 use ignis_storage::{Db, SessionSummary};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -418,6 +421,77 @@ impl Session {
             .map_err(|error| error.to_string())
     }
 
+    /// `/compact`：把有效历史里较早的轮次摘要化（设计 §6.7、决策 #20）。
+    ///
+    /// 检查顺序即错误优先级（测试锁定）：
+    /// 1. 当前内核不是 native、或没有 Ignis 凭据 → 凭据错误（外置内核不提供摘要所需的凭据）；
+    /// 2. 还没绑定会话 → `compact: no session yet`；
+    /// 3. 有效历史的 user 消息 ≤ [`COMPACT_KEEP_TURNS`] 条（没有可压段）→
+    ///    `Ok(["compact: nothing to compact"])`——普通回显，不是错误；
+    /// 4. 否则把被压缩段渲染成一次**无工具**的 native 请求交给模型，成功后落一条 compaction 记录、
+    ///    把内存历史重建为「摘要消息 + 保留段」、清掉组装统计（下一次组装会重算；用量保持最近一轮的
+    ///    真实值），返回回显行。
+    ///
+    /// 切分读的是 `store().effective_history(id)`——库里的 canonical 视图：某一轮的 append 被
+    /// fail-soft 跳过时，内存历史可能比库里更富，压缩**有意**以这份持久化视图为准重建，否则切点算错
+    /// 会让恢复后读到的历史与压缩时的不一致（内存里的富余消息会被下一次成功落库补齐）。
+    ///
+    /// 模型失败 → `Err`（REPL 打 `error: …`）且**不改任何状态**：不落 compaction、不动 `history`；
+    /// `session_messages` 的原始行**永不删除**——有效历史只是重建出来的视图。
+    pub async fn compact(&mut self) -> Result<Vec<String>, String> {
+        // 1. 摘要要用一次 native 请求：外置内核与没有 Ignis 凭据的会话都不具备
+        if !self.is_native() || !self.has_credentials() {
+            return Err(
+                "compact requires native kernel credentials (current kernel does not provide them)"
+                    .to_string(),
+            );
+        }
+        // 2. 没有会话就没有可压的历史
+        let Some(id) = self.current_session.clone() else {
+            return Err("compact: no session yet".to_string());
+        };
+        // 3. 库里的 canonical 视图切出「较旧轮次」；不足 keep 轮时没有可压段
+        let messages = self
+            .store()
+            .effective_history(&id)
+            .map_err(|error| error.to_string())?;
+        let (older, retained) = split_turns(&messages, COMPACT_KEEP_TURNS);
+        let Some(last_compacted) = older.last() else {
+            return Ok(vec![slash::compact_nothing_line()]);
+        };
+        // 被压缩段的上界：摘要消息的 seq 与后续切点都按它算
+        let upto_seq = last_compacted.seq;
+
+        // 4. 一次无工具的 native 请求（会话级模型覆盖经 `effective_config` 对摘要同样生效）
+        let config = self.effective_config();
+        let transcript = render_transcript(&older);
+        let runtime = mk_runtime(NATIVE_KERNEL, &config, &self.workspace)?;
+        let summary = summarize_turns(runtime, &config, &transcript, CancellationToken::new())
+            .await
+            .map_err(|error| error.to_string())?;
+
+        // 成功才动状态：先落库（重建视图的起点），再把内存历史换成「摘要消息 + 保留段」。
+        // 摘要消息的正文用与 `effective_history` 同一份常量拼法。
+        self.store()
+            .record_compaction(&id, upto_seq, &summary)
+            .map_err(|error| error.to_string())?;
+        let mut history = Vec::with_capacity(retained.len() + 1);
+        history.push(ChatMessage {
+            role: Role::User,
+            content: format!("{EARLIER_SUMMARY_PREFIX}\n\n{summary}"),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        });
+        history.extend(
+            retained
+                .into_iter()
+                .map(|message| message.to_chat_message()),
+        );
+        self.history = history;
+        self.last_prompt_stats = None;
+        Ok(slash::compact_lines(older.len(), summary.chars().count()))
+    }
+
     /// 当前内核是不是主路径的 native（`/model` 的能力分档与 `/status` 的模型行看它）。
     pub fn is_native(&self) -> bool {
         self.kernel == NATIVE_KERNEL
@@ -755,6 +829,8 @@ mod tests {
     use std::fs;
 
     use ignis_core::config::{ColorChoice, OutputMode, Theme, UiConfig};
+    use ignis_core::session::{COMPACT_SYSTEM_PROMPT, EARLIER_SUMMARY_PREFIX};
+    use ignis_runtime::Role;
     use ignis_runtime::test_support::{ScriptStep, ScriptedModel, ScriptedModelHandle};
 
     use super::fixtures::{
@@ -1271,5 +1347,304 @@ mod tests {
         assert_eq!(rows.len(), 1, "旧会话一行不动（不删数据）");
         assert_eq!(rows[0].session.id, id);
         assert_eq!(rows[0].message_count, 2);
+    }
+
+    /// 送进内核的一条 canonical 消息（canonical 口径：工具两列恒空）。
+    fn chat(role: Role, content: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: content.to_string(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    /// 造一条会话行 + 三轮 canonical 消息，并把会话切到它（有效历史装进 `history`）。
+    fn session_with_three_turns(session: &mut Session, label: &str) -> String {
+        let record = session
+            .store()
+            .create_session(session.workspace(), "native", None, "第一句")
+            .unwrap();
+        for (prompt, reply) in [
+            ("第一句", "答复一"),
+            ("第二句", "答复二"),
+            ("第三句", "答复三"),
+        ] {
+            assert_eq!(
+                session
+                    .store()
+                    .append_turn(&record.id, prompt, Some(reply))
+                    .unwrap(),
+                2,
+                "{label}"
+            );
+        }
+        assert_eq!(
+            session.resume_session(&record.id[..8]).unwrap(),
+            6,
+            "{label}: 三轮六条"
+        );
+        record.id
+    }
+
+    /// `/compact` 的检查顺序即错误优先级：内核/凭据 → 会话 → 可压段（三种错误都不碰模型）。
+    #[tokio::test]
+    async fn compact_error_matrix() {
+        // codex（外置内核）：凭据错误逐字
+        let (_dir, mut codex) = session_fixture("compact-codex", "codex");
+        assert_eq!(
+            codex.compact().await.unwrap_err(),
+            "compact requires native kernel credentials (current kernel does not provide them)"
+        );
+        assert_eq!(codex.current_session(), None, "失败的压缩不动会话指针");
+
+        // native 但没有 Ignis 凭据（环境变量名取不存在的，断言与运行者环境无关）：同一句
+        let (_dir, mut keyless) = keyless_session_fixture("compact-keyless", "native");
+        assert!(keyless.is_native());
+        assert!(!keyless.has_credentials());
+        assert_eq!(
+            keyless.compact().await.unwrap_err(),
+            "compact requires native kernel credentials (current kernel does not provide them)"
+        );
+
+        // native + 有凭据但还没绑定会话：第二句（凭据门槛先过）
+        let (_dir, mut fresh) = session_fixture("compact-no-session", "native");
+        assert!(fresh.has_credentials());
+        assert_eq!(
+            fresh.compact().await.unwrap_err(),
+            "compact: no session yet"
+        );
+    }
+
+    /// 两轮（= `keep`）：`Ok` 一行「没有可压的」；库与内存历史一位不动，也不碰模型。
+    #[tokio::test]
+    async fn compact_with_two_turns_says_nothing_to_compact() {
+        // 空脚本：真发了请求只会拿到 500，`requests()` 因此能钉住「没碰模型」
+        let model = ScriptedModel::start(Vec::new());
+        let (_dir, mut session) =
+            session_fixture_with_config("compact-nothing", "native", scripted_config(&model));
+        let record = session
+            .store()
+            .create_session(session.workspace(), "native", None, "第一句")
+            .unwrap();
+        for (prompt, reply) in [("第一句", "答复一"), ("第二句", "答复二")] {
+            session
+                .store()
+                .append_turn(&record.id, prompt, Some(reply))
+                .unwrap();
+        }
+        assert_eq!(session.resume_session(&record.id[..8]).unwrap(), 4);
+        let before = session.history().to_vec();
+
+        let lines = session
+            .compact()
+            .await
+            .expect("「没有可压的」是回显，不是错误");
+        assert_eq!(lines, ["compact: nothing to compact"]);
+        assert_eq!(session.history(), before.as_slice(), "不动内存历史");
+        assert!(
+            session
+                .db()
+                .latest_compaction(&record.id)
+                .unwrap()
+                .is_none(),
+            "不落 compaction"
+        );
+        assert!(model.requests().is_empty(), "没有可压段就不消耗模型");
+    }
+
+    /// 三轮：摘要落库（恰好一行、`upto_seq` = 被覆盖段上界）、内存历史重建成「摘要 + 保留段」、
+    /// 原始行一条不删、回显逐字，`last_prompt_stats` 清零而 `last_usage` 保持最近一轮的真实值。
+    #[tokio::test]
+    async fn compact_stores_the_summary_and_rebuilds_the_history() {
+        let model = ScriptedModel::start(vec![ScriptStep::Text("早前对话摘要".into())]);
+        let (_dir, mut session) =
+            session_fixture_with_config("compact-success", "native", scripted_config(&model));
+        let id = session_with_three_turns(&mut session, "compact-success");
+
+        // 压缩前的观察值：用量是最近一轮的真实值（成功后保留），组装统计随压缩清零
+        session.last_prompt_stats = Some(PromptStats {
+            facts_injected: 1,
+            skills_listed: 2,
+            system_chars: 3,
+            history_chars: 4,
+        });
+        session.last_usage = Some(Usage {
+            input_tokens: 12,
+            output_tokens: 3,
+            estimated: false,
+        });
+
+        let summary = "早前对话摘要";
+        let lines = session.compact().await.expect("脚本化模型应给出摘要");
+        let chars = summary.chars().count();
+        assert_eq!(chars, 6, "按字符计（按字节是 18）");
+        assert_eq!(
+            lines,
+            [format!("compacted: 2 messages → summary ({chars} chars)")]
+        );
+
+        // 压缩记录恰好一行：`upto_seq` 是第一轮 assistant 的 `seq`（= 2）
+        let rows: Vec<(i64, String)> = session
+            .db()
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT upto_seq, summary FROM session_compactions WHERE session_id = ?1",
+                )?;
+                let rows = stmt.query_map([&id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                rows.collect()
+            })
+            .unwrap();
+        assert_eq!(rows, [(2, summary.to_string())], "压缩记录恰好一行");
+
+        // 内存历史重建：前缀 + 空行 + 摘要（与 `effective_history` 同一份拼法常量）+ 保留段原文
+        let expected = [
+            chat(
+                Role::User,
+                &format!("{EARLIER_SUMMARY_PREFIX}\n\n{summary}"),
+            ),
+            chat(Role::User, "第二句"),
+            chat(Role::Assistant, "答复二"),
+            chat(Role::User, "第三句"),
+            chat(Role::Assistant, "答复三"),
+        ];
+        assert_eq!(session.history(), expected, "摘要 + 保留段");
+        // 与库里的有效历史（重建视图）逐个字段相等：退出再恢复读到的是同一段
+        let db_view: Vec<ChatMessage> = session
+            .store()
+            .effective_history(&id)
+            .unwrap()
+            .into_iter()
+            .map(|message| message.to_chat_message())
+            .collect();
+        assert_eq!(session.history(), db_view.as_slice(), "内存与库里同口径");
+        // 原始行一条不删（压缩只是视图，`/sessions` 的 MESSAGES 仍是 6）
+        assert_eq!(
+            session.db().session_messages_from(&id, 1).unwrap().len(),
+            6,
+            "原始消息一条不删"
+        );
+
+        // 观察值：组装统计清零（下一次组装重算）、用量保持最近一轮的真实值
+        assert_eq!(session.last_prompt_stats(), None);
+        assert_eq!(
+            session.last_usage().map(|usage| usage.input_tokens),
+            Some(12),
+            "用量是上一轮的真实用量，不被压缩改动"
+        );
+
+        // 摘要请求走会话的生效配置：system 钉死、user 是第一轮的渲染正文、不带工具
+        let requests = model.requests();
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert_eq!(
+            requests[0]["messages"][0],
+            serde_json::json!({"role": "system", "content": COMPACT_SYSTEM_PROMPT})
+        );
+        assert_eq!(
+            requests[0]["messages"][1]["content"],
+            serde_json::json!("user: 第一句\n\nassistant: 答复一")
+        );
+        assert!(requests[0].get("tools").is_none(), "{:#?}", requests[0]);
+    }
+
+    /// 二次压缩（ledger 预检 #6 的口径）：可压段只剩上一份摘要消息，`upto_seq` 沿用旧上界、
+    /// 保留段不变；原始行照旧一条不删。
+    #[tokio::test]
+    async fn compact_again_summarizes_the_previous_summary_only() {
+        let model = ScriptedModel::start(vec![
+            ScriptStep::Text("第一份摘要".into()),
+            ScriptStep::Text("第二份摘要".into()),
+        ]);
+        let (_dir, mut session) =
+            session_fixture_with_config("compact-second", "native", scripted_config(&model));
+        let id = session_with_three_turns(&mut session, "compact-second");
+
+        assert_eq!(
+            session.compact().await.unwrap(),
+            [format!(
+                "compacted: 2 messages → summary ({} chars)",
+                "第一份摘要".chars().count()
+            )]
+        );
+        // 二次压缩：有效历史 = [摘要(seq 2), 第二句, 答复二, 第三句, 答复三]，
+        // 倒数第二条 user 是「第二句」——比它更早的只有上一份摘要
+        let lines = session.compact().await.unwrap();
+        assert_eq!(
+            lines,
+            [format!(
+                "compacted: 1 messages → summary ({} chars)",
+                "第二份摘要".chars().count()
+            )]
+        );
+        assert_eq!(model.requests().len(), 2);
+        // `upto_seq` 沿用旧上界（还是第一轮 assistant 的 seq = 2），保留段原样
+        let latest = session
+            .db()
+            .latest_compaction(&id)
+            .unwrap()
+            .expect("第二次压缩行");
+        assert_eq!(latest.upto_seq, 2);
+        assert_eq!(latest.summary, "第二份摘要");
+        assert_eq!(
+            session.history(),
+            [
+                chat(
+                    Role::User,
+                    &format!("{EARLIER_SUMMARY_PREFIX}\n\n第二份摘要")
+                ),
+                chat(Role::User, "第二句"),
+                chat(Role::Assistant, "答复二"),
+                chat(Role::User, "第三句"),
+                chat(Role::Assistant, "答复三"),
+            ]
+        );
+        // 两次压缩都是「追加一行」：原始 6 行一条不删，摘要行两条都在
+        assert_eq!(session.db().session_messages_from(&id, 1).unwrap().len(), 6);
+        let count: i64 = session
+            .db()
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT count(*) FROM session_compactions WHERE session_id = ?1",
+                    [&id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    /// 模型失败：`Err` 带 `compact: summarization failed` 前缀、状态零变化（不落 compaction、
+    /// 历史逐条不变、组装统计不被清），原始行一条不删。
+    #[tokio::test]
+    async fn compact_model_failure_changes_nothing() {
+        // 401 不重试：内核立刻折成 `Done{Failed}`
+        let model = ScriptedModel::start(vec![ScriptStep::Error {
+            status: 401,
+            body: r#"{"error":"bad key"}"#.into(),
+        }]);
+        let (_dir, mut session) =
+            session_fixture_with_config("compact-failed", "native", scripted_config(&model));
+        let id = session_with_three_turns(&mut session, "compact-failed");
+        let before = session.history().to_vec();
+        session.last_prompt_stats = Some(PromptStats::default());
+
+        let error = session.compact().await.unwrap_err();
+        assert!(error.contains("compact: summarization failed"), "{error}");
+
+        assert!(
+            session.db().latest_compaction(&id).unwrap().is_none(),
+            "失败的压缩不落库"
+        );
+        assert_eq!(session.history(), before.as_slice(), "失败不动历史");
+        assert_eq!(
+            session.db().session_messages_from(&id, 1).unwrap().len(),
+            6,
+            "原始行一条不删"
+        );
+        assert!(
+            session.last_prompt_stats().is_some(),
+            "失败的压缩不清组装统计"
+        );
+        assert_eq!(model.requests().len(), 1, "请求真的发过：失败来自内核");
     }
 }

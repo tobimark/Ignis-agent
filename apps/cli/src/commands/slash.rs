@@ -49,6 +49,8 @@ pub enum Slash {
     Resume,
     /// `/context`：本会话的上下文预算与最近一轮用量（只读）。
     Context,
+    /// `/compact`：把较早轮次摘要化（保留最近两轮，原始消息保留；唯一需要模型往返的命令）。
+    Compact,
 }
 
 /// 一行输入的含义。
@@ -71,6 +73,8 @@ pub enum Dispatch {
     Exit,
     /// 命令的输出行（帮助 / 状态 / 回显）。
     Lines(Vec<String>),
+    /// `/compact`：唯一需要模型往返的命令——分发只交回意图，由 REPL `await` 会话的执行。
+    Compact,
 }
 
 /// Tab 补全的结果。
@@ -106,6 +110,8 @@ const TASKS_LIMIT_ERROR: &str = "tasks: limit must be a positive number";
 const TASKS_DEFAULT_LIMIT: usize = 10;
 /// `/resume` 缺参或多参时的用法行（命令只收一个位置）。
 const RESUME_USAGE: &str = "resume: usage: /resume <id>";
+/// `/compact` 的参数面：命令不收参数（多余词给这条用法行）。
+const COMPACT_USAGE: &str = "compact: usage: /compact";
 /// `/context` 第三行的外置内核形态（决策 #21：不伪造估算 token，写「无数据」）。
 const USAGE_UNAVAILABLE: &str = "last turn usage: unavailable (kernel reports no usage)";
 
@@ -151,8 +157,8 @@ struct Spec {
 
 /// 命令表：帮助与补全的唯一事实来源（条目、分组、参数提示与描述都只写一遍）。
 ///
-/// 顺序即组内顺序（`SESSION` 组排在最前；`/compact` 是 INTELLIGENCE 组的后续条目，由 Task 7 进表）。
-const COMMANDS: [Spec; 13] = [
+/// 顺序即组内顺序（`SESSION` 组排在最前；`INTELLIGENCE` 组按 `/memory` → `/context` → `/compact`）。
+const COMMANDS: [Spec; 14] = [
     Spec {
         command: Slash::New,
         group: Group::Session,
@@ -223,6 +229,14 @@ const COMMANDS: [Spec; 13] = [
         name: "/context",
         arg_hint: "",
         summary: "Show the context budget and the last turn usage",
+        expects_args: false,
+    },
+    Spec {
+        command: Slash::Compact,
+        group: Group::Intelligence,
+        name: "/compact",
+        arg_hint: "",
+        summary: "Summarize older turns into a summary message",
         expects_args: false,
     },
     Spec {
@@ -308,7 +322,7 @@ fn group_lines(specs: &[&Spec]) -> Vec<String> {
     lines
 }
 
-/// `/help` 的输出：四个分组与十三条命令（顺序与 [`COMMANDS`] 一致）。
+/// `/help` 的输出：四个分组与十四条命令（顺序与 [`COMMANDS`] 一致）。
 pub fn help_lines() -> Vec<String> {
     group_lines(&COMMANDS.iter().collect::<Vec<_>>())
 }
@@ -707,6 +721,21 @@ pub fn new_session_line() -> String {
     "new session".to_string()
 }
 
+/// `/compact` 成功的回显行：`compacted: {n} messages → summary ({m} chars)`。
+///
+/// `compacted` 是进入摘要段的消息条数（二次压缩时可能含上一份摘要消息）；`chars` 是摘要正文的
+/// **字符**数（与 `/context` 的 chars 同一口径，不按字节）。
+pub fn compact_lines(compacted: usize, chars: usize) -> Vec<String> {
+    vec![format!(
+        "compacted: {compacted} messages → summary ({chars} chars)"
+    )]
+}
+
+/// `/compact` 没有可压段时的回显行（普通 stdout 行，不是错误）。
+pub fn compact_nothing_line() -> String {
+    "compact: nothing to compact".to_string()
+}
+
 /// 执行一条本地命令：读会话字段 → 调渲染函数 / 调 setter。
 ///
 /// 错误一律人话（`String`）并原样交回 REPL（它打 `error: {…}`）；生产路径无 panic。
@@ -775,6 +804,12 @@ pub fn dispatch(
             session.context_budget(),
             session.last_usage(),
         ))),
+        // `/compact` 是唯一需要模型往返的命令：分发只交回意图，REPL 接住并 `await Session::compact()`
+        // （执行在会话侧，参数面只有「没有参数」一种合法形状——多余词给用法行，不查库）
+        Slash::Compact => match args {
+            [] => Ok(Dispatch::Compact),
+            _ => Err(COMPACT_USAGE.to_string()),
+        },
         // 三个会话命令：渲染与状态变更都落到 `Session` 的方法与纯渲染函数，这里只做接线。
         Slash::New => {
             session.start_new_session();
@@ -830,11 +865,12 @@ mod tests {
     use crate::commands::fixtures::{session_fixture, session_fixture_with_config};
     use crate::commands::skills;
 
-    /// 分发一条命令并取出它的输出行；退出类命令不该走这里。
+    /// 分发一条命令并取出它的输出行；退出类与需要模型往返的命令不该走这里。
     fn dispatch_lines(session: &mut Session, command: Slash, args: &[String]) -> Vec<String> {
         match dispatch(session, command, args).expect("命令应成功") {
             Dispatch::Lines(lines) => lines,
             Dispatch::Exit => panic!("{command:?} 不该退出"),
+            Dispatch::Compact => panic!("{command:?} 需要模型往返，不走这个助手"),
         }
     }
 
@@ -1079,7 +1115,7 @@ mod tests {
     }
 
     /// `/help` 的 INTELLIGENCE 组：`/context` 紧跟 `/memory`，组内对齐随最宽条目重算；
-    /// `/compact` 仍不在表里（Task 7）。
+    /// `/compact`（Task 7）排在组尾。
     #[test]
     fn help_lines_carry_the_context_row() {
         let lines = help_lines();
@@ -1103,8 +1139,9 @@ mod tests {
                 " ".repeat(pad)
             )
         );
-        // 组里没有多余的行：`/context` 之后就是下一个分组的标题
-        assert_eq!(lines[intelligence + 3], "INTERFACE", "{lines:?}");
+        // 组里没有多余的行：`/context` 之后是 `/compact`（Task 7 进表，逐字断言在
+        // `help_lines_carry_the_compact_row` 里），再后面就是下一个分组的标题
+        assert_eq!(lines[intelligence + 4], "INTERFACE", "{lines:?}");
 
         // 条目本身：无参数提示、不进参数补全，解析与 Tab 补全都认它
         let spec = COMMANDS
@@ -1128,16 +1165,79 @@ mod tests {
         );
     }
 
-    /// 帮助里绝不出现后续阶段的命令（`/compact` 属 Task 7；`/learn` `/reload` 属 P4）。
+    /// `/help` 的 INTELLIGENCE 组收尾：`/compact` 排在 `/context` 之后，组内对齐随最宽条目重算；
+    /// `/memory` 与 `/context` 两行一字不改。
+    #[test]
+    fn help_lines_carry_the_compact_row() {
+        let lines = help_lines();
+
+        let intelligence = lines
+            .iter()
+            .position(|line| line == "INTELLIGENCE")
+            .expect("INTELLIGENCE 组标题");
+        // 前两行与 `help_lines_carry_the_context_row` 的断言逐字一致：新条目没有挪动它们
+        assert_eq!(
+            lines[intelligence + 1],
+            "  /memory <list|search|add|edit|delete>  Read or edit long-term memory"
+        );
+        let memory_label = "/memory <list|search|add|edit|delete>";
+        let context_pad = memory_label.chars().count() - "/context".chars().count();
+        assert_eq!(
+            lines[intelligence + 2],
+            format!(
+                "  /context{}  Show the context budget and the last turn usage",
+                " ".repeat(context_pad)
+            )
+        );
+        // 收尾条目：`/compact` 只有 8 列，组内最宽条目不变，对齐按 37 列重算（列间两个空格）
+        let compact_pad = memory_label.chars().count() - "/compact".chars().count();
+        assert_eq!(
+            lines[intelligence + 3],
+            format!(
+                "  /compact{}  Summarize older turns into a summary message",
+                " ".repeat(compact_pad)
+            )
+        );
+        // 组里没有多余的行：`/compact` 之后就是下一个分组的标题
+        assert_eq!(lines[intelligence + 4], "INTERFACE", "{lines:?}");
+
+        // 条目本身：无参数提示、不进参数补全，解析与 Tab 补全都认它
+        let spec = COMMANDS
+            .iter()
+            .find(|spec| spec.command == Slash::Compact)
+            .expect("/compact 应进命令表");
+        assert_eq!(spec.group, Group::Intelligence);
+        assert_eq!(spec.arg_hint, "");
+        assert!(!spec.expects_args);
+        assert_eq!(spec.summary, "Summarize older turns into a summary message");
+        assert_eq!(
+            parse("/compact"),
+            Parsed::Command(Slash::Compact, Vec::new())
+        );
+        assert_eq!(
+            complete("/com"),
+            Completion::Accepted("/compact".to_string())
+        );
+        // 参数面没有候选（`/compact` 不收参数，多余词由 dispatch 给用法错误）
+        assert_eq!(complete("/compact n"), Completion::None);
+    }
+
+    /// 帮助里绝不出现后续阶段的命令：`/learn` `/reload` 属 P4；本阶段的 `/compact` 是合法条目。
     #[test]
     fn help_lines_never_mentions_later_phases() {
         let help = help_lines().join("\n");
-        for later in ["/compact", "/learn", "/reload"] {
+        for later in ["/learn", "/reload"] {
             assert!(
                 !help.contains(later),
                 "{later} 不该出现在 P3 的帮助里：{help}"
             );
         }
+        // 不再排除 `/compact` 不等于放它过去：它必须逐字出现在本阶段的帮助里
+        assert!(
+            help.contains("  /compact")
+                && help.contains("Summarize older turns into a summary message"),
+            "{help}"
+        );
     }
 
     /// `/sessions` 的表：空表一句、表头逐字、当前会话的 ID 格带 `*`、列宽对齐且行尾不留空格。
@@ -1483,6 +1583,22 @@ mod tests {
         );
     }
 
+    /// `/compact` 经 dispatch 只交回意图（真正的执行由 REPL `await Session::compact()`）；多余词给
+    /// 用法行、不查库也不动会话。
+    #[test]
+    fn dispatch_compact_returns_the_intent_and_rejects_extra_words() {
+        let (_dir, mut session) = session_fixture("slash-compact-dispatch", "native");
+
+        assert_eq!(
+            dispatch(&mut session, Slash::Compact, &[]).unwrap(),
+            Dispatch::Compact
+        );
+        // 参数面只有「没有参数」一种合法形状：错误逐字（不查库，因此也不会拿到 no session yet）
+        let error = dispatch(&mut session, Slash::Compact, &args(&["now", "please"])).unwrap_err();
+        assert_eq!(error, "compact: usage: /compact");
+        assert_eq!(session.current_session(), None, "用法错误不动会话指针");
+    }
+
     /// 未知命令的报错行逐字钉住（REPL 打到 stderr，不送模型）。
     #[test]
     fn unknown_command_line_is_pinned() {
@@ -1773,7 +1889,7 @@ mod tests {
                 "  /memory <list|search|add|edit|delete>  Read or edit long-term memory",
             ]
         );
-        // 前缀 `/` 命中全部九条：与 `/help` 逐行相等
+        // 前缀 `/` 命中全部条目：与 `/help` 逐行相等
         assert_eq!(listing("/"), help_lines());
 
         // `/kernel` 的第一个参数位置：取值候选（唯一命中接受整条命令）

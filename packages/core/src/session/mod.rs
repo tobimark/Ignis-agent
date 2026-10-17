@@ -21,6 +21,9 @@
 //!   `/compact` 二次压缩时算新的切点。
 //! - **fail-soft**：库里出现契约外的角色（历史遗留、手工改库）时跳过该行并打一行中文警告，绝不
 //!   panic、也不静默改写成 assistant。
+//! - **`/compact` 的切分与摘要**（[`split_turns`] / [`render_transcript`] / [`summarize_turns`]）：
+//!   按「保留最后 [`COMPACT_KEEP_TURNS`] 轮」切出较早轮次，渲染成一次**无工具**的 native 请求交给
+//!   模型做摘要；摘要只作为一条 compaction 记录落库，`session_messages` 一行不动。
 //!
 //! [`SessionStore`] 不持状态、不缓存连接：只包一个 `Arc<Db>`，每个方法经它走到共享连接，构造按需
 //! （CLI 的 `Session::store()` 每次新建一个）。
@@ -28,10 +31,18 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ignis_runtime::{ChatMessage, Role};
+use async_trait::async_trait;
+use futures::StreamExt;
+use ignis_runtime::{
+    ChatMessage, Role, RunRequest, RunStatus, Runtime, RuntimeEvent, ToolCall, ToolExecutor,
+    ToolResult, ToolSpec,
+};
 use ignis_storage::{
     Db, NewSession, NewSessionMessage, SessionRecord, SessionSummary, StorageError, now_millis,
 };
+use tokio_util::sync::CancellationToken;
+
+use crate::config::Config;
 
 /// 标题上限（字符数，与设计 §6.6 的「前 40 字符」一致）。
 pub const SESSION_TITLE_CHARS: usize = 40;
@@ -39,6 +50,12 @@ pub const SESSION_TITLE_CHARS: usize = 40;
 pub const TITLE_FALLBACK: &str = "untitled";
 /// 压缩摘要消息的前缀（有效历史重建与 `/compact` 共用一份）。
 pub const EARLIER_SUMMARY_PREFIX: &str = "[Earlier conversation summary]";
+/// 保留的轮数（设计 §6.7：保留最近 2 轮，其余进摘要段）。
+pub const COMPACT_KEEP_TURNS: usize = 2;
+/// 摘要请求的 system 提示（英文，逐字钉住）。
+pub const COMPACT_SYSTEM_PROMPT: &str = "Summarize the older part of this conversation for \
+continuity. Preserve the current task state, the user's decisions, unfinished work, and key \
+facts and file paths. Reply with the summary only.";
 
 /// canonical 消息的角色取值（`session_messages.role` 只写这两个）。
 const ROLE_USER: &str = "user";
@@ -89,6 +106,12 @@ pub enum SessionError {
     /// SQLite 读写 / IO / JSON 失败。
     #[error(transparent)]
     Storage(#[from] StorageError),
+    /// 摘要请求失败：`{0}` 是内核交回的人话原因（`Done{Failed}` 的 `error`、非成功终态或流提前结束）。
+    #[error("compact: summarization failed: {0}")]
+    Summarize(String),
+    /// 摘要请求成功但正文为空（全空白也算空）：没有可落库的摘要。
+    #[error("compact: summarization returned no text")]
+    EmptySummary,
 }
 
 /// 会话存储：`Arc<Db>` 之上的薄封装（无自有状态，构造按需）。
@@ -197,6 +220,22 @@ impl SessionStore {
         Ok(history)
     }
 
+    /// 落一条压缩记录：`session_compactions` 追加一行，`session_messages` 一行不动。
+    ///
+    /// `upto_seq` 是已被摘要覆盖的最后一条消息的 `seq`（[`split_turns`] 切出的被压缩段的上界），
+    /// 有效历史（[`SessionStore::effective_history`]）据此决定摘要消息之后从哪条原始消息继续。
+    /// `created_at` 取这一次的墙钟。
+    pub fn record_compaction(
+        &self,
+        session_id: &str,
+        upto_seq: i64,
+        summary: &str,
+    ) -> Result<(), SessionError> {
+        self.db
+            .insert_compaction(session_id, upto_seq, summary, now_millis())?;
+        Ok(())
+    }
+
     /// 本工作区最近一次更新的会话（`ignis -c` 的恢复点）；没有会话给 `None`。
     pub fn latest_for_workspace(
         &self,
@@ -242,6 +281,139 @@ impl SessionStore {
     }
 }
 
+/// 按「保留最后 `keep` 轮」切分有效历史：`user` 消息是轮次起点，切点 = 倒数第 `keep` 条 user 消息的
+/// 下标；不足 `keep` 轮时被压缩段为空（返回 `(vec![], 全体)`）。
+///
+/// 一次反向扫描找切点：切点落在 user 上，保留段因此以一条 user 开头（不足 `keep` 轮时切点在开头，
+/// 保留段是全体）。末轮没有答复（失败轮次只记 user）不影响切点；对不齐的尾部跟着它前面那条 user
+/// 一起留在保留段里。
+pub fn split_turns(
+    messages: &[HistoryMessage],
+    keep: usize,
+) -> (Vec<HistoryMessage>, Vec<HistoryMessage>) {
+    let mut seen = 0usize;
+    let mut cut = 0usize;
+    for (index, message) in messages.iter().enumerate().rev() {
+        if message.role == Role::User {
+            seen += 1;
+            if seen == keep {
+                cut = index;
+                break;
+            }
+        }
+    }
+    let mut older = messages.to_vec();
+    let retained = older.split_off(cut);
+    (older, retained)
+}
+
+/// 旧轮次 → 摘要请求的 user 正文：每条 `user: {content}` / `assistant: {content}`，空行分隔。
+///
+/// 内容原样（换行保留）；空表给空串（调用方只在被压缩段非空时才发起请求）。
+pub fn render_transcript(messages: &[HistoryMessage]) -> String {
+    messages
+        .iter()
+        .map(|message| format!("{}: {}", role_word(message.role), message.content))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// 一次无工具的 native 请求：`system` = [`COMPACT_SYSTEM_PROMPT`]、`user` = `transcript`，
+/// 累加 `TextDelta` 作为摘要；`Done{Failed}`、其余非成功终态与**无终态**（流提前结束）都报
+/// [`SessionError::Summarize`]，摘要正文为空（全空白也算）报 [`SessionError::EmptySummary`]。
+///
+/// 请求带 `config.limits` 与 `config.model`（调用方传会话的生效配置，`/model` 的会话级覆盖因此对摘要
+/// 也生效）。`tools()` 恒空：摘要请求不带工具，模型真回了工具调用也只会收到一条失败结果。
+pub async fn summarize_turns(
+    runtime: Arc<dyn Runtime>,
+    config: &Config,
+    transcript: &str,
+    cancel: CancellationToken,
+) -> Result<String, SessionError> {
+    let request = RunRequest {
+        messages: vec![ChatMessage {
+            role: Role::User,
+            content: transcript.to_string(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        }],
+        system_prompt: COMPACT_SYSTEM_PROMPT.to_string(),
+        model: config.model.clone(),
+        limits: config.limits,
+        executor: Arc::new(ToolLessExecutor),
+    };
+
+    let mut stream = runtime.run(request, cancel).await;
+    let mut summary = String::new();
+    let mut status: Option<RunStatus> = None;
+    let mut failure: Option<String> = None;
+    while let Some(event) = stream.next().await {
+        match event {
+            RuntimeEvent::TextDelta { text } => summary.push_str(&text),
+            // 恰好一条 `Done` 收束整条流；记下终态与内核给的原因
+            RuntimeEvent::Done {
+                status: done,
+                error,
+                ..
+            } => {
+                status = Some(done);
+                failure = error;
+            }
+            // 摘要请求不带工具、也不看推理：其余事件（Usage / ReasoningDelta / ToolExec…）忽略
+            _ => {}
+        }
+    }
+
+    match status {
+        Some(RunStatus::Success) => {
+            if summary.trim().is_empty() {
+                return Err(SessionError::EmptySummary);
+            }
+            Ok(summary)
+        }
+        Some(done) => Err(SessionError::Summarize(
+            failure.unwrap_or_else(|| done.as_str().to_string()),
+        )),
+        // 流结束却没有 `Done`：把缺失终态也报成摘要失败，不静默落半截正文
+        None => Err(SessionError::Summarize(
+            "model stream ended without a final status".to_string(),
+        )),
+    }
+}
+
+/// 摘要请求的工具执行器：`specs()` 恒空 → 请求体里没有 `tools` 字段。
+///
+/// 模型真的回了工具调用时给一条失败结果（这是防御性分支：摘要提示不含工具、请求也不带工具描述）。
+struct ToolLessExecutor;
+
+#[async_trait]
+impl ToolExecutor for ToolLessExecutor {
+    fn specs(&self) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+
+    fn summarize(&self, _call: &ToolCall) -> String {
+        String::new()
+    }
+
+    async fn execute(&self, _call: ToolCall, _cancel: CancellationToken) -> ToolResult {
+        ToolResult {
+            ok: false,
+            output: Some("compact request has no tools".to_string()),
+        }
+    }
+}
+
+/// canonical 角色 → 正文标签（canonical 历史只用 user / assistant；另两值只为穷尽枚举）。
+fn role_word(role: Role) -> &'static str {
+    match role {
+        Role::User => ROLE_USER,
+        Role::Assistant => ROLE_ASSISTANT,
+        Role::System => "system",
+        Role::Tool => "tool",
+    }
+}
+
 /// 会话行里的工作区字符串：创建与查询都走这一份转换，两侧永远对得上。
 fn workspace_key(workspace: &Path) -> String {
     workspace.display().to_string()
@@ -268,13 +440,20 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use ignis_runtime::Role;
+    use ignis_runtime::native::NativeRuntime;
+    use ignis_runtime::openai::OpenAiClient;
+    use ignis_runtime::test_support::{ScriptStep, ScriptedModel, ScriptedModelHandle};
+    use ignis_runtime::{ModelConfig, Role, Runtime};
     use ignis_storage::{Db, NewSession, NewSessionMessage, now_millis};
+    use serde_json::json;
+    use tokio_util::sync::CancellationToken;
 
     use super::{
-        EARLIER_SUMMARY_PREFIX, HistoryMessage, SESSION_TITLE_CHARS, SessionStore, TITLE_FALLBACK,
-        session_title,
+        COMPACT_KEEP_TURNS, COMPACT_SYSTEM_PROMPT, EARLIER_SUMMARY_PREFIX, HistoryMessage,
+        SESSION_TITLE_CHARS, SessionError, SessionStore, TITLE_FALLBACK, render_transcript,
+        session_title, split_turns, summarize_turns,
     };
+    use crate::config::Config;
 
     /// 唯一临时目录：测试并发跑，目录名带进程号与进程内自增序号（与 memory/doctor 同一手法）。
     struct TempDir(PathBuf);
@@ -351,6 +530,39 @@ mod tests {
             model: None,
             created_at: at,
         }
+    }
+
+    /// 用 `(role, content)` 造一段有效历史：`seq` 从 1 起连续（库里就是这样的行序）。
+    fn history(entries: &[(Role, &str)]) -> Vec<HistoryMessage> {
+        entries
+            .iter()
+            .enumerate()
+            .map(|(index, (role, content))| HistoryMessage {
+                seq: index as i64 + 1,
+                role: *role,
+                content: (*content).to_string(),
+            })
+            .collect()
+    }
+
+    /// 指向脚本化假模型的 native 配置（摘要请求真的走一遍 HTTP → SSE，不碰网络）。
+    fn scripted_config(model: &ScriptedModelHandle) -> Config {
+        Config {
+            api_key: Some("test-key".into()),
+            model: ModelConfig {
+                base_url: model.base_url(),
+                model: "test-model".into(),
+                ..ModelConfig::default()
+            },
+            ..Config::default()
+        }
+    }
+
+    /// 与 `commands::kernel::mk_runtime("native", …)` 同形的运行器：native + 假模型的 base_url。
+    fn native_runtime(config: &Config) -> Arc<dyn Runtime> {
+        Arc::new(NativeRuntime::new(
+            OpenAiClient::new(&config.model, "test-key".into()).unwrap(),
+        ))
     }
 
     #[test]
@@ -839,5 +1051,195 @@ mod tests {
             drop(store);
             drop(reader);
         }
+    }
+
+    /// 切分：user 消息是轮次起点，切点落在**倒数第 `keep` 条 user** 的下标；不足 `keep` 轮时被压缩段
+    /// 为空（保留段是全体）。
+    #[test]
+    fn split_turns_keeps_the_last_two_turns() {
+        // 三轮六条：最后两轮保留，第一轮（user + assistant）进摘要段
+        let messages = history(&[
+            (Role::User, "第一句"),
+            (Role::Assistant, "答复一"),
+            (Role::User, "第二句"),
+            (Role::Assistant, "答复二"),
+            (Role::User, "第三句"),
+            (Role::Assistant, "答复三"),
+        ]);
+        assert_eq!(COMPACT_KEEP_TURNS, 2);
+        let (older, retained) = split_turns(&messages, COMPACT_KEEP_TURNS);
+        assert_eq!(
+            older.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            ["第一句", "答复一"]
+        );
+        assert_eq!(
+            retained
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            ["第二句", "答复二", "第三句", "答复三"]
+        );
+        // 切出来的是副本：原表一条不动
+        assert_eq!(messages.len(), 6);
+        assert_eq!(older[0].seq, 1);
+        assert_eq!(retained[0].seq, 3);
+
+        // 刚好两轮：没有可压的旧轮次
+        let two_turns = history(&[
+            (Role::User, "第一句"),
+            (Role::Assistant, "答复一"),
+            (Role::User, "第二句"),
+            (Role::Assistant, "答复二"),
+        ]);
+        let (older, retained) = split_turns(&two_turns, COMPACT_KEEP_TURNS);
+        assert!(older.is_empty(), "两轮没有可压段：{older:?}");
+        assert_eq!(retained, two_turns);
+
+        // 三条消息（user/assistant 对不齐：末轮没有答复）：切点仍落在 user 边界——
+        // 只数出两条 user，不足 `keep` 轮，被压缩段为空
+        let misaligned = history(&[
+            (Role::User, "第一句"),
+            (Role::Assistant, "答复一"),
+            (Role::User, "第二句"),
+        ]);
+        let (older, retained) = split_turns(&misaligned, COMPACT_KEEP_TURNS);
+        assert!(older.is_empty(), "两条 user 不足 keep 轮：{older:?}");
+        assert_eq!(retained, misaligned);
+
+        // 对不齐但 user 多于 keep：切点落在 user 上（保留段从那条 user 开始，不切在别处）
+        let longer = history(&[
+            (Role::User, "一"),
+            (Role::Assistant, "答一"),
+            (Role::User, "二"),
+            (Role::Assistant, "答二"),
+            (Role::User, "三"),
+        ]);
+        let (older, retained) = split_turns(&longer, 1);
+        assert_eq!(
+            older.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            ["一", "答一", "二", "答二"]
+        );
+        assert_eq!(
+            retained
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            ["三"]
+        );
+    }
+
+    /// 摘要请求的正文：每条 `{role}: {content}`，条目之间空行；角色用 canonical 两值。
+    #[test]
+    fn render_transcript_labels_roles_and_separates_turns() {
+        let messages = history(&[
+            (Role::User, "第一句\n第二行"),
+            (Role::Assistant, "答复一"),
+            (Role::User, "第二句"),
+        ]);
+        assert_eq!(
+            render_transcript(&messages),
+            "user: 第一句\n第二行\n\nassistant: 答复一\n\nuser: 第二句"
+        );
+        // 空表给空串（调用方只在被压缩段非空时才发起摘要请求）
+        assert_eq!(render_transcript(&[]), "");
+    }
+
+    /// 一次无工具的 native 请求：system 是钉死的英文提示、user 是渲染好的正文，请求体没有 `tools`。
+    #[tokio::test]
+    async fn summarize_turns_uses_the_pinned_system_prompt_without_tools() {
+        let model = ScriptedModel::start(vec![ScriptStep::Text("摘要正文".into())]);
+        let config = scripted_config(&model);
+        let older = history(&[(Role::User, "第一句"), (Role::Assistant, "答复一")]);
+        let transcript = render_transcript(&older);
+
+        let summary = summarize_turns(
+            native_runtime(&config),
+            &config,
+            &transcript,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("脚本化模型应给出摘要");
+        assert_eq!(summary, "摘要正文");
+
+        let requests = model.requests();
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        // 请求体的第一条消息就是 system（文本来自 `RunRequest.system_prompt`）
+        assert_eq!(
+            requests[0]["messages"][0],
+            json!({"role": "system", "content": COMPACT_SYSTEM_PROMPT})
+        );
+        // 第二条是渲染好的正文，且整条请求只有这两条消息
+        assert_eq!(requests[0]["messages"][1]["role"], "user");
+        assert_eq!(requests[0]["messages"][1]["content"], json!(transcript));
+        assert_eq!(requests[0]["messages"].as_array().unwrap().len(), 2);
+        // 无工具执行器 → 请求体里没有 `tools` 字段
+        assert!(
+            requests[0].get("tools").is_none(),
+            "摘要请求不该带工具：{:#?}",
+            requests[0]
+        );
+    }
+
+    /// 模型失败（内核折成 `Done{Failed}`）→ `SessionError::Summarize`，原因带上内核给的原文。
+    #[tokio::test]
+    async fn summarize_turns_reports_a_failed_model() {
+        let model = ScriptedModel::start(vec![ScriptStep::Error {
+            status: 401,
+            body: r#"{"error":"bad key"}"#.into(),
+        }]);
+        let config = scripted_config(&model);
+
+        let error = summarize_turns(
+            native_runtime(&config),
+            &config,
+            "user: 你好",
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("失败的模型不该给出摘要");
+        assert!(matches!(error, SessionError::Summarize(_)), "{error:?}");
+        // 展示前缀逐字（`{0}` 是内核给的人话原因）
+        assert!(
+            error
+                .to_string()
+                .starts_with("compact: summarization failed: "),
+            "{error}"
+        );
+    }
+
+    /// `record_compaction` 只往 `session_compactions` 追加一行：原始消息一条不删，
+    /// `upto_seq` / `summary` 原样读回，有效历史据此重建成「摘要 + 保留段」。
+    #[test]
+    fn record_compaction_appends_a_row_and_keeps_the_raw_messages() {
+        let env = Env::new("record-compaction");
+        let (db, store) = open(&env.db_path());
+        let session = store
+            .create_session(&env.workspace(), "native", None, "压一压")
+            .unwrap();
+        for (prompt, reply) in [("一", "答一"), ("二", "答二"), ("三", "答三")] {
+            store.append_turn(&session.id, prompt, Some(reply)).unwrap();
+        }
+
+        store
+            .record_compaction(&session.id, 4, "前两轮的摘要")
+            .unwrap();
+
+        let record = db
+            .latest_compaction(&session.id)
+            .unwrap()
+            .expect("compaction 行");
+        assert_eq!(record.upto_seq, 4);
+        assert_eq!(record.summary, "前两轮的摘要");
+        assert!(record.created_at >= session.created_at, "{record:?}");
+        // 原始行一条不删（压缩只是有效历史的视图）
+        assert_eq!(db.session_messages_from(&session.id, 1).unwrap().len(), 6);
+        let history = store.effective_history(&session.id).unwrap();
+        assert_eq!(history.len(), 3, "{history:?}");
+        assert_eq!(
+            history[0].content,
+            format!("{EARLIER_SUMMARY_PREFIX}\n\n前两轮的摘要")
+        );
+        assert_eq!(history[1].content, "三");
     }
 }
