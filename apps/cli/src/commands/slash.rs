@@ -11,6 +11,7 @@ use std::path::Path;
 
 use ignis_core::config::OutputMode;
 use ignis_core::memory::FactScope;
+use ignis_core::task::PromptStats;
 use ignis_runtime::Usage;
 use ignis_storage::{SessionSummary, TaskRecord};
 
@@ -46,6 +47,8 @@ pub enum Slash {
     Sessions,
     /// `/resume <id>`：恢复本工作区的一条会话（id 可以是 ≥8 字符的唯一前缀）。
     Resume,
+    /// `/context`：本会话的上下文预算与最近一轮用量（只读）。
+    Context,
 }
 
 /// 一行输入的含义。
@@ -103,6 +106,8 @@ const TASKS_LIMIT_ERROR: &str = "tasks: limit must be a positive number";
 const TASKS_DEFAULT_LIMIT: usize = 10;
 /// `/resume` 缺参或多参时的用法行（命令只收一个位置）。
 const RESUME_USAGE: &str = "resume: usage: /resume <id>";
+/// `/context` 第三行的外置内核形态（决策 #21：不伪造估算 token，写「无数据」）。
+const USAGE_UNAVAILABLE: &str = "last turn usage: unavailable (kernel reports no usage)";
 
 /// 帮助分组（顺序即 [`help_lines`] 的输出顺序）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,9 +151,8 @@ struct Spec {
 
 /// 命令表：帮助与补全的唯一事实来源（条目、分组、参数提示与描述都只写一遍）。
 ///
-/// 顺序即组内顺序（`SESSION` 组排在最前；`/context` 与 `/compact` 是 INTELLIGENCE 组的后续条目，
-/// 由 Task 6 / Task 7 各自进表）。
-const COMMANDS: [Spec; 12] = [
+/// 顺序即组内顺序（`SESSION` 组排在最前；`/compact` 是 INTELLIGENCE 组的后续条目，由 Task 7 进表）。
+const COMMANDS: [Spec; 13] = [
     Spec {
         command: Slash::New,
         group: Group::Session,
@@ -212,6 +216,14 @@ const COMMANDS: [Spec; 12] = [
         arg_hint: "<list|search|add|edit|delete>",
         summary: "Read or edit long-term memory",
         expects_args: true,
+    },
+    Spec {
+        command: Slash::Context,
+        group: Group::Intelligence,
+        name: "/context",
+        arg_hint: "",
+        summary: "Show the context budget and the last turn usage",
+        expects_args: false,
     },
     Spec {
         command: Slash::Details,
@@ -296,7 +308,7 @@ fn group_lines(specs: &[&Spec]) -> Vec<String> {
     lines
 }
 
-/// `/help` 的输出：四个分组与十二条命令（顺序与 [`COMMANDS`] 一致）。
+/// `/help` 的输出：四个分组与十三条命令（顺序与 [`COMMANDS`] 一致）。
 pub fn help_lines() -> Vec<String> {
     group_lines(&COMMANDS.iter().collect::<Vec<_>>())
 }
@@ -418,7 +430,14 @@ pub fn status_lines(
         Some(count) => format!("unread alerts: {count}"),
         None => "unread alerts: unavailable".to_string(),
     });
-    lines.push(match usage {
+    lines.push(usage_line(usage));
+    lines
+}
+
+/// `last turn usage` 行（`/status` 与 `/context` 共用同一份文案）：有值给
+/// `in={i} out={o} tokens (exact|estimated)`，没有（本会话还没跑过任务）给 `-`。
+fn usage_line(usage: Option<&Usage>) -> String {
+    match usage {
         Some(usage) => format!(
             "last turn usage: in={} out={} tokens ({})",
             usage.input_tokens,
@@ -430,8 +449,53 @@ pub fn status_lines(
             }
         ),
         None => "last turn usage: -".to_string(),
-    });
-    lines
+    }
+}
+
+/// `/context` 的四个钉死行（顺序固定）：内核与模型、历史占用与预算、最近一轮用量、组装统计。
+///
+/// 两处数据来源口径不同一，展示面知情：
+/// - 第二行的**条数**是此刻的有效历史长度（[`Session::history`]，随 `/new`、`/resume` 立刻变），
+///   **字符数**是最近一次任务组装期量到的 [`PromptStats::history_chars`]（pre-kernel-trim：那时
+///   送进内核的历史 + 本轮输入）。本会话还没跑过任务、或最近一次会话切换之后还没再跑，两位就来自
+///   不同时刻——`chars` 为 0 只表示「还没有可展示的统计」，不表示「历史是空的」。
+/// - 外置内核不产生用量（会话里累计出来的是 0/0 占位值）：第三行一律给
+///   `last turn usage: unavailable (kernel reports no usage)`，绝不把 0/0 装成真实用量；
+///   native 没跑过任务写 `-`。
+/// - `stats` 为 `None`（同上）时第四行三个位都是 0。
+pub fn context_lines(
+    kernel: &str,
+    model: &str,
+    history_messages: usize,
+    stats: Option<&PromptStats>,
+    budget: usize,
+    usage: Option<&Usage>,
+) -> Vec<String> {
+    let stats = stats.copied().unwrap_or_default();
+    vec![
+        format!(
+            "context · kernel {kernel} · model {}",
+            if kernel == NATIVE_KERNEL {
+                model
+            } else {
+                "(kernel default)"
+            }
+        ),
+        format!(
+            "history: {history_messages} messages · {} chars (budget {budget} chars)",
+            stats.history_chars
+        ),
+        // 内核位先判：外置内核即便带着 0/0 的占位用量，也不当作「内核报的用量」
+        if kernel == NATIVE_KERNEL {
+            usage_line(usage)
+        } else {
+            USAGE_UNAVAILABLE.to_string()
+        },
+        format!(
+            "prompt: {} facts · {} skills · system {} chars",
+            stats.facts_injected, stats.skills_listed, stats.system_chars
+        ),
+    ]
 }
 
 /// 补全一行输入。
@@ -700,6 +764,15 @@ pub fn dispatch(
             session.workspace(),
             session.current_session(),
             session.unread_alerts(),
+            session.last_usage(),
+        ))),
+        // 只读：六个位全部来自会话现状，不碰历史/用量/会话指针，也不消耗模型
+        Slash::Context => Ok(Dispatch::Lines(context_lines(
+            session.kernel(),
+            session.model(),
+            session.history().len(),
+            session.last_prompt_stats(),
+            session.context_budget(),
             session.last_usage(),
         ))),
         // 三个会话命令：渲染与状态变更都落到 `Session` 的方法与纯渲染函数，这里只做接线。
@@ -1005,11 +1078,61 @@ mod tests {
         }
     }
 
-    /// 帮助里绝不出现后续阶段（P4）的命令——P3 的会话命令如今是合法条目。
+    /// `/help` 的 INTELLIGENCE 组：`/context` 紧跟 `/memory`，组内对齐随最宽条目重算；
+    /// `/compact` 仍不在表里（Task 7）。
+    #[test]
+    fn help_lines_carry_the_context_row() {
+        let lines = help_lines();
+
+        let intelligence = lines
+            .iter()
+            .position(|line| line == "INTELLIGENCE")
+            .expect("INTELLIGENCE 组标题");
+        // 组内顺序：`/memory` 仍在前（既有行一字不改），`/context` 紧跟其后
+        assert_eq!(
+            lines[intelligence + 1],
+            "  /memory <list|search|add|edit|delete>  Read or edit long-term memory"
+        );
+        // 对齐按组内最宽的 `/memory <list|search|add|edit|delete>` 重算（列间两个空格）
+        let memory_label = "/memory <list|search|add|edit|delete>";
+        let pad = memory_label.chars().count() - "/context".chars().count();
+        assert_eq!(
+            lines[intelligence + 2],
+            format!(
+                "  /context{}  Show the context budget and the last turn usage",
+                " ".repeat(pad)
+            )
+        );
+        // 组里没有多余的行：`/context` 之后就是下一个分组的标题
+        assert_eq!(lines[intelligence + 3], "INTERFACE", "{lines:?}");
+
+        // 条目本身：无参数提示、不进参数补全，解析与 Tab 补全都认它
+        let spec = COMMANDS
+            .iter()
+            .find(|spec| spec.command == Slash::Context)
+            .expect("/context 应进命令表");
+        assert_eq!(spec.group, Group::Intelligence);
+        assert_eq!(spec.arg_hint, "");
+        assert!(!spec.expects_args);
+        assert_eq!(
+            spec.summary,
+            "Show the context budget and the last turn usage"
+        );
+        assert_eq!(
+            parse("/context"),
+            Parsed::Command(Slash::Context, Vec::new())
+        );
+        assert_eq!(
+            complete("/con"),
+            Completion::Accepted("/context".to_string())
+        );
+    }
+
+    /// 帮助里绝不出现后续阶段的命令（`/compact` 属 Task 7；`/learn` `/reload` 属 P4）。
     #[test]
     fn help_lines_never_mentions_later_phases() {
         let help = help_lines().join("\n");
-        for later in ["/learn", "/reload"] {
+        for later in ["/compact", "/learn", "/reload"] {
             assert!(
                 !help.contains(later),
                 "{later} 不该出现在 P3 的帮助里：{help}"
@@ -1280,6 +1403,86 @@ mod tests {
         assert_eq!(model.requests().len(), 1, "会话命令不碰模型");
     }
 
+    /// `/context` 经 dispatch 只读：读会话字段交纯函数渲染，输出与 `context_lines` 逐行相等；
+    /// 命令前后模型请求数不变，会话状态一个字段都不动。
+    #[tokio::test]
+    async fn dispatch_context_reads_the_session_state() {
+        let model = ScriptedModel::start(vec![ScriptStep::Text("答复一".into())]);
+        let (_dir, mut session) =
+            session_fixture_with_config("slash-context", "native", scripted_config(&model));
+        session
+            .run_task("你好".into(), TaskKind::Repl)
+            .await
+            .expect("脚本化模型应答应成功");
+        assert_eq!(model.requests().len(), 1, "那一轮真的碰过模型");
+        // 手工塞一份已知的组装统计与用量：断言 dispatch 读的就是会话里这两个字段
+        let stats = PromptStats {
+            facts_injected: 2,
+            skills_listed: 3,
+            system_chars: 640,
+            history_chars: 128,
+        };
+        session.last_prompt_stats = Some(stats);
+        session.last_usage = Some(Usage {
+            input_tokens: 12,
+            output_tokens: 3,
+            estimated: true,
+        });
+
+        let expected = context_lines(
+            session.kernel(),
+            session.model(),
+            session.history().len(),
+            session.last_prompt_stats(),
+            session.context_budget(),
+            session.last_usage(),
+        );
+        let lines = dispatch_lines(&mut session, Slash::Context, &[]);
+        assert_eq!(lines, expected, "dispatch 与纯函数应收敛到同一份输出");
+        assert_eq!(
+            lines,
+            [
+                "context · kernel native · model test-model",
+                "history: 2 messages · 128 chars (budget 200000 chars)",
+                "last turn usage: in=12 out=3 tokens (estimated)",
+                "prompt: 2 facts · 3 skills · system 640 chars",
+            ]
+        );
+
+        // 只读：用量、统计、历史、指针、模式一个字段不动，也没有再碰模型；多余参数不解释
+        assert_eq!(
+            session.last_usage().map(|usage| usage.input_tokens),
+            Some(12)
+        );
+        assert_eq!(session.last_prompt_stats(), Some(&stats));
+        assert_eq!(session.history().len(), 2);
+        assert!(session.current_session().is_some());
+        assert_eq!(session.output_mode(), OutputMode::Normal);
+        assert_eq!(
+            dispatch_lines(&mut session, Slash::Context, &args(&["now"])),
+            lines
+        );
+        assert_eq!(model.requests().len(), 1, "/context 不消耗模型");
+
+        // 预算位读配置（不是写死的 200000）
+        let small = Config {
+            api_key: Some("test-key".into()),
+            limits: ignis_runtime::Limits {
+                context_char_budget: 4_000,
+                ..ignis_runtime::Limits::default()
+            },
+            ..Config::default()
+        };
+        let (_dir, mut session) =
+            session_fixture_with_config("slash-context-budget", "native", small);
+        assert_eq!(session.context_budget(), 4_000);
+        let lines = dispatch_lines(&mut session, Slash::Context, &[]);
+        assert_eq!(
+            lines[1],
+            "history: 0 messages · 0 chars (budget 4000 chars)"
+        );
+    }
+
     /// 未知命令的报错行逐字钉住（REPL 打到 stderr，不送模型）。
     #[test]
     fn unknown_command_line_is_pinned() {
@@ -1417,6 +1620,118 @@ mod tests {
         assert_eq!(codex[4], "session: new");
         assert_eq!(codex[5], "unread alerts: 1");
         assert_eq!(codex[6], "last turn usage: -");
+    }
+
+    /// `/context` 的真值表：四行顺序与文案逐字；两个数据来源各写各的（条数是此刻的有效历史长度、
+    /// 字符数是最近一次组装统计），外置内核必须写「无数据」。
+    #[test]
+    fn context_lines_matrix() {
+        // (a) native + 用量 + 统计：四行逐字；千位以下不用分隔符
+        let stats = PromptStats {
+            facts_injected: 3,
+            skills_listed: 4,
+            system_chars: 812,
+            history_chars: 420,
+        };
+        let usage = Usage {
+            input_tokens: 3636,
+            output_tokens: 58,
+            estimated: false,
+        };
+        assert_eq!(
+            context_lines(
+                "native",
+                "MiniMax-M2",
+                12,
+                Some(&stats),
+                200_000,
+                Some(&usage)
+            ),
+            [
+                "context · kernel native · model MiniMax-M2",
+                "history: 12 messages · 420 chars (budget 200000 chars)",
+                "last turn usage: in=3636 out=58 tokens (exact)",
+                "prompt: 3 facts · 4 skills · system 812 chars",
+            ]
+        );
+
+        // 字符数是**字符**不是字节（多字节文本按实际字符数计），`estimated` 照实标注
+        let text = "中文字符";
+        let multibyte = PromptStats {
+            history_chars: text.chars().count(),
+            ..PromptStats::default()
+        };
+        let estimated = Usage {
+            input_tokens: 12,
+            output_tokens: 3,
+            estimated: true,
+        };
+        let lines = context_lines(
+            "native",
+            "test-model",
+            1,
+            Some(&multibyte),
+            200_000,
+            Some(&estimated),
+        );
+        assert_eq!(
+            lines[1],
+            format!(
+                "history: 1 messages · {} chars (budget 200000 chars)",
+                text.chars().count()
+            )
+        );
+        assert_eq!(lines[2], "last turn usage: in=12 out=3 tokens (estimated)");
+
+        // (b) native 还没跑过任务：统计与用量都是 None —— 两个位分别写 0 与 `-`
+        assert_eq!(
+            context_lines("native", "test-model", 0, None, 200_000, None),
+            [
+                "context · kernel native · model test-model",
+                "history: 0 messages · 0 chars (budget 200000 chars)",
+                "last turn usage: -",
+                "prompt: 0 facts · 0 skills · system 0 chars",
+            ]
+        );
+
+        // (c) 外置内核：模型位与 `/status` 同口径给 `(kernel default)`；用量位写「无数据」——
+        // 即使会话里落着外置内核累计出来的 0/0 默认值，也不许装成真实用量
+        for kernel in ["codex", "claude"] {
+            let lines = context_lines(kernel, "test-model", 0, None, 200_000, None);
+            assert_eq!(lines.len(), 4, "{kernel}: {lines:?}");
+            assert_eq!(
+                lines[0],
+                format!("context · kernel {kernel} · model (kernel default)")
+            );
+            assert_eq!(
+                lines[2], "last turn usage: unavailable (kernel reports no usage)",
+                "{kernel}"
+            );
+            assert_eq!(
+                context_lines(
+                    kernel,
+                    "test-model",
+                    0,
+                    None,
+                    200_000,
+                    Some(&Usage::default())
+                )[2],
+                "last turn usage: unavailable (kernel reports no usage)",
+                "{kernel}: 0/0 的占位值不是用量"
+            );
+        }
+
+        // (d) 统计有值但现在没有历史（`/resume` 后未跑任务）：条数随会话、字符数随统计
+        let resumed = PromptStats {
+            history_chars: 420,
+            ..stats
+        };
+        let lines = context_lines("native", "test-model", 0, Some(&resumed), 200_000, None);
+        assert_eq!(
+            lines[1],
+            "history: 0 messages · 420 chars (budget 200000 chars)"
+        );
+        assert_eq!(lines[2], "last turn usage: -");
     }
 
     /// banner 与 `/status` 共用的会话行取值：没有会话是 `new`，有就是 13 字符短 id。

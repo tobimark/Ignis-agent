@@ -25,9 +25,9 @@ use ignis_core::alerts::{MultiNotifier, Notifier};
 use ignis_core::config::{Config, OutputMode, ensure_home, ignis_home, load_config};
 use ignis_core::memory::MemoryStore;
 use ignis_core::security::{ApprovalMode, Policy};
-use ignis_core::session::SessionStore;
+use ignis_core::session::{HistoryMessage, SessionStore};
 use ignis_core::skills::SkillCatalog;
-use ignis_core::task::{TaskKind, TaskOutcome, TaskRequest, TaskRunner};
+use ignis_core::task::{PromptStats, TaskKind, TaskOutcome, TaskRequest, TaskRunner};
 use ignis_runtime::{ApprovalHandler, ChatMessage, RunStatus, Usage};
 use ignis_storage::{Db, SessionSummary};
 use tokio::sync::mpsc;
@@ -82,6 +82,9 @@ pub struct Session {
     current_session: Option<String>,
     /// 最近一轮任务的用量（`/status` 的 `last turn usage` 行）：`None` = 本会话还没跑过任务。
     last_usage: Option<Usage>,
+    /// 最近一轮任务的组装统计（`/context` 的 `chars` 与 `prompt` 行）：`None` = 本会话还没跑过
+    /// 任务、或最近一次会话切换（`-c` / `/new` / `/resume`）把它清掉了。
+    last_prompt_stats: Option<PromptStats>,
     /// 本会话是否已经做过自拉起提示（每会话至多一次，REPL 跨轮次共享）。
     already_prompted: AtomicBool,
 }
@@ -198,6 +201,7 @@ impl Session {
             history: Vec::new(),
             current_session: None,
             last_usage: None,
+            last_prompt_stats: None,
             already_prompted: AtomicBool::new(false),
         })
     }
@@ -264,6 +268,17 @@ impl Session {
         self.last_usage.as_ref()
     }
 
+    /// 最近一轮任务的组装统计（`/context` 的 `chars` 与 `prompt` 位）：本会话还没跑过任务时是
+    /// `None`，`/new` 与两个恢复路径之后也是 `None`。
+    pub fn last_prompt_stats(&self) -> Option<&PromptStats> {
+        self.last_prompt_stats.as_ref()
+    }
+
+    /// 字符预算（`config.limits.context_char_budget`，默认 200_000）：`/context` 的预算位。
+    pub fn context_budget(&self) -> usize {
+        self.config.limits.context_char_budget
+    }
+
     /// 当前会话 id（banner 与 `/status` 的 Session 行读它）：本进程还没落过会话行时是 `None`。
     pub fn current_session(&self) -> Option<&str> {
         self.current_session.as_deref()
@@ -302,10 +317,34 @@ impl Session {
         Ok(record.id)
     }
 
+    /// 清掉「最近一轮」的观察值（用量与组装统计）：`/new` 与两个恢复路径共用这一处。
+    ///
+    /// 两个值都是**上一段运行**的观察值，跟过来只会让 `/status` 与 `/context` 说谎。集中在这里
+    /// 是因为会话状态的清空点有三个（[`Session::resume_latest`] / [`Session::start_new_session`] /
+    /// [`Session::resume_session`]）：将来再加轮次观察值只补这一行，不会各抄一遍、漏一处。
+    fn clear_turn_state(&mut self) {
+        self.last_usage = None;
+        self.last_prompt_stats = None;
+    }
+
+    /// 换上一段会话（`-c` 与 `/resume` 共用）：当前会话指针与 canonical 历史成对更新，最近一轮的
+    /// 观察值跟着清掉（见 [`Session::clear_turn_state`]）。
+    ///
+    /// 指针与历史必须一起换：只换一处就会让下一轮任务把旧会话的历史送进内核，或在旧会话上追加
+    /// 新一轮消息。库里读出的 [`HistoryMessage`] 在这里统一还原成送进内核的 canonical 消息。
+    fn adopt_history(&mut self, id: String, history: Vec<HistoryMessage>) {
+        self.current_session = Some(id);
+        self.history = history
+            .into_iter()
+            .map(|message| message.to_chat_message())
+            .collect();
+        self.clear_turn_state();
+    }
+
     /// `-c`：装载本工作区最近一次会话的有效历史并设为当前会话；没有会话给 `Ok(None)`。
     ///
-    /// 命中时清掉最近用量（Task 6 起连 `last_prompt_stats` 一起清）：那是上一段运行的观察值，
-    /// 恢复后 `last turn usage` 行应显示 `-` 而不是旧值。未命中什么都不改。
+    /// 命中时清掉最近一轮的观察值（用量与组装统计，见 [`Session::clear_turn_state`]）：那是上一段
+    /// 运行的观察值，恢复后 `last turn usage` 与 `/context` 的统计行都应回到起点。未命中什么都不改。
     pub fn resume_latest(&mut self) -> Result<Option<usize>, String> {
         let store = self.store();
         let Some(record) = store
@@ -318,24 +357,19 @@ impl Session {
             .effective_history(&record.id)
             .map_err(|error| error.to_string())?;
         let count = history.len();
-        self.current_session = Some(record.id);
-        self.history = history
-            .into_iter()
-            .map(|message| message.to_chat_message())
-            .collect();
-        self.last_usage = None;
+        self.adopt_history(record.id, history);
         Ok(Some(count))
     }
 
     /// `/new`：清会话指针与历史，回到「本进程还没绑会话」的起点。
     ///
     /// 只清内存里的会话状态——模式、模型覆盖、内核一律不碰，数据也一行不删（旧会话留在
-    /// `sessions` 表里，之后可用 `/sessions` + `/resume` 回去）。Task 6 的 `last_prompt_stats`
-    /// 加入后在这里一并清空（与 [`Session::resume_latest`] 同一口径）。
+    /// `sessions` 表里，之后可用 `/sessions` + `/resume` 回去）。最近一轮的观察值（用量与组装
+    /// 统计）也一并清空（与 [`Session::resume_latest`] 同一口径）。
     pub fn start_new_session(&mut self) {
         self.history.clear();
         self.current_session = None;
-        self.last_usage = None;
+        self.clear_turn_state();
     }
 
     /// `/resume <id|前缀>`：按前缀解析本工作区的一条会话，装载有效历史并设为当前会话；
@@ -343,9 +377,9 @@ impl Session {
     ///
     /// 先过 [`task::is_id_prefix`] 的准入（≥8 字符、只含 uuid 字符集）：拼错或过短的参数直接报
     /// `session not found`，不去库里翻无关行。命中唯一一条时换成它的有效历史（最近一次压缩的
-    /// 摘要 + 其后原始消息），并清掉最近用量（Task 6 起连 `last_prompt_stats` 一起清）；命中多条
-    /// 把候选（新近在前、短 id、与 `/sessions` 同一口径）交给用户自己挑。错误一律人话 `Err`，
-    /// 由 REPL 原样打成 `error: {…}`。
+    /// 摘要 + 其后原始消息），并清掉最近一轮的观察值（用量与组装统计，见
+    /// [`Session::clear_turn_state`]）；命中多条把候选（新近在前、短 id、与 `/sessions` 同一口径）
+    /// 交给用户自己挑。错误一律人话 `Err`，由 REPL 原样打成 `error: {…}`。
     pub fn resume_session(&mut self, id: &str) -> Result<usize, String> {
         if !task::is_id_prefix(id) {
             return Err(format!("session not found: {id}"));
@@ -361,12 +395,7 @@ impl Session {
                     .effective_history(&record.id)
                     .map_err(|error| error.to_string())?;
                 let count = history.len();
-                self.current_session = Some(record.id.clone());
-                self.history = history
-                    .into_iter()
-                    .map(|message| message.to_chat_message())
-                    .collect();
-                self.last_usage = None;
+                self.adopt_history(record.id.clone(), history);
                 Ok(count)
             }
             many => Err(format!(
@@ -459,8 +488,9 @@ impl Session {
     /// 因此 `/kernel` 的切换只影响后续任务。本轮配置由 [`Session::effective_config`] 给出
     /// （native 的会话级模型覆盖在这里生效）。渲染选项每轮重算：模式来自会话状态（`/details`
     /// 切过就按新的来），颜色/主题/宽度来自 `config.ui` + stdout 的 tty 状态（宽度每轮探测一次
-    /// 终端）。结束后先 `finish()` 冲刷挂起内容再打结束行，随后把本轮用量与上下文记进会话
-    /// （`/status` 与下一轮内核都读它们），最后按本轮事件决定要不要提示自拉起守护进程。
+    /// 终端）。结束后先 `finish()` 冲刷挂起内容再打结束行，随后把本轮用量、组装统计与上下文记进
+    /// 会话（`/status`、`/context` 与下一轮内核都读它们），最后按本轮事件决定要不要提示自拉起
+    /// 守护进程。
     /// 监听任务必须随本次运行结束，否则 REPL 会攒下一串永远不会触发的监听器。
     ///
     /// 会话接线（REPL 轮次）：先懒创建会话（首个任务落一行），`TaskRequest.session_id` 带上它；
@@ -557,9 +587,11 @@ impl Session {
         renderer.finish();
 
         let outcome = result?;
-        // 运行成功才换跨轮上下文与最近用量：运行器返回 `Err` 时 `history` 保持原样（本轮没跑成）
+        // 运行成功才换跨轮上下文与最近一轮的观察值（用量 + 组装统计）：运行器返回 `Err` 时
+        // 三者都保持原样（本轮没跑成）
         self.history = outcome.messages.clone();
         self.last_usage = Some(outcome.usage);
+        self.last_prompt_stats = Some(outcome.stats);
         // 轮次落库：只追加 REPL 的一轮（user + 有最终答复时的 assistant），写库失败 fail-soft
         if kind == TaskKind::Repl
             && let Some(session_id) = session_id.as_deref()
@@ -711,6 +743,7 @@ pub(crate) mod fixtures {
             output_mode,
             model_override: None,
             last_usage: None,
+            last_prompt_stats: None,
             history: Vec::new(),
             current_session: None,
         }
@@ -1150,15 +1183,21 @@ mod tests {
         // 同一个 home / 同一工作区的又一个会话（等价于进程重启后的 `Session::new`）
         let mut resumed = session_at_home(dir.path(), "native", plain_config());
         assert_eq!(resumed.current_session(), None, "恢复前本进程还没有会话");
+        assert_eq!(resumed.last_prompt_stats(), None, "恢复前没有组装统计");
         assert_eq!(resumed.resume_latest().unwrap(), Some(2));
         assert!(resumed.current_session().is_some());
         assert_eq!(resumed.history(), expected.as_slice(), "有效历史逐条相等");
         assert_eq!(resumed.last_usage(), None);
 
-        // 恢复也重置最近用量：同进程里再恢复一次，跑过那一轮的旧观察值必须回落
+        // 恢复也重置最近一轮的观察值：同进程里再恢复一次，跑过那一轮的旧值必须回落
         assert!(session.last_usage().is_some(), "跑过一轮后有用量");
+        assert!(
+            session.last_prompt_stats().is_some(),
+            "跑过一轮后有组装统计"
+        );
         assert_eq!(session.resume_latest().unwrap(), Some(2));
         assert_eq!(session.last_usage(), None);
+        assert_eq!(session.last_prompt_stats(), None);
 
         // 空 home：没有会话，什么都不改
         let empty = TempDir::new("session-resume-empty");
@@ -1193,28 +1232,38 @@ mod tests {
             output_tokens: 2,
             estimated: false,
         });
+        let stats = PromptStats {
+            facts_injected: 1,
+            skills_listed: 4,
+            system_chars: 640,
+            history_chars: 128,
+        };
+        session.last_prompt_stats = Some(stats);
 
-        // `/resume <前缀>`：装载历史、切指针、清最近用量（运行前的观察值不该跟过来）
+        // `/resume <前缀>`：装载历史、切指针、清最近一轮的观察值（运行前的观察值不该跟过来）
         assert_eq!(session.resume_session(&id[..8]).unwrap(), 2);
         assert_eq!(session.current_session(), Some(id.as_str()));
         assert_eq!(session.history().len(), 2);
         assert_eq!(session.history()[0].content, "第一句");
         assert_eq!(session.history()[1].content, "答复一");
         assert_eq!(session.last_usage(), None, "恢复清掉最近用量");
+        assert_eq!(session.last_prompt_stats(), None, "恢复清掉组装统计");
         assert_eq!(session.output_mode(), OutputMode::Debug, "模式不动");
         assert_eq!(session.model(), "test-model-2", "模型覆盖不动");
         assert_eq!(session.kernel(), "native", "内核不动");
 
-        // `/new`：清会话指针/历史/最近用量；模式/模型/内核照旧，旧会话行还在库里
+        // `/new`：清会话指针/历史/最近一轮的观察值；模式/模型/内核照旧，旧会话行还在库里
         session.last_usage = Some(Usage {
             input_tokens: 1,
             output_tokens: 2,
             estimated: false,
         });
+        session.last_prompt_stats = Some(stats);
         session.start_new_session();
         assert_eq!(session.current_session(), None);
         assert!(session.history().is_empty());
         assert_eq!(session.last_usage(), None);
+        assert_eq!(session.last_prompt_stats(), None, "`/new` 清掉组装统计");
         assert_eq!(session.output_mode(), OutputMode::Debug, "模式不动");
         assert_eq!(session.model(), "test-model-2", "模型覆盖不动");
         assert_eq!(session.kernel(), "native", "内核不动");

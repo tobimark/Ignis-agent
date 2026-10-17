@@ -68,6 +68,23 @@ pub struct TaskRequest {
     pub session_id: Option<String>,
 }
 
+/// 本轮提示组装期统计（供 REPL 展示，不落库）。
+///
+/// 量的是**这一份送进内核的请求**：组装完成的那一刻算一次，之后模型怎么用（例如 native 在
+/// `trim_history` 里按预算裁历史）都不回写这里。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PromptStats {
+    /// 组装期交给 prompt 的事实条数（裁预算前）。
+    pub facts_injected: usize,
+    /// 技能目录条数（`skills.metas().len()`）。
+    pub skills_listed: usize,
+    /// system prompt 的字符数。
+    pub system_chars: usize,
+    /// 送进内核的 canonical 消息字符数（**pre-kernel-trim**：native 的 `trim_history` 之前的那一份，
+    /// 即历史 + 本轮用户输入；与「内核实际发出多少」不是同一口径）。
+    pub history_chars: usize,
+}
+
 /// 一次任务的结果；`messages` 即下一轮应当带上的上下文（末尾的 assistant 消息与
 /// [`TaskOutcome::final_text`] 同源，取的都是脱敏后的摘要）。
 pub struct TaskOutcome {
@@ -89,6 +106,8 @@ pub struct TaskOutcome {
     /// `load_skill` 同样计入，`ToolResult` 不算）。事件流没以 `Done` 收尾时统计的也是已经看到的
     /// 那些；与 [`TaskOutcome::skills_used`] 一样是本轮统计，不落库，供命令层结束行标注 `N tools`。
     pub tool_calls: usize,
+    /// 本轮提示组装期统计（`/context` 的展示面）：组装完成时算一次，不落库。
+    pub stats: PromptStats,
 }
 
 /// 任务编排的失败原因；内核自身的失败是 `Done{Failed}` 事件，不走这里。
@@ -299,16 +318,30 @@ impl TaskRunner {
             )),
             None => tool_runtime,
         };
+        let system_prompt = prompts::build_system_prompt(
+            &workspace,
+            &executor.specs(),
+            // 能力门控：工具段依内核能力二选一（外部内核的工具对 Ignis 不可用）
+            !self.runtime.capabilities().tools,
+            &facts,
+            self.skills.metas(),
+        );
+        // 组装期统计（`/context` 的展示面，不落库）：只量这一份即将送进内核的请求。
+        // `history_chars` 是 pre-kernel-trim 的口径——native 的 `trim_history` 之后内核真正发出的
+        // 消息可能更少，两者不是一回事；`facts_injected` 也是交给 prompt 装配的条数，极端超预算时
+        // 可能略大于渲染出的行数（截断发生在 prompts 内部，不回调）。
+        let stats = PromptStats {
+            facts_injected: facts.len(),
+            skills_listed: self.skills.metas().len(),
+            system_chars: system_prompt.chars().count(),
+            history_chars: messages
+                .iter()
+                .map(|message| message.content.chars().count())
+                .sum(),
+        };
         let request = RunRequest {
             messages: messages.clone(),
-            system_prompt: prompts::build_system_prompt(
-                &workspace,
-                &executor.specs(),
-                // 能力门控：工具段依内核能力二选一（外部内核的工具对 Ignis 不可用）
-                !self.runtime.capabilities().tools,
-                &facts,
-                self.skills.metas(),
-            ),
+            system_prompt,
             model: self.config.model.clone(),
             limits: self.config.limits,
             executor,
@@ -416,6 +449,7 @@ impl TaskRunner {
             messages,
             skills_used,
             tool_calls,
+            stats,
         })
     }
 
@@ -1437,6 +1471,61 @@ mod tests {
         assert!(
             prompt.contains("Answer in the user's language."),
             "{prompt}"
+        );
+    }
+
+    /// 组装期统计（`PromptStats`）：量的是**这一份送进内核的请求**——交给 prompt 的事实条数、
+    /// 技能目录条数、system prompt 字符数与历史字符数（历史 + 本轮输入，native `trim_history`
+    /// 之前的口径），随 `TaskOutcome` 一起交回。
+    #[tokio::test]
+    async fn prompt_stats_measure_the_assembly() {
+        let env = Env::new("stats", vec![success(Some("done"))], None);
+        let workspace = env.dir.path().to_path_buf();
+        env.remember_project(&workspace, "pkg_manager", "这个项目用 uv 管理依赖");
+        env.memory
+            .remember(FactScope::User, None, "editor", "偏好 Neovim 编辑", None)
+            .unwrap();
+
+        // 历史两条 + 本轮输入一条：三者的字符数一起计进 `history_chars`
+        let mut req = env.request("依赖帮我用 Neovim 改一下");
+        req.history = vec![user("第一轮"), assistant("答复一")];
+        let report = env.run(req).await;
+
+        assert_eq!(report.outcome.status, RunStatus::Success);
+        let stats = report.outcome.stats;
+        // 一条 project 事实（无条件注入）+ 一条被 prompt 检索到的 user 事实
+        assert_eq!(stats.facts_injected, 2);
+        assert_eq!(stats.skills_listed, env.skills.metas().len());
+        // system 字符数就是内核收到的那一份（同一份字符串，不是估算）
+        let prompt = &env.system_prompts()[0];
+        assert_eq!(stats.system_chars, prompt.chars().count());
+        assert!(stats.system_chars > 0, "{prompt}");
+        // 历史字符 = 历史两条 + 本轮输入（含本轮，不是只有历史那一份）
+        let expected: usize = ["第一轮", "答复一", "依赖帮我用 Neovim 改一下"]
+            .iter()
+            .map(|text| text.chars().count())
+            .sum();
+        assert_eq!(stats.history_chars, expected);
+        assert!(
+            stats.history_chars > "第一轮".chars().count(),
+            "本轮输入必须计入：{stats:?}"
+        );
+
+        // 没有事实时事实位归零，其余口径不变（技能目录恒带内置三技能，故技能位只钉「与目录同长」）
+        let bare = Env::new("stats-bare", vec![success(Some("done"))], None);
+        let report = bare.run(bare.request("随便问一句")).await;
+        assert_eq!(report.outcome.stats.facts_injected, 0);
+        assert_eq!(
+            report.outcome.stats.skills_listed,
+            bare.skills.metas().len()
+        );
+        assert_eq!(
+            report.outcome.stats.history_chars,
+            "随便问一句".chars().count()
+        );
+        assert_eq!(
+            report.outcome.stats.system_chars,
+            bare.system_prompts()[0].chars().count()
         );
     }
 
