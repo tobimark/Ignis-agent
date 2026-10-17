@@ -14,6 +14,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ignis_runtime::test_support::ScriptStep;
 use serde_json::Value;
 
+/// pty 夹具（`libc::openpty` + 子进程直连从端）：只服务 REPL 的交互用例。
+///
+/// 非 unix 上 `openpty` 这条路线不存在（CLI 本身照样编），所以整块按平台门控。
+#[cfg(unix)]
+pub mod pty;
+
 /// 同一测试进程内的目录序号：并行执行的用例之间互不撞名。
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
