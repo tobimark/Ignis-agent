@@ -185,6 +185,9 @@ impl TaskRunner {
             kernel: kernel.to_string(),
             workspace: workspace.display().to_string(),
             started_at: now_millis(),
+            // 会话关联列（迁移 004）：本次只落存储层，`TaskRequest` 还没有 `session_id`
+            // （`ignis run` 与调度运行不绑会话，写 None 与既有行为一致）
+            session_id: None,
         })?;
 
         // 任务行已落库：此后任何基础设施失败（含事件循环里的落盘失败）都要先把这一行收成

@@ -115,8 +115,8 @@ fn migration_003_creates_the_schedule_tables_and_bumps_user_version() {
     let path = dir.join("ignis.db");
 
     let db = Db::open(&path).unwrap();
-    // 三条迁移都已应用
-    assert_eq!(user_version(&db), 3);
+    // 四条迁移都已应用
+    assert_eq!(user_version(&db), 4);
     for table in ["jobs", "job_runs", "alerts"] {
         assert!(object_exists(&db, "table", table), "{table} 缺失");
     }
@@ -182,15 +182,17 @@ fn migration_003_creates_the_schedule_tables_and_bumps_user_version() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// v2 → v3 升级：一个只跑到 002 的库（`user_version = 2`，没有 003 的三张表）打开后应建出
-/// `jobs` / `job_runs` / `alerts`、把 `user_version` 推到 3，且 001/002 期间的既有数据（这里：
-/// 一条任务行）一条不少。手工回退版本号 + 删表就是「旧版 ignis 写的库」的最小复现。
+/// v2 → 最新升级：一个只跑到 002 的库（`user_version = 2`，没有 003 的三张表，也没有 004 的会话表
+/// 与 `tasks` 两列）打开后应把 003 与 004 一起应用、`user_version` 推到 4，且 001/002 期间的既有
+/// 数据（这里：一条任务行）一条不少。手工回退版本号 + 删表/删列就是「旧版 ignis 写的库」的最小
+/// 复现；构造**真实** v3 库的升级用例在 `src/db.rs` 的内联测试里（那里能按序执行 `MIGRATIONS`）。
 #[test]
 fn a_v2_database_upgrades_to_v3_and_keeps_earlier_rows() {
     let dir = temp_dir("upgrade");
     let path = dir.join("ignis.db");
 
-    // 先开一个最新库，写入 001 时代的任务行，再把 003 的成果抹掉并退回版本号 2
+    // 先开一个最新库，写入 001 时代的任务行，再把 003/004 的成果抹掉并退回版本号 2：
+    // 两列也要 `DROP COLUMN` 掉，否则重跑 004 的 `ALTER TABLE tasks ADD COLUMN` 会撞重复列
     let db = Db::open(&path).unwrap();
     let task = NewTask {
         id: "task-1".into(),
@@ -199,34 +201,62 @@ fn a_v2_database_upgrades_to_v3_and_keeps_earlier_rows() {
         kernel: "native".into(),
         workspace: "/w".into(),
         started_at: 42,
+        session_id: None,
     };
     db.insert_task(&task).unwrap();
     db.with_conn(|c| {
         c.execute_batch(
-            "DROP TABLE jobs;
+            "DROP TABLE session_messages;
+             DROP TABLE session_compactions;
+             DROP TABLE sessions;
+             DROP TABLE jobs;
              DROP TABLE job_runs;
              DROP TABLE alerts;
+             ALTER TABLE tasks DROP COLUMN session_id;
+             ALTER TABLE tasks DROP COLUMN skills_used;
              PRAGMA user_version = 2",
         )
     })
     .unwrap();
-    // 前提：003 的三张表确实不在了（否则这条用例什么也没验证）
-    for table in ["jobs", "job_runs", "alerts"] {
+    // 前提：003/004 的成果确实不在了（否则这条用例什么也没验证）
+    for table in [
+        "jobs",
+        "job_runs",
+        "alerts",
+        "sessions",
+        "session_messages",
+        "session_compactions",
+    ] {
         assert!(!object_exists(&db, "table", table), "{table} 应已被删掉");
     }
+    assert!(
+        !table_columns(&db, "tasks")
+            .iter()
+            .any(|c| c == "session_id")
+    );
     assert_eq!(user_version(&db), 2);
     drop(db);
 
-    // 再打开：003 重新应用，版本推到 3，旧数据仍在
+    // 再打开：003 与 004 一起重新应用，版本推到 4，旧数据仍在
     let db = Db::open(&path).unwrap();
-    assert_eq!(user_version(&db), 3);
-    for table in ["jobs", "job_runs", "alerts"] {
+    assert_eq!(user_version(&db), 4);
+    for table in [
+        "jobs",
+        "job_runs",
+        "alerts",
+        "sessions",
+        "session_messages",
+        "session_compactions",
+    ] {
         assert!(object_exists(&db, "table", table), "{table} 缺失");
     }
     let row = db.get_task("task-1").unwrap().expect("旧任务行应还在");
     assert_eq!(row.status, "running");
     assert_eq!(row.prompt, "旧版本写下的任务");
     assert_eq!(row.started_at, 42);
+    // 004 的两列对旧行是 `ALTER TABLE` 的默认值 NULL
+    assert_eq!(row.session_id, None);
+    assert_eq!(row.skills_used, None);
     // 新表可用：升级之后 003 的 DAO 能正常读写
     db.insert_job(&job("job-1")).unwrap();
     assert_eq!(job_ids(&db.list_jobs(false).unwrap()), ["job-1"]);
@@ -249,7 +279,7 @@ fn reopening_a_migrated_database_is_idempotent_and_keeps_schedule_rows() {
 
     // 第二次打开：迁移是 no-op，三张表的数据都还在
     let db = Db::open(&path).unwrap();
-    assert_eq!(user_version(&db), 3);
+    assert_eq!(user_version(&db), 4);
     assert!(db.get_job("job-1").unwrap().is_some());
     assert_eq!(
         run_ids(&db.list_job_runs(Some("job-1"), 10).unwrap()),

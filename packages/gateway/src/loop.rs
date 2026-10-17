@@ -1125,6 +1125,7 @@ mod tests {
                 kernel: "native".into(),
                 workspace: env.home.path().display().to_string(),
                 started_at: 1,
+                session_id: None,
             })
             .unwrap();
         // 交互运行的活行（kind=run）：清场不该碰它
@@ -1136,6 +1137,7 @@ mod tests {
                 kernel: "native".into(),
                 workspace: env.home.path().display().to_string(),
                 started_at: 2,
+                session_id: None,
             })
             .unwrap();
 

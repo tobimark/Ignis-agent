@@ -12,6 +12,8 @@ pub struct NewTask {
     pub workspace: String,
     /// epoch 毫秒。
     pub started_at: i64,
+    /// 这条任务所属的会话（REPL 内提交时给）；`ignis run` 与调度运行为 `None`。
+    pub session_id: Option<String>,
 }
 
 /// `tasks` 表的一行。
@@ -33,15 +35,22 @@ pub struct TaskRecord {
     pub started_at: i64,
     /// epoch 毫秒；任务未收尾时为 `None`。
     pub ended_at: Option<i64>,
+    /// 这条任务所属的会话（迁移 004 加的列）；`ignis run` 与调度运行为 `None`。
+    pub session_id: Option<String>,
+    /// 本轮用到的技能名（迁移 004 加的列，逗号分隔；`set_task_skills_used` 写，没记过为 `None`）。
+    pub skills_used: Option<String>,
 }
 
 const TASK_COLUMNS: &str = "id, kind, prompt, kernel, workspace, status, summary, error, \
-                            input_tokens, output_tokens, usage_estimated, started_at, ended_at";
+                            input_tokens, output_tokens, usage_estimated, started_at, ended_at, \
+                            session_id, skills_used";
 
 /// 把 `prefix` 里的 LIKE 元字符转义成字面（配合 `ESCAPE '\'`）。
 ///
 /// 反斜杠必须**先**转，否则 `\%` 会被再转一次变成 `\\%`（仍旧匹配一个字面 `%`，但多一层转义）。
-fn escape_like(prefix: &str) -> String {
+/// 任务 id 与会话 id 的前缀查询共用这一份（见 [`Db::task_ids_with_prefix`] /
+/// [`Db::session_ids_with_prefix`]）。
+pub(crate) fn escape_like(prefix: &str) -> String {
     let mut out = String::with_capacity(prefix.len());
     for c in prefix.chars() {
         if matches!(c, '\\' | '%' | '_') {
@@ -68,17 +77,28 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<TaskRecord> {
         usage_estimated: row.get("usage_estimated")?,
         started_at: row.get("started_at")?,
         ended_at: row.get("ended_at")?,
+        session_id: row.get("session_id")?,
+        skills_used: row.get("skills_used")?,
     })
 }
 
 impl Db {
-    /// 插入一条 `running` 状态的任务行。
+    /// 插入一条 `running` 状态的任务行；`session_id` 为 `None` 表示不绑会话。
     pub fn insert_task(&self, t: &NewTask) -> Result<()> {
         self.with_conn(|c| {
             c.execute(
-                "INSERT INTO tasks (id, kind, prompt, kernel, workspace, status, started_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6)",
-                params![t.id, t.kind, t.prompt, t.kernel, t.workspace, t.started_at],
+                "INSERT INTO tasks (id, kind, prompt, kernel, workspace, status, started_at,
+                 session_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, ?7)",
+                params![
+                    t.id,
+                    t.kind,
+                    t.prompt,
+                    t.kernel,
+                    t.workspace,
+                    t.started_at,
+                    t.session_id
+                ],
             )?;
             Ok(())
         })
@@ -113,6 +133,27 @@ impl Db {
                 ended_at,
                 id,
             ])
+        })?;
+        if updated == 0 {
+            return Err(StorageError::TaskNotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// 记录这条任务用到的技能名（逗号分隔落库）；空表写 NULL。任务行不存在时报错。
+    ///
+    /// 与 [`Db::finish_task`] 分开：finish 的形状是 P1 钉死的，会话路径只补这一列（`task show`
+    /// 与 `/tasks` 展示用）。
+    pub fn set_task_skills_used(&self, id: &str, skills_used: &[String]) -> Result<()> {
+        // 空表落 NULL 而不是空串：展示面靠 `None` 判「没记」
+        let joined = if skills_used.is_empty() {
+            None
+        } else {
+            Some(skills_used.join(","))
+        };
+        let updated = self.with_conn(|c| {
+            c.prepare_cached("UPDATE tasks SET skills_used = ?1 WHERE id = ?2")?
+                .execute(params![joined, id])
         })?;
         if updated == 0 {
             return Err(StorageError::TaskNotFound(id.to_string()));
@@ -189,6 +230,7 @@ mod tests {
             kernel: "native".into(),
             workspace: "/w".into(),
             started_at,
+            session_id: None,
         }
     }
 
@@ -211,6 +253,9 @@ mod tests {
         assert_eq!(rec.output_tokens, 0);
         assert!(!rec.usage_estimated);
         assert_eq!(rec.ended_at, None);
+        // 迁移 004 的两个新列：没给会话就是不绑（`ignis run` 的口径），技能名还没记
+        assert_eq!(rec.session_id, None);
+        assert_eq!(rec.skills_used, None);
     }
 
     #[test]

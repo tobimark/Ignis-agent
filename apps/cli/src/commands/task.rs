@@ -502,6 +502,7 @@ mod tests {
             kernel: "native".into(),
             workspace: "/tmp/project".into(),
             started_at: STARTED_AT,
+            session_id: None,
         })
         .unwrap();
         db.finish_task(
@@ -571,6 +572,8 @@ mod tests {
             usage_estimated: false,
             started_at,
             ended_at: None,
+            session_id: None,
+            skills_used: None,
         }
     }
 
@@ -637,6 +640,7 @@ mod tests {
             kernel: "native".into(),
             workspace: "/tmp/project".into(),
             started_at,
+            session_id: None,
         })
         .unwrap();
     }

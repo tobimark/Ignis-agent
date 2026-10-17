@@ -677,6 +677,7 @@ mod tests {
                 kernel: "native".into(),
                 workspace: "/tmp/project".into(),
                 started_at,
+                session_id: None,
             })
             .unwrap();
     }

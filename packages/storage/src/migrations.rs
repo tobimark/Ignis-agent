@@ -75,6 +75,42 @@ CREATE TABLE alerts (
 CREATE INDEX idx_alerts_dedup_created ON alerts(dedup_key, created_at);
 CREATE INDEX idx_alerts_read ON alerts(read_at);
 ",
+    // 004：会话表（会话 / canonical 消息 / 压缩摘要）与 `tasks` 的会话关联列。
+    //
+    // 取值契约（由上层保证，storage 与 `tasks.status` 一样不做校验）：
+    // - `session_messages.role`：user | assistant——会话只存 canonical 消息（用户提示词 + assistant
+    //   最终答复），工具细节留在任务 JSONL；
+    // - `session_messages.tool_call_id` / `tool_calls`：P3 一律 NULL（canonical 消息是纯文本，列先留着）；
+    // - `session_compactions.upto_seq`：已被摘要覆盖的最后一条消息的 `seq`（有效历史 = 最近一次摘要
+    //   + 其后消息；原始消息一条不删）。
+    // `idx_session_messages_seq` 兼作「同一会话内 `seq` 不重复」的唯一约束（追加时按
+    // `COALESCE(MAX(seq), 0)` 续写）；`idx_sessions_workspace` 服务「本工作区最近会话」与列表。
+    // `tasks.session_id` 为 NULL 表示这条任务不绑会话（`ignis run` 与调度运行）；
+    // `tasks.skills_used` 是逗号分隔的技能名（空表写 NULL）。003 及以前的库升级上来时，
+    // 既有任务行的两个新列都是 `ALTER TABLE` 的默认值 NULL。
+    "
+CREATE TABLE sessions (
+  id TEXT PRIMARY KEY, title TEXT NOT NULL, workspace TEXT NOT NULL,
+  kernel TEXT NOT NULL, model TEXT,
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE TABLE session_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL REFERENCES sessions(id),
+  seq INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
+  tool_call_id TEXT, tool_calls TEXT,
+  created_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX idx_session_messages_seq ON session_messages(session_id, seq);
+CREATE INDEX idx_sessions_workspace ON sessions(workspace, updated_at DESC);
+CREATE TABLE session_compactions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL REFERENCES sessions(id),
+  upto_seq INTEGER NOT NULL, summary TEXT NOT NULL, created_at INTEGER NOT NULL
+);
+ALTER TABLE tasks ADD COLUMN session_id TEXT;
+ALTER TABLE tasks ADD COLUMN skills_used TEXT;
+",
 ];
 
 /// 逐条应用未执行的迁移；每条迁移在独立事务中执行并同步推进 `user_version`。

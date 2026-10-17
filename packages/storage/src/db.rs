@@ -150,7 +150,10 @@ mod tests {
         assert!(table_exists(&db, "jobs"));
         assert!(table_exists(&db, "job_runs"));
         assert!(table_exists(&db, "alerts"));
-        assert_eq!(user_version(&db), 3);
+        assert!(table_exists(&db, "sessions"));
+        assert!(table_exists(&db, "session_messages"));
+        assert!(table_exists(&db, "session_compactions"));
+        assert_eq!(user_version(&db), 4);
         drop(db);
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -169,13 +172,14 @@ mod tests {
             kernel: "native".into(),
             workspace: "/w".into(),
             started_at: 1,
+            session_id: None,
         })
         .unwrap();
         drop(db);
 
         // 第二次打开同一路径：迁移已是 no-op，既有数据仍在。
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 3);
+        assert_eq!(user_version(&db), 4);
         assert!(db.get_task("01").unwrap().is_some());
         drop(db);
 
@@ -219,7 +223,74 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         assert!(table_exists(&db, "tasks"));
         assert!(table_exists(&db, "approvals"));
-        assert_eq!(user_version(&db), 3);
+        assert!(table_exists(&db, "sessions"));
+        assert_eq!(user_version(&db), 4);
         assert!(db.list_tasks(10).unwrap().is_empty());
+    }
+
+    /// v3 → v4 升级：造一个**真实的 v3 库**（逐条执行 001–003 的脚本、`user_version` 停在 3），再交给
+    /// [`Db::open`]；004 的三张表应补齐、`user_version` 推到 4，001 时代写下的任务行一个字段不少，
+    /// 两个新列是 `ALTER TABLE` 对旧行的默认值 `NULL`。
+    ///
+    /// 不能「先开一个 v4 库、写行、再把 `user_version` 降回 3 重开」：004 对 `tasks` 是
+    /// `ALTER TABLE ADD COLUMN`，重跑会因列已存在而失败，测的就不是真实的旧库升级路径。
+    /// 用例放在这里是因为要按序执行 `MIGRATIONS`（crate 内可见），集成测试只走公共 API。
+    #[test]
+    fn a_v3_database_upgrades_to_v4_and_keeps_earlier_rows() {
+        let dir = temp_dir("upgrade-v3");
+        let path = dir.join("ignis.db");
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        for sql in &crate::migrations::MIGRATIONS[..3] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 3i64).unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, kind, prompt, kernel, workspace, status, summary, error,
+             input_tokens, output_tokens, usage_estimated, started_at, ended_at)
+             VALUES ('v3-task', 'run', '旧版本写下的任务', 'native', '/w', 'success', '已完成',
+             NULL, 3, 4, 0, 42, 77)",
+            [],
+        )
+        .unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+        drop(conn);
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(user_version(&db), 4);
+        assert!(table_exists(&db, "sessions"));
+        assert!(table_exists(&db, "session_messages"));
+        assert!(table_exists(&db, "session_compactions"));
+
+        let task = db.get_task("v3-task").unwrap().expect("旧任务行");
+        assert_eq!(task.kind, "run");
+        assert_eq!(task.prompt, "旧版本写下的任务");
+        assert_eq!(task.kernel, "native");
+        assert_eq!(task.workspace, "/w");
+        assert_eq!(task.status, "success");
+        assert_eq!(task.summary.as_deref(), Some("已完成"));
+        assert_eq!(task.error, None);
+        assert_eq!((task.input_tokens, task.output_tokens), (3, 4));
+        assert!(!task.usage_estimated);
+        assert_eq!(task.started_at, 42);
+        assert_eq!(task.ended_at, Some(77));
+        // 两个新列直接按 SQL 查：`ALTER TABLE` 给旧行填的是默认值 NULL，与 DAO 的字段映射无关
+        let (session_id, skills_used): (Option<String>, Option<String>) = db
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT session_id, skills_used FROM tasks WHERE id = 'v3-task'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(session_id, None);
+        assert_eq!(skills_used, None);
+        drop(db);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
