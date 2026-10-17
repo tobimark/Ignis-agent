@@ -69,11 +69,10 @@ impl LineReader for StdinReader {
     }
 }
 
-/// REPL banner：固定 4 行（版本号是 P1 的固定文案，不跟 `CARGO_PKG_VERSION` 联动），有未读告警时
-/// 追加第 5 行。
+/// REPL banner：固定 4 行（版本号跟 `CARGO_PKG_VERSION` 联动，不写死字面量），有未读告警时追加第 5 行。
 ///
-/// 第 4 行是运行时就绪度：技能目录条数 + active 事实数；一条事实都没有（`memory == 0`，
-/// 也含计数读失败时调用方退回的 0）打 `Memory: off`。
+/// 第 4 行是运行时就绪度：技能目录条数 + active 事实数（0 也照实显示 `Memory: 0 facts`——
+/// 记忆是「有就注入」的可选段，不是开关，不该在 banner 上显示成 `off`）。
 ///
 /// 第 5 行只在有未读告警时出现（spec §6.1：启动时若有未读告警，顶部横幅提示）：`unread` 为
 /// `Some(n)` 且 `n > 0` 时给 `⚠ {n} unread alerts — run \`ignis alerts\``；`None`（计数读失败，
@@ -86,27 +85,15 @@ pub fn banner_lines(
     unread_alerts: Option<usize>,
 ) -> Vec<String> {
     let mut lines = vec![
-        "IGNIS v0.1".to_string(),
+        format!("IGNIS v{}", env!("CARGO_PKG_VERSION")),
         "● Ready".to_string(),
         format!("Workspace: {}", workspace.display()),
-        format!(
-            "Runtime: {kernel} · Skills: {skills} · {}",
-            memory_segment(memory)
-        ),
+        format!("Runtime: {kernel} · Skills: {skills} · Memory: {memory} facts"),
     ];
     if let Some(count) = unread_alerts.filter(|count| *count > 0) {
         lines.push(format!("⚠ {count} unread alerts — run `ignis alerts`"));
     }
     lines
-}
-
-/// banner 的记忆段：有 active 事实给 `Memory: {n} facts`，没有给 `Memory: off`。
-fn memory_segment(facts: usize) -> String {
-    if facts == 0 {
-        "Memory: off".to_string()
-    } else {
-        format!("Memory: {facts} facts")
-    }
 }
 
 /// 分类一行输入：空行跳过，三个斜杠命令之外都当作任务内容（去掉行尾换行与首尾空白）。
@@ -151,7 +138,7 @@ pub async fn run(cli: &Cli) -> Result<ExitCode> {
     }
 
     let mut session = Session::new(cli)?;
-    // 计数来自会话里那份存储/技能目录（与运行器同一份），读库失败只退回 `Memory: off`
+    // 计数来自会话里那份存储/技能目录（与运行器同一份），读库失败只退回 0 facts
     // 与「不打未读行」（各自已打一行警告）
     let (skills, memory) = session.banner_counts();
     let unread = session.unread_alerts();
@@ -214,6 +201,9 @@ pub async fn run(cli: &Cli) -> Result<ExitCode> {
                     .run_task(prompt, history.clone(), TaskKind::Repl)
                     .await?;
                 history = outcome.messages;
+                // 轮次之间空一行：上一轮的结束行与下一轮的提示符不至于粘在一起
+                // （`ignis run` 是一锤子买卖，不补这一行）
+                println!();
             }
         }
     }
@@ -246,22 +236,22 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "IGNIS v0.1".to_string(),
+                // 版本号跟 `CARGO_PKG_VERSION` 联动（钉死字面量会让升级后 banner 说谎）
+                format!("IGNIS v{}", env!("CARGO_PKG_VERSION")),
                 "● Ready".to_string(),
                 "Workspace: /tmp/ws".to_string(),
                 "Runtime: native · Skills: 3 · Memory: 2 facts".to_string(),
             ]
         );
-        assert!(lines.contains(&"IGNIS v0.1".to_string()), "{lines:?}");
         assert!(lines.contains(&"● Ready".to_string()), "{lines:?}");
     }
 
     #[test]
-    fn banner_marks_memory_off_when_there_are_no_facts() {
+    fn banner_counts_zero_facts_instead_of_turning_memory_off() {
         let lines = banner_lines(Path::new("/tmp/ws"), "native", 5, 0, None);
 
-        assert_eq!(lines[3], "Runtime: native · Skills: 5 · Memory: off");
-        assert!(!lines[3].contains("0 facts"), "{lines:?}");
+        assert_eq!(lines[3], "Runtime: native · Skills: 5 · Memory: 0 facts");
+        assert!(!lines[3].contains("off"), "{lines:?}");
     }
 
     /// 未读告警：有就追加第 5 行（点名条数与下一步命令），没有（0 或计数读失败）保持 4 行。

@@ -4,19 +4,23 @@
 //! [`TaskLog`] 写的 JSONL：能解析成 `RuntimeEvent` 的行渲染成 `HH:MM:SS 类型 …`，
 //! 解析不了的行（`task_start`/`task_end` 这类运行器自己的行、被手工改坏的行）只展示
 //! `type` 字段——任何一种行都不能让 `task show` 失败。
+//!
+//! `show` 的参数是完整 id 或 ≥8 字符的唯一前缀（`task list` 的第一列印的就是 13 字符短 id，
+//! 可以直接复制过来用）；`list` 的 id 列、结束行与这里的候选名单共用 [`short_id`] 一个口径。
 
 use std::fs;
 use std::io;
 use std::path::Path;
 use std::process::ExitCode;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use ignis_core::config::ignis_home;
 use ignis_runtime::RuntimeEvent;
 use ignis_storage::{ApprovalRecord, Db, TaskLog, TaskRecord};
 use serde_json::Value;
 
 use crate::cli::TaskCommand;
+use crate::render::short_id;
 
 /// 事件详情与兜底行的展示上限（按字符数，不按字节）。
 const DETAIL_CHARS: usize = 120;
@@ -25,6 +29,10 @@ const PROMPT_CHARS: usize = 40;
 /// 兜底事件行最多展示的标量字段数与其取值长度。
 const FALLBACK_FIELDS: usize = 3;
 const FALLBACK_VALUE_CHARS: usize = 40;
+/// 前缀解析允许的最短参数：短于此的输入不当前缀用（否则 `task show 2` 会撞到一半任务）。
+const ID_PREFIX_MIN: usize = 8;
+/// 歧义错误里最多列出的候选数（前缀撞车只用于人工二选一，不需要全量）。
+const CANDIDATES: usize = 10;
 
 /// `ignis task`：`show` 看一条任务，`list` 看最近若干条。
 pub fn run(command: &TaskCommand) -> Result<ExitCode> {
@@ -34,7 +42,7 @@ pub fn run(command: &TaskCommand) -> Result<ExitCode> {
     }
 }
 
-/// 打印一条任务的详情；任务不存在时报 `task not found: {id}`。
+/// 打印一条任务的详情；id 可以是完整 id，也可以是 ≥8 字符的唯一前缀。
 fn show(id: &str) -> Result<ExitCode> {
     print!("{}", show_at(&ignis_home(), id)?);
     Ok(ExitCode::SUCCESS)
@@ -48,16 +56,51 @@ fn list(limit: usize) -> Result<ExitCode> {
 }
 
 /// 从 `home` 下读出任务详情文本；`home` 可注入，便于测试。
+///
+/// id 的解析规则见 [`find_task`]：完整 id 精确命中，否则按 ≥8 字符的唯一前缀。
 fn show_at(home: &Path, id: &str) -> Result<String> {
     let db = Db::open(&home.join("ignis.db"))?;
-    let Some(task) = db.get_task(id)? else {
-        // 未找到是命令层的错误：`main` 打成 `error: task not found: {id}` 并给退出码 1
-        bail!("task not found: {id}");
-    };
-    let approvals = db.list_approvals(id)?;
+    let task = find_task(&db, id)?;
+    let approvals = db.list_approvals(&task.id)?;
     // 日志路径与写入方同源（`TaskLog::path`）
-    let log_path = TaskLog::new(&home.join("logs"))?.path(id);
+    let log_path = TaskLog::new(&home.join("logs"))?.path(&task.id);
     Ok(render_task(&task, &approvals, &log_path)?)
+}
+
+/// `task show <id|前缀>` 的 id 解析：**全等优先**（含旧日志里的非 uuid id），否则按前缀查。
+///
+/// 前缀要求 ≥8 字符且只含 uuid 的字符集（`[0-9a-f-]`）：这条闸门让拼错的任务名与过短的参数
+/// 直接报「没找到」，而不是去库里撞出一堆无关行。命中 1 条就用它，0 条报没找到，多条把候选
+/// （短 id，与 `task list` 同一口径）交给用户自己挑。
+fn find_task(db: &Db, arg: &str) -> Result<TaskRecord> {
+    if let Some(task) = db.get_task(arg)? {
+        return Ok(task);
+    }
+    if !is_id_prefix(arg) {
+        bail!("task not found: {arg}");
+    }
+    let ids = db.task_ids_with_prefix(arg, CANDIDATES)?;
+    match ids.as_slice() {
+        [] => bail!("task not found: {arg}"),
+        [id] => db
+            .get_task(id)?
+            .ok_or_else(|| anyhow!("task not found: {arg}")),
+        _ => bail!(
+            "ambiguous task id: {arg}（候选：{}）",
+            ids.iter()
+                .map(|id| short_id(id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// 前缀的准入：至少 [`ID_PREFIX_MIN`] 个字符且只含 uuid 的字符集（`[0-9a-f-]`）。
+fn is_id_prefix(arg: &str) -> bool {
+    arg.chars().count() >= ID_PREFIX_MIN
+        && arg
+            .chars()
+            .all(|c| matches!(c, '0'..='9' | 'a'..='f' | '-'))
 }
 
 /// 任务详情：头部（一字段一行）→ 审批记录表 → 事件流。
@@ -107,7 +150,7 @@ fn render_task(
     Ok(out)
 }
 
-/// 最近任务表：id 前 8 位、status、kind、started、prompt 前 40 字符。
+/// 最近任务表：id 短 id（13 字符）、status、kind、started、prompt 前 40 字符。
 fn render_list(tasks: &[TaskRecord]) -> String {
     let mut rows = vec![vec![
         "ID".to_string(),
@@ -118,7 +161,8 @@ fn render_list(tasks: &[TaskRecord]) -> String {
     ]];
     for task in tasks {
         rows.push(vec![
-            id_prefix(&task.id),
+            // 与结束行、`task show` 的前缀解析共用同一个短 id 口径
+            short_id(&task.id),
             task.status.clone(),
             task.kind.clone(),
             format_time(task.started_at),
@@ -387,14 +431,6 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year + i64::from(month <= 2), month, day)
 }
 
-/// id 的展示前缀（8 字符；uuid 前 8 字符必然存在）。
-///
-/// 只有 `task list` 用：任务 id 仍是完整 uuid，列表里只露前 8 位求一眼能分；
-/// `schedule`/`alerts` 展示的是完整的 10 位短 id，不再截断。
-pub(crate) fn id_prefix(id: &str) -> String {
-    id.chars().take(8).collect()
-}
-
 /// 压成单行：换行/制表/连续空白合成一个空格（表格单元格必过这一层，多行文本不会撑破表格）。
 pub(crate) fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -416,6 +452,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use ignis_runtime::RunStatus;
     use ignis_storage::{NewApproval, NewTask, TaskLog};
     use serde_json::json;
 
@@ -587,8 +624,130 @@ mod tests {
         assert_eq!(error, "task not found: nope");
     }
 
+    /// 往临时 home 的库里再插一条任务行（前缀歧义与前缀命中共用）。
+    fn insert_task(home: &Path, id: &str, started_at: i64) {
+        let db = Db::open(&home.join("ignis.db")).unwrap();
+        db.insert_task(&NewTask {
+            id: id.to_string(),
+            kind: "run".into(),
+            prompt: "另一条任务".into(),
+            kernel: "native".into(),
+            workspace: "/tmp/project".into(),
+            started_at,
+        })
+        .unwrap();
+    }
+
+    /// `task show <前缀>`：全等之外的参数按前缀解析（≥8 字符且只含 uuid 字符集）。
     #[test]
-    fn task_list_shows_id_prefix_and_truncates_prompt() {
+    fn task_show_resolves_a_unique_id_prefix() {
+        let home = TempHome::new("prefix");
+        let id = fixture(home.path());
+
+        // 8 字符、13 字符短 id 与完整 id 都命中同一条
+        for arg in [&id[..8], &id[..13], id.as_str()] {
+            let out = show_at(home.path(), arg).unwrap_or_else(|error| panic!("{arg}: {error}"));
+            assert!(out.contains(&format!("id: {id}\n")), "{arg}: {out}");
+            assert!(out.contains("summary: 已修复\n"), "{arg}: {out}");
+        }
+    }
+
+    /// 前缀撞上多条时不是「随便挑一条」，而是把候选交给用户（短 id 与 `task list` 同一口径）。
+    #[test]
+    fn task_show_reports_an_ambiguous_prefix_with_candidates() {
+        let home = TempHome::new("ambiguous");
+        let id = fixture(home.path());
+        let other = format!("{}2", &id[..id.len() - 1]);
+        insert_task(home.path(), &other, STARTED_AT + 1_000);
+
+        let error = show_at(home.path(), &id[..8]).unwrap_err().to_string();
+
+        assert!(
+            error.starts_with(&format!("ambiguous task id: {}（候选：", &id[..8])),
+            "{error}"
+        );
+        assert!(error.contains(&id[..13]), "{error}");
+        assert!(error.contains(&other[..13]), "{error}");
+    }
+
+    /// 前缀的准入：少于 8 字符或含 uuid 字符集之外的字符都不当前缀用（否则 `task show 2`
+    /// 会撞到一半任务，拼错的任务名也会去库里翻一堆无关行）。
+    #[test]
+    fn task_show_rejects_a_prefix_that_is_too_short_or_not_id_like() {
+        let home = TempHome::new("bad-prefix");
+        let id = fixture(home.path());
+
+        let error = show_at(home.path(), &id[..7]).unwrap_err().to_string();
+        assert_eq!(error, format!("task not found: {}", &id[..7]));
+
+        let error = show_at(home.path(), "019a1b2c-zz").unwrap_err().to_string();
+        assert_eq!(error, "task not found: 019a1b2c-zz");
+    }
+
+    /// `task show` 的事件行详情覆盖 v0.2 的新变体（推理分道 + 带 `call_id` 的工具行）。
+    #[test]
+    fn event_detail_renders_the_reasoning_and_tool_variants() {
+        assert_eq!(
+            event_detail(&RuntimeEvent::ReasoningDelta {
+                text: "推理一行".into()
+            }),
+            "reasoning_delta 推理一行"
+        );
+        // 长内容按**字符**截断（不切坏 UTF-8）
+        assert_eq!(
+            event_detail(&RuntimeEvent::ReasoningDelta {
+                text: "长".repeat(200)
+            }),
+            format!("reasoning_delta {}…", "长".repeat(DETAIL_CHARS))
+        );
+        assert_eq!(
+            event_detail(&RuntimeEvent::ToolExec {
+                name: "fs_read".into(),
+                summary: "Reading a.txt".into(),
+                args: json!({"path": "a.txt"}),
+                call_id: "call_1".into(),
+            }),
+            "tool_exec fs_read Reading a.txt"
+        );
+        assert_eq!(
+            event_detail(&RuntimeEvent::ToolResult {
+                name: "shell_run".into(),
+                ok: false,
+                output: Some("boom".into()),
+                call_id: "call_2".into(),
+            }),
+            "tool_result shell_run ok=false boom"
+        );
+        // 旧日志缺 `call_id`（空串）与缺 `output`：详情照常注册，不多一个空段
+        assert_eq!(
+            event_detail(&RuntimeEvent::ToolResult {
+                name: "fs_read".into(),
+                ok: true,
+                output: None,
+                call_id: String::new(),
+            }),
+            "tool_result fs_read ok=true"
+        );
+        assert_eq!(
+            event_detail(&RuntimeEvent::Usage {
+                input_tokens: 1,
+                output_tokens: 2,
+                estimated: false,
+            }),
+            "usage in=1 out=2 estimated=false"
+        );
+        assert_eq!(
+            event_detail(&RuntimeEvent::Done {
+                status: RunStatus::Success,
+                summary: Some("done".into()),
+                error: None,
+            }),
+            "done status=success summary=done"
+        );
+    }
+
+    #[test]
+    fn task_list_shows_short_id_and_truncates_prompt() {
         let long_prompt = "改".repeat(50);
         let tasks = vec![
             record(TASK_ID, "success", "run", STARTED_AT, &long_prompt),
@@ -606,8 +765,9 @@ mod tests {
         // 表头 + 两行
         assert_eq!(out.lines().count(), 3, "{out}");
         assert!(out.contains("ID"), "{out}");
-        assert!(out.contains("019a1b2c "), "{out}");
-        assert!(!out.contains("3d4e-7f00"), "id 只展示前 8 位：{out}");
+        // id 列统一用 `short_id`（13 字符），与结束行的短 id 同一口径
+        assert!(out.contains("019a1b2c-3d4e "), "{out}");
+        assert!(!out.contains("7f00-8000"), "id 只展示前 13 位：{out}");
         assert!(out.contains("success"), "{out}");
         assert!(out.contains("running"), "{out}");
         assert!(out.contains("2026-10-15T12:00:00Z"), "{out}");

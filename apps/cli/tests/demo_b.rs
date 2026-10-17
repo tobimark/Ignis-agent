@@ -69,7 +69,7 @@ fn system_message(request: &Value) -> &str {
 /// stdout 里的结束行：渲染的文本增量不补换行，结束行可能紧跟最终答复在同一行，所以按
 /// `contains` 找行；调用方再钉它的行尾（技能标注就挂在行尾）。
 fn finished_line(stdout: &str) -> Option<&str> {
-    stdout.lines().find(|line| line.contains("● Finished:"))
+    stdout.lines().find(|line| line.contains("● Done"))
 }
 
 /// 任务日志（`IGNIS_HOME/logs/<task_id>.jsonl`）的原文；断言失败时贴进消息里便于定位。

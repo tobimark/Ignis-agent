@@ -38,6 +38,20 @@ pub struct TaskRecord {
 const TASK_COLUMNS: &str = "id, kind, prompt, kernel, workspace, status, summary, error, \
                             input_tokens, output_tokens, usage_estimated, started_at, ended_at";
 
+/// 把 `prefix` 里的 LIKE 元字符转义成字面（配合 `ESCAPE '\'`）。
+///
+/// 反斜杠必须**先**转，否则 `\%` 会被再转一次变成 `\\%`（仍旧匹配一个字面 `%`，但多一层转义）。
+fn escape_like(prefix: &str) -> String {
+    let mut out = String::with_capacity(prefix.len());
+    for c in prefix.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn row_to_task(row: &Row<'_>) -> rusqlite::Result<TaskRecord> {
     Ok(TaskRecord {
         id: row.get("id")?,
@@ -122,6 +136,23 @@ impl Db {
         self.with_conn(|c| {
             let mut stmt = c.prepare_cached(&sql)?;
             let rows = stmt.query_map(params![limit as i64], row_to_task)?;
+            rows.collect()
+        })
+    }
+
+    /// 按前缀查任务 id（`task show <前缀>` 的解析用）：以 `prefix` 开头的 id，按 `started_at`
+    /// 倒序（与 [`Db::list_tasks`] 同一口径）最多 `limit` 条。
+    ///
+    /// `prefix` 里的 LIKE 元字符（`\` `%` `_`）按字面处理：调用方虽然只放 `[0-9a-f-]` 过来，
+    /// DAO 自身不该留一个「传 `%` 就查全表」的口子。空前缀等价于「所有 id」——准入闸门在命令层。
+    pub fn task_ids_with_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<String>> {
+        let pattern = format!("{}%", escape_like(prefix));
+        self.with_conn(|c| {
+            let mut stmt = c.prepare_cached(
+                "SELECT id FROM tasks WHERE id LIKE ?1 ESCAPE '\\'
+                 ORDER BY started_at DESC, id DESC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![pattern, limit as i64], |row| row.get(0))?;
             rows.collect()
         })
     }
@@ -231,6 +262,39 @@ mod tests {
                 .unwrap();
             assert_eq!(db.get_task(&id).unwrap().unwrap().status, *status);
         }
+    }
+
+    /// 按前缀查 id：命中多条（新近在前）、按 `limit` 截断、不命中给空表；LIKE 元字符按字面。
+    #[test]
+    fn task_ids_with_prefix_matches_literally_up_to_the_limit() {
+        let db = Db::open_in_memory().unwrap();
+        for (id, started) in [
+            ("019a1b2c-3d4e-7f00-8000-000000000001", 10),
+            ("019a1b2c-3d4e-7f00-8000-000000000002", 20),
+            ("019a1b2c-ffff-7f00-8000-000000000003", 30),
+        ] {
+            db.insert_task(&new_task(id, started)).unwrap();
+        }
+
+        let all = db.task_ids_with_prefix("019a1b2c", 10).unwrap();
+        assert_eq!(all.len(), 3);
+        // 新近在前：与 `list_tasks` 同一口径
+        assert_eq!(all[0], "019a1b2c-ffff-7f00-8000-000000000003");
+        assert_eq!(all[2], "019a1b2c-3d4e-7f00-8000-000000000001");
+
+        let limited = db.task_ids_with_prefix("019a1b2c-3d4e", 1).unwrap();
+        assert_eq!(limited, ["019a1b2c-3d4e-7f00-8000-000000000002"]);
+
+        assert!(db.task_ids_with_prefix("ffff", 10).unwrap().is_empty());
+        // 空前缀等价于「所有 id」（调用方的准入闸门不给空串，DAO 不做二次猜测）
+        assert_eq!(db.task_ids_with_prefix("", 10).unwrap().len(), 3);
+
+        // LIKE 元字符按字面：`_` 不该变成「任意一个字符」，`%` 不该变成「任意后缀」
+        db.insert_task(&new_task("01_", 40)).unwrap();
+        db.insert_task(&new_task("01x", 50)).unwrap();
+        assert_eq!(db.task_ids_with_prefix("01_", 10).unwrap(), ["01_"]);
+        assert_eq!(db.task_ids_with_prefix("01x", 10).unwrap(), ["01x"]);
+        assert!(db.task_ids_with_prefix("%", 10).unwrap().is_empty());
     }
 
     #[test]

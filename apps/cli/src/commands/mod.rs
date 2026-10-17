@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::approval::{InteractiveApproval, PolicyOnlyApproval, resolve_mode};
 use crate::cli::Cli;
-use crate::render::{Renderer, format_task_end};
+use crate::render::{Renderer, RendererOptions, format_task_end, resolve_color, width_for_stdout};
 
 use self::kernel::{
     NATIVE_KERNEL, known_kernel, missing_api_key, mk_runtime, mk_runtime_with_path, resolve_kernel,
@@ -215,7 +215,7 @@ impl Session {
 
     /// banner 第 4 行的计数：`(技能数, active 事实数)`。
     ///
-    /// 事实数读不出来时只打一行警告并退回 0（banner 显示 `Memory: off`）：状态行不该因为
+    /// 事实数读不出来时只打一行警告并退回 0（banner 显示 `Memory: 0 facts`）：状态行不该因为
     /// 记忆库读失败而拦住整个 REPL。
     pub fn banner_counts(&self) -> (usize, usize) {
         let skills = self.skills.metas().len();
@@ -243,12 +243,16 @@ impl Session {
         }
     }
 
-    /// 跑一次任务：渲染任务消费 sink 边跑边输出，Ctrl-C 监听任务负责中止本次运行。
+    /// 跑一次任务：渲染与 `runner.run` 在**同一任务内交错消费**事件，Ctrl-C 监听任务负责中止本次运行。
     ///
     /// 每轮按当前内核装配运行器（native 建 HTTP 客户端，外部内核只做一次 PATH 检查），
-    /// 因此 `/kernel` 的切换只影响后续任务。结束后打印结束行并把结果交回调用方；随后按本轮事件
-    /// 决定要不要提示自拉起守护进程。渲染任务与监听任务都必须随本次运行结束，否则 REPL 会攒下
-    /// 一串永远不会触发的监听器。
+    /// 因此 `/kernel` 的切换只影响后续任务。渲染选项每轮从 `config.ui` + stdout 的 tty 状态
+    /// 重算（宽度每轮探测一次终端）。结束后先 `finish()` 冲刷挂起内容再打结束行，随后按本轮事件
+    /// 决定要不要提示自拉起守护进程。监听任务必须随本次运行结束，否则 REPL 会攒下一串永远不会
+    /// 触发的监听器。
+    ///
+    /// 审批提示是审批层对 stdout 的直接写入（不经渲染器），异步管线下它与工具行的硬写序做不到
+    /// ——记为已知限制，P2/P5 单一写者时收口。
     pub async fn run_task(
         &self,
         prompt: String,
@@ -272,40 +276,57 @@ impl Session {
         );
 
         let (sink, mut events) = mpsc::unbounded_channel();
-        // 自拉起的判定看「本轮事件里出现过 schedule_create」：由渲染任务顺手记下
+        // 自拉起的判定看「本轮事件里出现过 schedule_create」：由渲染器在事件流里顺手记下
         let saw_schedule_create = Arc::new(AtomicBool::new(false));
-        let mut renderer = Renderer {
-            out: Box::new(std::io::stdout()),
-            color: std::io::stdout().is_terminal(),
-            saw_schedule_create: Arc::clone(&saw_schedule_create),
-        };
-        let renderer_task = tokio::spawn(async move {
-            while let Some(event) = events.recv().await {
-                renderer.on_event(&event);
-            }
-        });
+        let options = renderer_options(
+            &self.config,
+            std::io::stdout().is_terminal(),
+            std::env::var_os("NO_COLOR")
+                .as_deref()
+                .and_then(OsStr::to_str),
+        );
+        let mut renderer = Renderer::new(
+            Box::new(std::io::stdout()),
+            options,
+            Arc::clone(&saw_schedule_create),
+        );
 
         let cancel = CancellationToken::new();
         let watcher = spawn_ctrl_c_watcher(cancel.clone());
 
         let started = Instant::now();
-        let result = runner
-            .run(
-                TaskRequest {
-                    prompt,
-                    history,
-                    kind,
-                    workspace: self.workspace.clone(),
-                    // 交互运行没有来源 job（调度运行由守护进程填 job.id）
-                    job_id: None,
+        // 渲染在同一任务内与运行器交错消费（不另起渲染任务）：写序竞态压到最低，事件不再经第二个
+        // 任务中转。`run` 返回后再把已经入队的剩余事件排干（通道随 sink 析构关闭）。
+        let run = runner.run(
+            TaskRequest {
+                prompt,
+                history,
+                kind,
+                workspace: self.workspace.clone(),
+                // 交互运行没有来源 job（调度运行由守护进程填 job.id）
+                job_id: None,
+            },
+            sink,
+            cancel,
+        );
+        tokio::pin!(run);
+        let mut events_open = true;
+        let result = loop {
+            tokio::select! {
+                outcome = &mut run => break outcome,
+                event = events.recv(), if events_open => match event {
+                    Some(event) => renderer.on_event(&event),
+                    // sink 已经析构但 `run` 还没返回：通道不会再给事件，继续等它
+                    None => events_open = false,
                 },
-                sink,
-                cancel,
-            )
-            .await;
-        // 本次运行已经结束：监听任务先收掉，sink 随 `run` 一起析构后渲染任务也会自行结束
+            }
+        };
         watcher.abort();
-        let _ = renderer_task.await;
+        // 排干剩余事件（`run` 返回时可能还有已经入队的）：结束行必须排在它们后面
+        while let Ok(event) = events.try_recv() {
+            renderer.on_event(&event);
+        }
+        renderer.finish();
 
         let outcome = result?;
         println!(
@@ -315,7 +336,9 @@ impl Session {
                 outcome.status,
                 started.elapsed(),
                 &outcome.usage,
-                &outcome.skills_used
+                &outcome.skills_used,
+                outcome.tool_calls,
+                options.mode,
             )
         );
         // 非成功终态不能只留一个状态词：原因（内核给出、已过 Redactor）打到 stderr，与
@@ -336,6 +359,17 @@ impl Session {
     }
 }
 
+/// 渲染选项：`config.ui` 给模式/主题，`ColorChoice` + stdout 的 tty 状态 + `NO_COLOR` 定颜色，
+/// 宽度按 stdout 类型给（tty → 探测终端列数，非 tty → 不折行）。
+fn renderer_options(config: &Config, is_tty: bool, no_color: Option<&str>) -> RendererOptions {
+    RendererOptions {
+        mode: config.ui.output_mode,
+        color: resolve_color(config.ui.color, is_tty, no_color),
+        theme: config.ui.theme,
+        width: width_for_stdout(is_tty),
+    }
+}
+
 /// 起一个 Ctrl-C 监听任务：收到信号就取消本次运行，返回的句柄由调用方在运行结束后 abort。
 ///
 /// `tokio::signal::ctrl_c()` 装的是进程级处理；装不上（不支持的平台）时监听任务直接结束，
@@ -351,6 +385,8 @@ pub fn spawn_ctrl_c_watcher(cancel: CancellationToken) -> JoinHandle<()> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+
+    use ignis_core::config::{ColorChoice, OutputMode, Theme, UiConfig};
 
     use super::*;
     use crate::commands::kernel::fixtures::{TempDir, set_executable};
@@ -567,5 +603,33 @@ mod tests {
             "找不到 claude CLI：请先安装 claude 并确保它在 PATH 中"
         );
         assert_eq!(session.kernel(), "codex");
+    }
+
+    /// 渲染选项的三个来源各管一段：`config.ui` 给模式/主题，`ColorChoice` + tty + `NO_COLOR` 定颜色，
+    /// stdout 不是 tty 时宽度是「不折行」。
+    #[test]
+    fn renderer_options_come_from_config_tty_and_no_color() {
+        let defaults = Config::default();
+        let options = renderer_options(&defaults, false, None);
+        assert_eq!(options.mode, OutputMode::Normal);
+        assert_eq!(options.theme, Theme::Dark);
+        assert!(!options.color, "Auto + 非 tty 不上色");
+        assert_eq!(options.width, usize::MAX, "非 tty 不插入物理换行");
+
+        let loud = Config {
+            ui: UiConfig {
+                output_mode: OutputMode::Debug,
+                color: ColorChoice::Always,
+                theme: Theme::Light,
+            },
+            ..Config::default()
+        };
+        // `Always` 即使非 tty 也上色；`NO_COLOR` 非空恒无色（含 `Always`）
+        let options = renderer_options(&loud, false, None);
+        assert_eq!(options.mode, OutputMode::Debug);
+        assert_eq!(options.theme, Theme::Light);
+        assert!(options.color);
+        assert!(!renderer_options(&loud, false, Some("1")).color);
+        assert!(renderer_options(&loud, false, Some("")).color);
     }
 }

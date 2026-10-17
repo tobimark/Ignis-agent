@@ -697,6 +697,7 @@ dependencies = [
  "ignis-gateway",
  "ignis-runtime",
  "ignis-storage",
+ "libc",
  "rusqlite",
  "serde_json",
  "tokio",

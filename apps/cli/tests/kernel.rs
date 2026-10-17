@@ -145,7 +145,7 @@ fn codex_kernel_runs_a_task_with_the_rendered_external_prompt() {
     assert!(stdout.contains(&note("codex")), "{text}");
     // 假 CLI 的文本事件与结束行照常渲染
     assert!(stdout.contains("OK from codex"), "{text}");
-    assert!(stdout.contains("● Finished: success"), "{text}");
+    assert!(stdout.contains("● Done"), "{text}");
     // 假模型一次都没被请求：这一轮跑的是 codex 内核
     assert!(model.requests().is_empty(), "{:#?}", model.requests());
 
