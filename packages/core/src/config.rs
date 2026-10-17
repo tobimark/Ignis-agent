@@ -23,6 +23,58 @@ const ENV_BASE_URL: &str = "IGNIS_BASE_URL";
 const ENV_MODEL: &str = "IGNIS_MODEL";
 const ENV_API_KEY: &str = "IGNIS_API_KEY";
 
+/// 终端输出模式：三档信息量，运行时可由 `/details` 临时切换。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputMode {
+    /// 只留正文与结束行。
+    Minimal,
+    /// 默认：正文 + 工具状态行 + 结束行。
+    #[default]
+    Normal,
+    /// 额外给出推理分道、用量等诊断信息。
+    Debug,
+}
+
+/// 颜色策略：`NO_COLOR` 非空时恒无色，优先级高于本项（判断在渲染器侧）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorChoice {
+    /// 只有输出到终端（tty）时才上色。
+    #[default]
+    Auto,
+    /// 显式上色：非 tty 也输出 ANSI。
+    Always,
+    /// 恒不上色。
+    Never,
+}
+
+/// 配色主题：深/浅背景的灰度需要换档（例如 `dim` 的 ANSI 取值不同）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    /// 深色背景（默认）。
+    #[default]
+    Dark,
+    /// 浅色背景。
+    Light,
+}
+
+/// 终端显示选项：`ui` 段，由渲染器消费。
+///
+/// 容器级 `#[serde(default)]` 让 `ui` 段只写一项时另外两项回落默认值
+/// （`{"ui":{"color":"never"}}` 是合法的）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    /// 输出模式：`minimal` / `normal` / `debug`。
+    pub output_mode: OutputMode,
+    /// 颜色策略：`auto` / `always` / `never`。
+    pub color: ColorChoice,
+    /// 配色主题：`dark` / `light`。
+    pub theme: Theme,
+}
+
 /// 生效配置：配置文件只需写要覆盖的字段，其余回落到 [`Default`]。
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -37,6 +89,8 @@ pub struct Config {
     pub api_key: Option<String>,
     /// 运行上限。
     pub limits: Limits,
+    /// 终端显示选项（输出模式 / 颜色 / 主题）。
+    pub ui: UiConfig,
 }
 
 impl Default for Config {
@@ -48,6 +102,7 @@ impl Default for Config {
             model: ModelConfig::default(),
             api_key: None,
             limits: Limits::default(),
+            ui: UiConfig::default(),
         }
     }
 }
@@ -61,6 +116,7 @@ impl fmt::Debug for Config {
             .field("model", &self.model)
             .field("api_key", &"***")
             .field("limits", &self.limits)
+            .field("ui", &self.ui)
             .finish()
     }
 }
@@ -388,6 +444,102 @@ mod tests {
     }
 
     #[test]
+    fn ui_section_missing_falls_back_to_defaults() {
+        let home = TempHome::new("ui-missing");
+        // 旧配置文件：没有 `ui` 段，必须靠 `#[serde(default)]` 读成默认三值
+        fs::write(home.config_path(), r#"{"model":{"model":"local-llm"}}"#).unwrap();
+
+        let cfg = load_config(home.path()).unwrap();
+
+        assert_eq!(cfg.ui, UiConfig::default());
+        assert_eq!(cfg.ui.output_mode, OutputMode::Normal);
+        assert_eq!(cfg.ui.color, ColorChoice::Auto);
+        assert_eq!(cfg.ui.theme, Theme::Dark);
+    }
+
+    #[test]
+    fn ui_section_accepts_partial_writes() {
+        let home = TempHome::new("ui-partial");
+        // 只写一项时其余两项仍回落默认（`config set ui.color never` 落盘后就是这个形状）
+        fs::write(home.config_path(), r#"{"ui":{"color":"never"}}"#).unwrap();
+
+        let cfg = load_config_with_env(home.path(), no_env).unwrap();
+
+        assert_eq!(cfg.ui.color, ColorChoice::Never);
+        assert_eq!(cfg.ui.output_mode, OutputMode::Normal);
+        assert_eq!(cfg.ui.theme, Theme::Dark);
+    }
+
+    #[test]
+    fn ui_json_shape_is_lowercase_literals() {
+        // 形状即契约（设计 §6.11）：小写字符串，键名与枚举一致
+        let ui = UiConfig {
+            output_mode: OutputMode::Debug,
+            color: ColorChoice::Always,
+            theme: Theme::Light,
+        };
+        assert_eq!(
+            serde_json::to_value(ui).unwrap(),
+            json!({"output_mode": "debug", "color": "always", "theme": "light"})
+        );
+        assert_eq!(
+            serde_json::to_value(UiConfig::default()).unwrap(),
+            json!({"output_mode": "normal", "color": "auto", "theme": "dark"})
+        );
+        for (mode, literal) in [
+            (OutputMode::Minimal, "minimal"),
+            (OutputMode::Normal, "normal"),
+            (OutputMode::Debug, "debug"),
+        ] {
+            assert_eq!(serde_json::to_value(mode).unwrap(), json!(literal));
+        }
+        for (color, literal) in [
+            (ColorChoice::Auto, "auto"),
+            (ColorChoice::Always, "always"),
+            (ColorChoice::Never, "never"),
+        ] {
+            assert_eq!(serde_json::to_value(color).unwrap(), json!(literal));
+        }
+        for (theme, literal) in [(Theme::Dark, "dark"), (Theme::Light, "light")] {
+            assert_eq!(serde_json::to_value(theme).unwrap(), json!(literal));
+        }
+    }
+
+    #[test]
+    fn ui_values_written_to_file_reach_the_effective_config() {
+        let home = TempHome::new("ui-file");
+        fs::write(
+            home.config_path(),
+            r#"{"ui":{"output_mode":"debug","color":"never","theme":"light"}}"#,
+        )
+        .unwrap();
+
+        let cfg = load_config_with_env(home.path(), no_env).unwrap();
+
+        assert_eq!(cfg.ui.output_mode, OutputMode::Debug);
+        assert_eq!(cfg.ui.color, ColorChoice::Never);
+        assert_eq!(cfg.ui.theme, Theme::Light);
+    }
+
+    #[test]
+    fn invalid_ui_value_fails_to_parse_and_leaves_the_file_alone() {
+        let home = TempHome::new("ui-invalid");
+        let raw = r#"{"ui":{"color":"sometimes"}}"#;
+        let path = home.config_path();
+        fs::write(&path, raw).unwrap();
+
+        let err = load_config_with_env(home.path(), no_env).unwrap_err();
+
+        assert!(
+            matches!(&err, ConfigError::Parse { path: p, .. } if p == &path),
+            "unexpected error: {err:?}"
+        );
+        // 人话里点出非法字面量；文件不被改写，仍是合法 JSON
+        assert!(err.to_string().contains("sometimes"), "err: {err}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), raw);
+    }
+
+    #[test]
     fn env_overrides_win_over_file() {
         let home = TempHome::new("env-wins");
         let raw = r#"{"model":{"model":"a"},"api_key":"file-key"}"#;
@@ -476,6 +628,11 @@ mod tests {
             limits: Limits {
                 max_steps: 7,
                 ..Limits::default()
+            },
+            ui: UiConfig {
+                output_mode: OutputMode::Debug,
+                color: ColorChoice::Never,
+                theme: Theme::Light,
             },
         };
 

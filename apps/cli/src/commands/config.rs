@@ -92,7 +92,17 @@ const FIELDS: &[(&str, Kind)] = &[
     ("limits.tool_output_limit", Kind::Usize),
     ("limits.http_max_bytes", Kind::Usize),
     ("limits.context_char_budget", Kind::Usize),
+    ("ui.output_mode", Kind::Choice(OUTPUT_MODES)),
+    ("ui.color", Kind::Choice(COLOR_CHOICES)),
+    ("ui.theme", Kind::Choice(THEMES)),
 ];
+
+/// `ui.output_mode` 的合法字面量：与 `ignis_core::config::OutputMode` 的 serde 名一致。
+const OUTPUT_MODES: &[&str] = &["minimal", "normal", "debug"];
+/// `ui.color` 的合法字面量：与 `ignis_core::config::ColorChoice` 的 serde 名一致。
+const COLOR_CHOICES: &[&str] = &["auto", "always", "never"];
+/// `ui.theme` 的合法字面量：与 `ignis_core::config::Theme` 的 serde 名一致。
+const THEMES: &[&str] = &["dark", "light"];
 
 /// 取值类型：决定 CLI 字符串怎么变成 JSON 标量。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -105,6 +115,8 @@ enum Kind {
     U32,
     U64,
     Usize,
+    /// 枚举字面量：payload 是该项允许的取值（小写字符串，口径同 core 枚举的 serde 名）。
+    Choice(&'static [&'static str]),
 }
 
 impl Kind {
@@ -115,15 +127,21 @@ impl Kind {
             Kind::U32 => raw.parse::<u32>().ok().map(|value| json!(value)),
             Kind::U64 => raw.parse::<u64>().ok().map(|value| json!(value)),
             Kind::Usize => raw.parse::<usize>().ok().map(|value| json!(value)),
+            // 枚举同样以字符串写进 JSON；这里先按白名单拦一道，好把 serde 的英文报错
+            // 换成中文人话。落盘前仍由 `serde_json::from_value::<Config>` 按真实类型复核。
+            Kind::Choice(allowed) => allowed
+                .contains(&raw)
+                .then(|| Value::String(raw.to_string())),
         }
     }
 
     /// 报错文案里的取值说明。
-    fn expected(self) -> &'static str {
+    fn expected(self) -> String {
         match self {
-            Kind::Text | Kind::Secret => "文本",
-            Kind::U32 => "0-4294967295 的整数",
-            Kind::U64 | Kind::Usize => "非负整数",
+            Kind::Text | Kind::Secret => "文本".to_string(),
+            Kind::U32 => "0-4294967295 的整数".to_string(),
+            Kind::U64 | Kind::Usize => "非负整数".to_string(),
+            Kind::Choice(allowed) => format!("{} 之一", allowed.join("|")),
         }
     }
 }
@@ -181,7 +199,9 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use ignis_core::config::{load_config_file, load_config_with_env};
+    use ignis_core::config::{
+        ColorChoice, OutputMode, Theme, load_config_file, load_config_with_env,
+    };
     use ignis_runtime::ModelConfig;
 
     use super::*;
@@ -241,6 +261,10 @@ mod tests {
         );
         assert!(out.contains("limits.max_steps = 30\n"), "{out}");
         assert!(out.contains("default_kernel = native\n"), "{out}");
+        // 新增的 ui 段同样逐叶子摊平，取值是小写字面量
+        assert!(out.contains("ui.output_mode = normal\n"), "{out}");
+        assert!(out.contains("ui.color = auto\n"), "{out}");
+        assert!(out.contains("ui.theme = dark\n"), "{out}");
         assert!(
             out.contains(&format!(
                 "workspace_root = {}\n",
@@ -347,6 +371,102 @@ mod tests {
     }
 
     #[test]
+    fn config_set_ui_keys_roundtrip() {
+        let home = TempHome::new("set-ui");
+
+        assert_eq!(
+            set_value(home.path(), "ui.output_mode", "debug").unwrap(),
+            "debug"
+        );
+        assert_eq!(
+            set_value(home.path(), "ui.color", "never").unwrap(),
+            "never"
+        );
+        assert_eq!(
+            set_value(home.path(), "ui.theme", "light").unwrap(),
+            "light"
+        );
+
+        // 回读生效：三个枚举都是落盘后按类型收下的
+        let saved = load_config_file(home.path()).unwrap();
+        assert_eq!(saved.ui.output_mode, OutputMode::Debug);
+        assert_eq!(saved.ui.color, ColorChoice::Never);
+        assert_eq!(saved.ui.theme, Theme::Light);
+
+        // 文件形状是小写字面量（设计 §6.11），且默认值一个都没被物化
+        let raw = fs::read_to_string(home.path().join("config.json")).unwrap();
+        let json: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            json,
+            json!({"ui": {"output_mode": "debug", "color": "never", "theme": "light"}}),
+            "{raw}"
+        );
+        // `config show` 把新段落也摊平出来（与发生效值一致）
+        let shown = render(&saved).unwrap();
+        assert!(shown.contains("ui.output_mode = debug\n"), "{shown}");
+    }
+
+    #[test]
+    fn config_set_ui_accepts_every_whitelisted_literal() {
+        // 白名单是与 core 枚举分开维护的字面量清单，这里逐个跑一遍钉住口径：
+        // 若某个字面量 serde 不认，`set_value` 落盘前的 `from_value::<Config>` 校验会红。
+        let literals: &[(&str, &[&str])] = &[
+            ("ui.output_mode", OUTPUT_MODES),
+            ("ui.color", COLOR_CHOICES),
+            ("ui.theme", THEMES),
+        ];
+        for &(key, allowed) in literals {
+            for literal in allowed {
+                let home = TempHome::new("set-ui-literal");
+                assert_eq!(
+                    set_value(home.path(), key, literal).unwrap(),
+                    *literal,
+                    "{key}={literal}"
+                );
+                let raw = fs::read_to_string(home.path().join("config.json")).unwrap();
+                assert!(raw.contains(&format!("\"{literal}\"")), "{key} → {raw}");
+            }
+        }
+    }
+
+    #[test]
+    fn config_set_rejects_invalid_ui_value_without_touching_the_file() {
+        let home = TempHome::new("set-ui-invalid");
+        let path = home.path().join("config.json");
+        fs::write(&path, r#"{"ui":{"color":"auto"},"limits":{"max_steps":3}}"#).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+
+        let error = set_value(home.path(), "ui.color", "sometimes")
+            .unwrap_err()
+            .to_string();
+
+        // 中文人话，并列出该项的合法取值；文件原样（仍是合法 JSON，值没被改坏）
+        assert_eq!(
+            error, "取值不合法：sometimes（ui.color 需要auto|always|never 之一）",
+            "{error}"
+        );
+        assert!(error.contains("取值不合法"), "{error}");
+        assert!(error.contains("sometimes"), "{error}");
+        assert!(error.contains("auto|always|never"), "{error}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(
+            load_config_file(home.path()).unwrap().ui.color,
+            ColorChoice::Auto
+        );
+
+        // 全新 home 上的非法值同样只报错、不落文件
+        let fresh = TempHome::new("set-ui-invalid-fresh");
+        for (key, value) in [("ui.output_mode", "verbose"), ("ui.theme", "solarized")] {
+            let error = set_value(fresh.path(), key, value).unwrap_err().to_string();
+            assert!(error.contains("取值不合法"), "{key} → {error}");
+        }
+        assert!(
+            !fresh.path().join("config.json").exists(),
+            "非法取值不该写出配置文件"
+        );
+    }
+
+    #[test]
     fn config_set_redacts_key_echo() {
         let home = TempHome::new("secret");
 
@@ -365,7 +485,7 @@ mod tests {
         let home = TempHome::new("reject");
 
         // 白名单之外（含容器路径）一律拒绝
-        for key in ["model.nope", "model", "limits", "nope"] {
+        for key in ["model.nope", "model", "limits", "ui", "nope"] {
             let error = set_value(home.path(), key, "x").unwrap_err().to_string();
             assert!(error.contains("未知配置项"), "{key} → {error}");
         }
