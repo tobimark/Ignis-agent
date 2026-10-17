@@ -478,9 +478,13 @@ pub fn dispatch(
                     session.model_override.is_some(),
                 )?,
                 [name] => {
-                    session.set_model(name);
+                    // 先渲染后落状态：非 native 内核的 not-applicable 必须先于 set_model，
+                    // 否则被拒的命令会留下幽灵覆盖（切回 native 后 `/status` 与任务都会用它）。
                     // 设置回显带上 `(this session)`：这次覆盖只影响本会话，持久化要另走 config set
-                    model_lines(session.kernel(), &format!("{name} (this session)"), true)?
+                    let lines =
+                        model_lines(session.kernel(), &format!("{name} (this session)"), true)?;
+                    session.set_model(name);
+                    lines
                 }
                 _ => return Err(MODEL_USAGE.to_string()),
             };
@@ -867,16 +871,56 @@ mod tests {
 
         // 外部内核：不适用（**不静默接受一个不生效的覆盖**）
         let (_dir, mut codex) = session_fixture("slash-model-codex", "codex");
-        let error = dispatch(&mut codex, Slash::Model, &["test-model-2".to_string()]).unwrap_err();
+        let kernel_default = codex.model().to_string();
+
+        // 有参：先校验（渲染）后落状态——错误路径必须把会话留在原样
+        let error = dispatch(&mut codex, Slash::Model, &["gpt-5".to_string()]).unwrap_err();
         assert_eq!(
             error,
             "model: not applicable — kernel codex uses its own default model"
         );
+        assert_eq!(codex.model(), kernel_default, "被拒的覆盖不该落进会话");
+
+        // 无参：同一句错误
         let error = dispatch(&mut codex, Slash::Model, &[]).unwrap_err();
         assert_eq!(
             error,
             "model: not applicable — kernel codex uses its own default model"
         );
+        assert_eq!(codex.model(), kernel_default);
+
+        // 幽灵覆盖最迟在切回 native 时暴露：`/status` 与后续任务都拿 `model()` 当生效值
+        dispatch_lines(&mut codex, Slash::Kernel, &["native".to_string()]);
+        assert!(codex.is_native());
+        assert_eq!(
+            codex.model(),
+            kernel_default,
+            "切回 native 后仍是配置里的模型，不是被拒的名字"
+        );
+        assert_eq!(
+            dispatch_lines(&mut codex, Slash::Model, &[]),
+            [format!("model: {kernel_default}")],
+            "显示不带 note，说明会话里没有覆盖"
+        );
+    }
+
+    /// `/model` 的参数个数先于内核判定：`/model a b` 在任何内核上都是 usage，且不改状态。
+    #[test]
+    fn dispatch_model_rejects_extra_arguments_on_every_kernel() {
+        for kernel in ["native", "codex", "claude"] {
+            let (_dir, mut session) = session_fixture("slash-model-usage", kernel);
+            let before = session.model().to_string();
+
+            let error = dispatch(
+                &mut session,
+                Slash::Model,
+                &["a".to_string(), "b".to_string()],
+            )
+            .unwrap_err();
+
+            assert_eq!(error, "model: usage: /model [name]", "{kernel}");
+            assert_eq!(session.model(), before, "{kernel}: usage 错误不该改状态");
+        }
     }
 
     /// `/kernel`：无参显示、有参切换（失败原样交回、内核不动）、多参给 usage。
