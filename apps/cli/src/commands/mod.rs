@@ -12,7 +12,7 @@ pub mod schedule;
 pub mod skills;
 pub mod task;
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -281,9 +281,8 @@ impl Session {
         let options = renderer_options(
             &self.config,
             std::io::stdout().is_terminal(),
-            std::env::var_os("NO_COLOR")
-                .as_deref()
-                .and_then(OsStr::to_str),
+            // 非 UTF-8 的取值照样算「已设置」：转换在 `no_color_value` 里做有损解码
+            no_color_value(std::env::var_os("NO_COLOR")).as_deref(),
         );
         let mut renderer = Renderer::new(
             Box::new(std::io::stdout()),
@@ -368,6 +367,13 @@ fn renderer_options(config: &Config, is_tty: bool, no_color: Option<&str>) -> Re
         theme: config.ui.theme,
         width: width_for_stdout(is_tty),
     }
+}
+
+/// `NO_COLOR` 环境变量的取值转换：存在即算「已设置」——值本身不解码，非 UTF-8 按
+/// `to_string_lossy` 有损处理（no-color.org 的约定只看「存在且非空」，不看内容；空串由
+/// [`resolve_color`] 按未设置处理）。
+fn no_color_value(raw: Option<OsString>) -> Option<String> {
+    raw.map(|value| value.to_string_lossy().into_owned())
 }
 
 /// 起一个 Ctrl-C 监听任务：收到信号就取消本次运行，返回的句柄由调用方在运行结束后 abort。
@@ -631,5 +637,30 @@ mod tests {
         assert!(options.color);
         assert!(!renderer_options(&loud, false, Some("1")).color);
         assert!(renderer_options(&loud, false, Some("")).color);
+    }
+
+    /// F3（评审遗留）：`NO_COLOR` 只看「存在且非空」，不看值本身——非 UTF-8 的取值有损解码后
+    /// 仍非空，必须算「已设置」（否则一个乱码值会把颜色悄悄放回来，违反 no-color.org 的约定）。
+    #[cfg(unix)]
+    #[test]
+    fn no_color_value_treats_non_utf8_values_as_set() {
+        use std::os::unix::ffi::OsStringExt;
+
+        // 非 UTF-8 字节：有损解码得到替换字符（非空），颜色照关
+        let value = no_color_value(Some(OsString::from_vec(vec![0xff, 0xfe])));
+        assert!(value.as_deref().is_some_and(|v| !v.is_empty()), "{value:?}");
+        assert!(!resolve_color(ColorChoice::Always, true, value.as_deref()));
+
+        // 未设置 / 空串：按 NO_COLOR 的约定不关颜色（空串走到 `resolve_color` 里按未设置处理）
+        assert_eq!(no_color_value(None), None);
+        assert_eq!(
+            no_color_value(Some(OsString::from(""))).as_deref(),
+            Some("")
+        );
+        // 普通取值原样透传
+        assert_eq!(
+            no_color_value(Some(OsString::from("1"))).as_deref(),
+            Some("1")
+        );
     }
 }

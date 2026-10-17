@@ -66,8 +66,8 @@ fn system_message(request: &Value) -> &str {
     first["content"].as_str().expect("system 消息应为文本")
 }
 
-/// stdout 里的结束行：渲染的文本增量不补换行，结束行可能紧跟最终答复在同一行，所以按
-/// `contains` 找行；调用方再钉它的行尾（技能标注就挂在行尾）。
+/// stdout 里的结束行：P1 起渲染器在 `finish()` 里保证输出以换行收尾，结束行独立成行、不再
+/// 紧贴最终答复；断言仍按 `contains` 找行，调用方再钉它的行尾（技能标注就挂在行尾）。
 fn finished_line(stdout: &str) -> Option<&str> {
     stdout.lines().find(|line| line.contains("● Done"))
 }

@@ -1,6 +1,6 @@
-//! 渲染 e2e：内联推理分道与工具完成行（v0.2 §6.3）。
+//! 渲染 e2e：内联推理分道、工具完成行与 NO_COLOR 覆盖（v0.2 §6.3）。
 //!
-//! 两个用例都只认 stdout：终端渲染写的是 stdout，stderr 是另一条流，用它替渲染背书会把
+//! 三个用例都只认 stdout：终端渲染写的是 stdout，stderr 是另一条流，用它替渲染背书会把
 //! 「行没渲染到 stdout」放过去。非 tty 下零 ANSI、不插入物理换行（每行可 grep），所以断言按
 //! `contains` 找行，而不是比对整段输出。
 
@@ -12,7 +12,7 @@ use common::{TempDir, ignis_cmd, output_text, tool_call};
 use ignis_runtime::test_support::{ScriptStep, ScriptedModel};
 use serde_json::json;
 
-/// v0.2 之前的结束行文案：两个用例都钉住它不再出现（回归锚点）。
+/// v0.2 之前的结束行文案：三个用例都钉住它不再出现（回归锚点）。
 const OLD_END_LINE: &str = "● Finished";
 
 /// 推理行的行首标记（normal 模式）：推理与正文分道后，推理块独占一行。
@@ -88,4 +88,37 @@ fn tool_completion_line_pairs_with_the_exec_line_and_carries_the_elapsed() {
     assert!(stdout.contains("● Done"), "{text}");
     assert!(!stdout.contains(OLD_END_LINE), "{text}");
     assert!(!stdout.contains('\u{1b}'), "{text}");
+}
+
+/// `NO_COLOR` 压过配置里的 `color: always`：环境变量存在且非空时零 ANSI，即便配置要求上色；
+/// 正文与结束行照旧输出（压的是颜色，不是渲染本身）。
+#[test]
+fn no_color_env_overrides_always_color_in_config() {
+    // 加粗正文在 `color: always` 下会带 ANSI（`\u{1b}[1m…`）：没有 NO_COLOR 覆盖时这条断言
+    // 会真的看见转义序列，测试不是空转
+    let model = ScriptedModel::start(vec![ScriptStep::Text("**结论已定**".into())]);
+
+    let dir = TempDir::new("render-no-color");
+    let home = dir.join("home");
+    let project = dir.join("project");
+    fs::create_dir_all(&home).expect("home 应可创建");
+    fs::create_dir_all(&project).expect("工作区应可创建");
+    fs::write(home.join("config.json"), r#"{"ui":{"color":"always"}}"#).expect("配置应可写入");
+
+    let output = ignis_cmd(&home, &project, &model.base_url())
+        // 只给这一例加 `NO_COLOR`：其余用例保持进程环境的原样（`ignis_cmd` 不碰它）
+        .env("NO_COLOR", "1")
+        .args(["run", "说一句话", "--yes"])
+        .output()
+        .expect("ignis 二进制应可执行");
+    let text = output_text(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+
+    // `color: always` 被 NO_COLOR 压回去：stdout 一个 ANSI 字节都不许有
+    assert!(!stdout.contains('\u{1b}'), "{text}");
+    // 正文与结束行照旧（回归锚点同前两例）
+    assert!(stdout.contains("结论已定"), "{text}");
+    assert!(stdout.contains("● Done"), "{text}");
+    assert!(!stdout.contains(OLD_END_LINE), "{text}");
 }

@@ -28,11 +28,13 @@ use serde_json::Value;
 use self::markdown::{MdStream, Segment, Style};
 use self::width::wrap;
 
-// 宽度/折行模块（Task 6 落地，本模块消费）。声明与入口一律 `pub`：此刻它只被自身测试引用，
-// 收紧成私有/`pub(crate)` 会让 `dead_code` 在门禁（`-D warnings`）下报错。
+// 宽度/折行模块（Task 6 落地，本模块消费）。声明与入口一律 `pub`：本模块之外还有明确消费者
+// ——P2 的输入编辑器按显示宽度定位光标（spec §6.4），P5 的 TUI 由面板给出宽度、复用同一套
+// 口径（spec §6.10），收紧可见性会挡住这两处复用。
 pub mod width;
 
-// Markdown 子集与流式装配（Task 6 落地，本模块消费）。同样一律 `pub`。
+// Markdown 子集与流式装配（Task 6 落地，本模块消费）。同样一律 `pub`：P5 的 TUI 复用同一套
+// markdown/width（spec §6.10 的复用要求，不复制第二套逻辑）。
 pub mod markdown;
 
 /// ANSI：重置。每段着色自带收尾，颜色不会漏到下一段。
@@ -689,7 +691,8 @@ fn runs_of(chars: &[(char, Style)]) -> Vec<(String, Style)> {
     })
 }
 
-/// 结束行：`● Done · 2.1s · 3 tools · task 019a1b2c-3d4e`（模式决定信息量）。
+/// 结束行：`● Done · 2.1s · 3 tools · task 019a1b2c-3d4e`（模式决定信息量）；工具计数按
+/// 单复数出词：恰好一次是 `1 tool`，其余（含 0）是 `N tools`。
 ///
 /// - minimal：`● {状态} · {耗时}`（只留正文与一行收尾）。
 /// - normal：加工具计数与**短 id**（13 字符）——失败/触限的运行要能直接从终端复制 id 去
@@ -708,15 +711,17 @@ pub fn format_task_end(
 ) -> String {
     let elapsed = format_elapsed(elapsed);
     let mut line = format!("● {} · {elapsed}", status_word(status));
+    // 恰好一次调用用单数：`· 1 tool` / `· 3 tools`
+    let tools = if tool_calls == 1 { "tool" } else { "tools" };
     match mode {
         OutputMode::Minimal => {}
         OutputMode::Normal => {
-            line.push_str(&format!(" · {tool_calls} tools · task {}", short_id(id)));
+            line.push_str(&format!(" · {tool_calls} {tools} · task {}", short_id(id)));
         }
         OutputMode::Debug => {
             let mark = if usage.estimated { "~" } else { "" };
             line.push_str(&format!(
-                " · {tool_calls} tools · tokens {mark}in={} {mark}out={} · task {id}",
+                " · {tool_calls} {tools} · tokens {mark}in={} {mark}out={} · task {id}",
                 usage.input_tokens, usage.output_tokens
             ));
         }
@@ -1431,5 +1436,44 @@ mod tests {
             )
             .contains("skills")
         );
+    }
+
+    /// F2（评审遗留）：工具计数按单复数出词——恰好一次是 `1 tool`，其余（含 0）是 `N tools`，
+    /// normal 与 debug 两个模式共用同一口径。
+    #[test]
+    fn task_end_line_pluralizes_the_tool_count() {
+        let usage = Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+            estimated: false,
+        };
+        let elapsed = Duration::from_millis(2100);
+        let normal = |tools: usize| {
+            format_task_end(
+                TASK_ID,
+                RunStatus::Success,
+                elapsed,
+                &usage,
+                &[],
+                tools,
+                OutputMode::Normal,
+            )
+        };
+
+        assert!(normal(1).contains(" · 1 tool · task "), "{}", normal(1));
+        assert!(!normal(1).contains("1 tools"), "{}", normal(1));
+        assert!(normal(0).contains(" · 0 tools · task "), "{}", normal(0));
+        assert!(normal(2).contains(" · 2 tools · task "), "{}", normal(2));
+
+        let debug = format_task_end(
+            TASK_ID,
+            RunStatus::Success,
+            elapsed,
+            &usage,
+            &[],
+            1,
+            OutputMode::Debug,
+        );
+        assert!(debug.contains(" · 1 tool · tokens "), "{debug}");
     }
 }

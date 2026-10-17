@@ -133,7 +133,7 @@ MM_KEY=<键> codex exec --json -C <临时工作区> --sandbox workspace-write --
 
 > **v0.2 修订（2026-10-16）**：reasoning → `ReasoningDelta`；`item.started`/`item.completed` →
 > 配对的 `ToolExec`/`ToolResult`（`call_id = item.id`）；`item.updated` 跳过。下表的「适配器处置」
-> 已按 v0.2 行为更新；历史轨迹与结论不变。
+> 已按 v0.2 行为更新；本段下方为 v0.1 时点结论；v0.2 起的映射以上表修订为准。
 
 | 真机行 | 适配器处置（v0.2） | 对得上？ |
 |---|---|---|
