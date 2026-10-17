@@ -151,15 +151,26 @@ pub enum RuntimeEvent {
     TextDelta {
         text: String,
     },
+    /// 推理/思考增量：与正文分通道，渲染层据此分道展示（正文不带推理标记）。
+    ReasoningDelta {
+        text: String,
+    },
     ToolExec {
         name: String,
         summary: String,
         args: serde_json::Value,
+        /// 模型给出的一次工具调用 id：渲染层按它把 `ToolExec` 与 `ToolResult` 配对计时。
+        /// 旧日志（v0.1）缺此字段，缺省为空串。
+        #[serde(default)]
+        call_id: String,
     },
     ToolResult {
         name: String,
         ok: bool,
         output: Option<String>,
+        /// 与 `ToolExec` 同一枚调用 id：空串表示旧日志缺字段（渲染层退化为 FIFO 配对）。
+        #[serde(default)]
+        call_id: String,
     },
     Usage {
         input_tokens: u64,
@@ -277,15 +288,48 @@ mod tests {
             serde_json::to_value(&ev).unwrap(),
             json!({"type":"text_delta","text":"hi"})
         );
+        let ev = RuntimeEvent::ReasoningDelta { text: "hmm".into() };
+        assert_eq!(
+            serde_json::to_value(&ev).unwrap(),
+            json!({"type":"reasoning_delta","text":"hmm"})
+        );
+
         let ev = RuntimeEvent::ToolExec {
             name: "fs_read".into(),
             summary: "Reading a.txt".into(),
             args: json!({"path":"a.txt"}),
+            call_id: "call_1".into(),
         };
         assert_eq!(
             serde_json::to_value(&ev).unwrap(),
-            json!({"type":"tool_exec","name":"fs_read","summary":"Reading a.txt","args":{"path":"a.txt"}})
+            json!({
+                "type":"tool_exec","name":"fs_read","summary":"Reading a.txt",
+                "args":{"path":"a.txt"},"call_id":"call_1"
+            })
         );
+    }
+
+    /// 旧日志兼容：v0.1 落盘的工具事件没有 `call_id` 字段，缺失时补空串而不是整行解析失败。
+    #[test]
+    fn old_tool_events_without_call_id_still_parse() {
+        let ev: RuntimeEvent = serde_json::from_value(
+            json!({"type":"tool_exec","name":"fs_read","summary":"Reading a.txt","args":{}}),
+        )
+        .unwrap();
+        let RuntimeEvent::ToolExec { call_id, .. } = ev else {
+            panic!("应为 ToolExec")
+        };
+        assert_eq!(call_id, "");
+
+        // `tool_result` 同样带 `#[serde(default)]`：旧行的 `call_id` 取空串（渲染层退化为 FIFO 配对）
+        let ev: RuntimeEvent = serde_json::from_value(
+            json!({"type":"tool_result","name":"fs_read","ok":true,"output":"a.txt"}),
+        )
+        .unwrap();
+        let RuntimeEvent::ToolResult { call_id, .. } = ev else {
+            panic!("应为 ToolResult")
+        };
+        assert_eq!(call_id, "");
     }
 
     /// 四个终态的契约字符串逐个钉住（`tasks.status` / `job_runs.status` / JSONL 共用）。

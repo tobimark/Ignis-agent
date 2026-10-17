@@ -300,6 +300,7 @@ async fn tool_use_maps_to_observation_only_tool_exec() {
         name,
         summary,
         args,
+        ..
     } = tool_execs[0]
     else {
         unreachable!()

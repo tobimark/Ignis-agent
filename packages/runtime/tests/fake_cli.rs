@@ -298,6 +298,7 @@ async fn command_execution_maps_to_observation_only_tool_exec() {
             name,
             summary,
             args,
+            ..
         } = event
         else {
             unreachable!()

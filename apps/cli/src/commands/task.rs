@@ -229,11 +229,20 @@ fn event_detail(event: &RuntimeEvent) -> String {
         RuntimeEvent::TextDelta { text } => {
             format!("text_delta {}", truncate(&one_line(text), DETAIL_CHARS))
         }
+        // 推理通道的最终形态由 Task 8 重写；本任务只打类型名 + 首行截断
+        RuntimeEvent::ReasoningDelta { text } => {
+            format!(
+                "reasoning_delta {}",
+                truncate(&one_line(text), DETAIL_CHARS)
+            )
+        }
         RuntimeEvent::ToolExec { name, summary, .. } => format!(
             "tool_exec {name} {}",
             truncate(&one_line(summary), DETAIL_CHARS)
         ),
-        RuntimeEvent::ToolResult { name, ok, output } => {
+        RuntimeEvent::ToolResult {
+            name, ok, output, ..
+        } => {
             let mut detail = format!("tool_result {name} ok={ok}");
             if let Some(output) = output {
                 detail.push_str(&format!(" {}", truncate(&one_line(output), DETAIL_CHARS)));

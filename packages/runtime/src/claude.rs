@@ -230,6 +230,8 @@ async fn drive(
                                     name: TOOL_USE_ITEM.into(),
                                     summary,
                                     args,
+                                    // Task 3 改填真实 tool id；本任务先占位空串（旧日志兼容语义）
+                                    call_id: String::new(),
                                 },
                             )
                             .await

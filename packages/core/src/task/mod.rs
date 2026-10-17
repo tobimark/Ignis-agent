@@ -764,11 +764,13 @@ mod tests {
                 name: "fs_read".into(),
                 summary: "Reading a.txt".into(),
                 args: json!({"path": "a.txt"}),
+                call_id: "call_1".into(),
             },
             RuntimeEvent::ToolResult {
                 name: "fs_read".into(),
                 ok: true,
                 output: Some("contents".into()),
+                call_id: "call_1".into(),
             },
             RuntimeEvent::Usage {
                 input_tokens: 10,
@@ -987,11 +989,13 @@ mod tests {
                     name: "shell_run".into(),
                     summary: "Running: echo sk-test-secret".into(),
                     args: json!({"command": "echo sk-test-secret"}),
+                    call_id: "call_1".into(),
                 },
                 RuntimeEvent::ToolResult {
                     name: "shell_run".into(),
                     ok: true,
                     output: Some("sk-test-secret\n".into()),
+                    call_id: "call_1".into(),
                 },
                 success(Some("ok")),
             ],
@@ -1543,6 +1547,7 @@ mod tests {
             name: name.to_string(),
             summary: format!("Running {name}"),
             args,
+            call_id: "call_1".into(),
         }
     }
 }

@@ -24,7 +24,7 @@ const ERROR_PREVIEW_CHARS: usize = 200;
 /// 建过调度任务的标志所认的元工具名：任务结束后据此决定要不要提示自拉起。
 const SCHEDULE_CREATE: &str = "schedule_create";
 
-/// 事件渲染器：文本增量原样输出，工具执行/失败各写一行。
+/// 事件渲染器：文本增量原样输出，推理增量暗色输出，工具执行/失败各写一行。
 pub struct Renderer {
     /// 渲染目标：命令层给 stdout，测试给可读回的缓冲区。
     pub out: Box<dyn Write + Send>,
@@ -43,6 +43,11 @@ impl Renderer {
         match ev {
             RuntimeEvent::TextDelta { text } => {
                 let _ = self.out.write_all(text.as_bytes());
+            }
+            // 推理通道的完整形态（模式/块状态/前缀）由 Task 8 重写；本任务只作暗色原样输出
+            RuntimeEvent::ReasoningDelta { text } => {
+                let line = self.style(text, DIM);
+                let _ = writeln!(self.out, "{line}");
             }
             RuntimeEvent::ToolExec { name, summary, .. } => {
                 // 记「发起过」而不是「建成了」：工具可能被审批拒掉，但用户想建调度任务的意图
@@ -158,6 +163,7 @@ mod tests {
             name: "fs_read".to_string(),
             summary: summary.to_string(),
             args: json!({ "path": "a.txt" }),
+            call_id: "call_1".to_string(),
         }
     }
 
@@ -182,6 +188,7 @@ mod tests {
             name: "schedule_create".to_string(),
             ok: true,
             output: None,
+            call_id: "call_1".to_string(),
         });
         assert!(!flag.load(Ordering::Relaxed), "只有 ToolExec 才算数");
 
@@ -189,6 +196,7 @@ mod tests {
             name: "schedule_create".to_string(),
             summary: "Running schedule_create".to_string(),
             args: json!({ "name": "disk-watch" }),
+            call_id: "call_2".to_string(),
         });
         assert!(flag.load(Ordering::Relaxed), "schedule_create 必须翻标志");
     }
@@ -211,11 +219,13 @@ mod tests {
             name: "fs_read".to_string(),
             ok: true,
             output: Some("文件内容".to_string()),
+            call_id: "call_1".to_string(),
         });
         renderer.on_event(&RuntimeEvent::ToolResult {
             name: "shell_run".to_string(),
             ok: false,
             output: Some("not ok\n附加的第二行".to_string()),
+            call_id: "call_2".to_string(),
         });
         renderer.on_event(&RuntimeEvent::Usage {
             input_tokens: 10,
@@ -253,6 +263,7 @@ mod tests {
             name: "shell_run".to_string(),
             ok: false,
             output: Some("boom".to_string()),
+            call_id: "call_1".to_string(),
         });
 
         let text = buf.text();
@@ -273,6 +284,7 @@ mod tests {
                 name: "shell_run".to_string(),
                 ok: false,
                 output: Some(output),
+                call_id: "call_1".to_string(),
             });
 
             let text = buf.text();

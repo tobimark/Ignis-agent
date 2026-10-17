@@ -213,6 +213,7 @@ async fn drive(
                             name: call.name.clone(),
                             summary,
                             args: call.args.clone(),
+                            call_id: call.id.clone(),
                         },
                     )
                     .await
@@ -226,6 +227,7 @@ async fn drive(
                             name: call.name.clone(),
                             ok: result.ok,
                             output: result.output.clone(),
+                            call_id: call.id.clone(),
                         },
                     )
                     .await
@@ -537,6 +539,7 @@ mod tests {
                 name: "fs_list".into(),
                 summary: "Listing .".into(),
                 args: json!({}),
+                call_id: "call_1".into(),
             }
         );
         assert_eq!(
@@ -545,6 +548,7 @@ mod tests {
                 name: "fs_list".into(),
                 ok: true,
                 output: Some("a.txt".into()),
+                call_id: "call_1".into(),
             }
         );
         assert_eq!(
@@ -636,6 +640,7 @@ mod tests {
                 name: "fs_list".into(),
                 summary: "Listing .".into(),
                 args: json!({}),
+                call_id: "call_1".into(),
             }
         );
         assert_eq!(
@@ -644,6 +649,7 @@ mod tests {
                 name: "fs_list".into(),
                 ok: true,
                 output: Some("a.txt".into()),
+                call_id: "call_1".into(),
             }
         );
         assert_eq!(
@@ -652,6 +658,7 @@ mod tests {
                 name: "fs_read".into(),
                 summary: "Reading notes.md".into(),
                 args: json!({"path": "notes.md"}),
+                call_id: "call_2".into(),
             }
         );
         assert_eq!(
@@ -660,6 +667,7 @@ mod tests {
                 name: "fs_read".into(),
                 ok: true,
                 output: Some("note".into()),
+                call_id: "call_2".into(),
             }
         );
         // executor 按 index 顺序收到两个调用（id 由假模型按 index 生成）
