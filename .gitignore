@@ -1,5 +1,6 @@
 /target
 .commandcode/
 .agents/
+.superpowers/
 skills-lock.json
 harness/results-*.md
