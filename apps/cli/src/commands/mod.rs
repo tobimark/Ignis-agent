@@ -29,7 +29,7 @@ use ignis_core::session::SessionStore;
 use ignis_core::skills::SkillCatalog;
 use ignis_core::task::{TaskKind, TaskOutcome, TaskRequest, TaskRunner};
 use ignis_runtime::{ApprovalHandler, ChatMessage, RunStatus, Usage};
-use ignis_storage::Db;
+use ignis_storage::{Db, SessionSummary};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -44,6 +44,9 @@ use self::kernel::{
 // 能力提示行由 `run` 与 REPL 共用：路径保持在 `crate::commands::kernel_note`（内部实现搬进
 // `kernel` 模块，调用方不用跟着改）
 pub use self::kernel::kernel_note;
+
+/// `/sessions` 列出的条数上限（本工作区最近 N 条；只影响展示，不删数据）。
+const SESSIONS_LIMIT: usize = 10;
 
 /// 一次 CLI 会话的共享依赖：`run` 与 REPL 都从这里取当前内核与工作区。
 pub struct Session {
@@ -322,6 +325,68 @@ impl Session {
             .collect();
         self.last_usage = None;
         Ok(Some(count))
+    }
+
+    /// `/new`：清会话指针与历史，回到「本进程还没绑会话」的起点。
+    ///
+    /// 只清内存里的会话状态——模式、模型覆盖、内核一律不碰，数据也一行不删（旧会话留在
+    /// `sessions` 表里，之后可用 `/sessions` + `/resume` 回去）。Task 6 的 `last_prompt_stats`
+    /// 加入后在这里一并清空（与 [`Session::resume_latest`] 同一口径）。
+    pub fn start_new_session(&mut self) {
+        self.history.clear();
+        self.current_session = None;
+        self.last_usage = None;
+    }
+
+    /// `/resume <id|前缀>`：按前缀解析本工作区的一条会话，装载有效历史并设为当前会话；
+    /// 返回装载的消息条数。
+    ///
+    /// 先过 [`task::is_id_prefix`] 的准入（≥8 字符、只含 uuid 字符集）：拼错或过短的参数直接报
+    /// `session not found`，不去库里翻无关行。命中唯一一条时换成它的有效历史（最近一次压缩的
+    /// 摘要 + 其后原始消息），并清掉最近用量（Task 6 起连 `last_prompt_stats` 一起清）；命中多条
+    /// 把候选（新近在前、短 id、与 `/sessions` 同一口径）交给用户自己挑。错误一律人话 `Err`，
+    /// 由 REPL 原样打成 `error: {…}`。
+    pub fn resume_session(&mut self, id: &str) -> Result<usize, String> {
+        if !task::is_id_prefix(id) {
+            return Err(format!("session not found: {id}"));
+        }
+        let store = self.store();
+        let matches = store
+            .sessions_with_prefix(&self.workspace, id, task::CANDIDATES)
+            .map_err(|error| error.to_string())?;
+        match matches.as_slice() {
+            [] => Err(format!("session not found: {id}")),
+            [record] => {
+                let history = store
+                    .effective_history(&record.id)
+                    .map_err(|error| error.to_string())?;
+                let count = history.len();
+                self.current_session = Some(record.id.clone());
+                self.history = history
+                    .into_iter()
+                    .map(|message| message.to_chat_message())
+                    .collect();
+                self.last_usage = None;
+                Ok(count)
+            }
+            many => Err(format!(
+                "ambiguous session id: {id}（候选：{}）",
+                many.iter()
+                    .map(|record| crate::render::short_id(&record.id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+
+    /// `/sessions`：本工作区最近 [`SESSIONS_LIMIT`] 条会话（新近在前，含 canonical 消息条数）。
+    ///
+    /// `message_count` 是 `session_messages` 的**原始行数**（含已被压缩覆盖、不在有效历史里的
+    /// 前缀）；展示层知情即可，与 Task 2 的文档口径一致。
+    pub fn sessions(&self) -> Result<Vec<SessionSummary>, String> {
+        self.store()
+            .list_for_workspace(&self.workspace, SESSIONS_LIMIT)
+            .map_err(|error| error.to_string())
     }
 
     /// 当前内核是不是主路径的 native（`/model` 的能力分档与 `/status` 的模型行看它）。
@@ -1101,5 +1166,61 @@ mod tests {
         assert_eq!(fresh.resume_latest().unwrap(), None);
         assert_eq!(fresh.current_session(), None);
         assert!(fresh.history().is_empty());
+    }
+
+    /// `/new` 与 `/resume` 只动会话状态（`history` / `current_session` / `last_usage`）：
+    /// 输出模式、模型覆盖与内核一律不碰；旧会话行在库里一行不动。
+    #[test]
+    fn start_new_session_and_resume_session_move_only_conversation_state() {
+        let (_dir, mut session) = session_fixture("session-switch-state", "native");
+        let store = session.store();
+        let record = store
+            .create_session(session.workspace(), "native", None, "第一句")
+            .unwrap();
+        assert_eq!(
+            store
+                .append_turn(&record.id, "第一句", Some("答复一"))
+                .unwrap(),
+            2
+        );
+        let id = record.id.clone();
+
+        // 把非会话状态都设成非默认值：只有它们不该被两个命令碰到
+        session.set_model("test-model-2");
+        session.set_output_mode(OutputMode::Debug);
+        session.last_usage = Some(Usage {
+            input_tokens: 1,
+            output_tokens: 2,
+            estimated: false,
+        });
+
+        // `/resume <前缀>`：装载历史、切指针、清最近用量（运行前的观察值不该跟过来）
+        assert_eq!(session.resume_session(&id[..8]).unwrap(), 2);
+        assert_eq!(session.current_session(), Some(id.as_str()));
+        assert_eq!(session.history().len(), 2);
+        assert_eq!(session.history()[0].content, "第一句");
+        assert_eq!(session.history()[1].content, "答复一");
+        assert_eq!(session.last_usage(), None, "恢复清掉最近用量");
+        assert_eq!(session.output_mode(), OutputMode::Debug, "模式不动");
+        assert_eq!(session.model(), "test-model-2", "模型覆盖不动");
+        assert_eq!(session.kernel(), "native", "内核不动");
+
+        // `/new`：清会话指针/历史/最近用量；模式/模型/内核照旧，旧会话行还在库里
+        session.last_usage = Some(Usage {
+            input_tokens: 1,
+            output_tokens: 2,
+            estimated: false,
+        });
+        session.start_new_session();
+        assert_eq!(session.current_session(), None);
+        assert!(session.history().is_empty());
+        assert_eq!(session.last_usage(), None);
+        assert_eq!(session.output_mode(), OutputMode::Debug, "模式不动");
+        assert_eq!(session.model(), "test-model-2", "模型覆盖不动");
+        assert_eq!(session.kernel(), "native", "内核不动");
+        let rows = session.sessions().unwrap();
+        assert_eq!(rows.len(), 1, "旧会话一行不动（不删数据）");
+        assert_eq!(rows[0].session.id, id);
+        assert_eq!(rows[0].message_count, 2);
     }
 }

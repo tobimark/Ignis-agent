@@ -12,7 +12,7 @@ use std::path::Path;
 use ignis_core::config::OutputMode;
 use ignis_core::memory::FactScope;
 use ignis_runtime::Usage;
-use ignis_storage::TaskRecord;
+use ignis_storage::{SessionSummary, TaskRecord};
 
 use super::Session;
 use super::kernel::{KERNELS, NATIVE_KERNEL, kernel_note};
@@ -40,6 +40,12 @@ pub enum Slash {
     Memory,
     /// `/details [minimal|normal|debug]`：显示或切换输出模式。
     Details,
+    /// `/new`：开始新会话（只清会话指针与历史，不删数据）。
+    New,
+    /// `/sessions`：本工作区最近会话列表（当前会话带 `*`）。
+    Sessions,
+    /// `/resume <id>`：恢复本工作区的一条会话（id 可以是 ≥8 字符的唯一前缀）。
+    Resume,
 }
 
 /// 一行输入的含义。
@@ -95,10 +101,14 @@ const MEMORY_DELETE_USAGE: &str = "usage: /memory delete <id>";
 const TASKS_LIMIT_ERROR: &str = "tasks: limit must be a positive number";
 /// `/tasks` 无参时的条数（与帮助里的 `(default 10)` 同一口径）。
 const TASKS_DEFAULT_LIMIT: usize = 10;
+/// `/resume` 缺参或多参时的用法行（命令只收一个位置）。
+const RESUME_USAGE: &str = "resume: usage: /resume <id>";
 
 /// 帮助分组（顺序即 [`help_lines`] 的输出顺序）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Group {
+    /// 会话面（`/new` `/sessions` `/resume`）。
+    Session,
     /// 智能体本身的开关。
     Agent,
     /// 记忆面。
@@ -111,6 +121,7 @@ impl Group {
     /// 组名（帮助里独占一行）。
     fn label(self) -> &'static str {
         match self {
+            Group::Session => "SESSION",
             Group::Agent => "AGENT",
             Group::Intelligence => "INTELLIGENCE",
             Group::Interface => "INTERFACE",
@@ -135,8 +146,33 @@ struct Spec {
 
 /// 命令表：帮助与补全的唯一事实来源（条目、分组、参数提示与描述都只写一遍）。
 ///
-/// 顺序即组内顺序；`SESSION` 组的三条会话命令属 P3，本阶段不进表（帮助里因此也不出现）。
-const COMMANDS: [Spec; 9] = [
+/// 顺序即组内顺序（`SESSION` 组排在最前；`/context` 与 `/compact` 是 INTELLIGENCE 组的后续条目，
+/// 由 Task 6 / Task 7 各自进表）。
+const COMMANDS: [Spec; 12] = [
+    Spec {
+        command: Slash::New,
+        group: Group::Session,
+        name: "/new",
+        arg_hint: "",
+        summary: "Start a new session",
+        expects_args: false,
+    },
+    Spec {
+        command: Slash::Sessions,
+        group: Group::Session,
+        name: "/sessions",
+        arg_hint: "",
+        summary: "List recent sessions in this workspace",
+        expects_args: false,
+    },
+    Spec {
+        command: Slash::Resume,
+        group: Group::Session,
+        name: "/resume",
+        arg_hint: "<id>",
+        summary: "Resume a session from this workspace",
+        expects_args: true,
+    },
     Spec {
         command: Slash::Model,
         group: Group::Agent,
@@ -235,7 +271,12 @@ fn spec_line(spec: &Spec, width: usize) -> String {
 /// 一组条目按 `/help` 的格式落行：组名独占一行、组内按最宽对齐；没有条目的组不出现。
 fn group_lines(specs: &[&Spec]) -> Vec<String> {
     let mut lines = Vec::new();
-    for group in [Group::Agent, Group::Intelligence, Group::Interface] {
+    for group in [
+        Group::Session,
+        Group::Agent,
+        Group::Intelligence,
+        Group::Interface,
+    ] {
         let entries: Vec<&Spec> = specs
             .iter()
             .copied()
@@ -255,7 +296,7 @@ fn group_lines(specs: &[&Spec]) -> Vec<String> {
     lines
 }
 
-/// `/help` 的输出：三个分组与九条命令（顺序与 [`COMMANDS`] 一致）。
+/// `/help` 的输出：四个分组与十二条命令（顺序与 [`COMMANDS`] 一致）。
 pub fn help_lines() -> Vec<String> {
     group_lines(&COMMANDS.iter().collect::<Vec<_>>())
 }
@@ -555,6 +596,53 @@ pub fn tasks_lines(rows: &[TaskRecord]) -> Vec<String> {
     lines
 }
 
+/// `/sessions` 的输出：空表给一句 `(no sessions)`；否则 4 列表格（ID / MESSAGES / UPDATED / TITLE）。
+///
+/// 当前会话的 ID 单元格加 `*` 前缀；ID 是 13 字符短 id（与任务短 id 同一 helper，可直接复制给
+/// `/resume`）。`MESSAGES` 是库里 canonical 消息的**原始条数**（含已被压缩覆盖、不在有效历史里的
+/// 前缀，Task 2 的口径）；`UPDATED` 用 [`task::format_time`]；`TITLE` 原样（库里已经 ≤40 字符）。
+pub fn sessions_lines(rows: &[SessionSummary], current: Option<&str>) -> Vec<String> {
+    if rows.is_empty() {
+        return vec!["(no sessions)".to_string()];
+    }
+    let mut table = vec![vec![
+        "ID".to_string(),
+        "MESSAGES".to_string(),
+        "UPDATED".to_string(),
+        "TITLE".to_string(),
+    ]];
+    for row in rows {
+        let mark = if current == Some(row.session.id.as_str()) {
+            "*"
+        } else {
+            ""
+        };
+        table.push(vec![
+            format!("{mark}{}", short_id(&row.session.id)),
+            row.message_count.to_string(),
+            task::format_time(row.session.updated_at),
+            row.session.title.clone(),
+        ]);
+    }
+    lines_of(&task::render_table(&table))
+}
+
+/// `/resume` 成功的回显行：`resumed session {short13} ({n} messages)`。
+///
+/// `id` 传**解析出的整条会话 id**（参数可能只是它的一段前缀）：短 id 因此与 `/sessions` 的第一列
+/// 逐字一致，用户下一步就认得是哪条。
+pub fn resume_lines(id: &str, messages: usize) -> Vec<String> {
+    vec![format!(
+        "resumed session {} ({messages} messages)",
+        short_id(id)
+    )]
+}
+
+/// `/new` 的回显行（逐字）。
+pub fn new_session_line() -> String {
+    "new session".to_string()
+}
+
 /// 执行一条本地命令：读会话字段 → 调渲染函数 / 调 setter。
 ///
 /// 错误一律人话（`String`）并原样交回 REPL（它打 `error: {…}`）；生产路径无 panic。
@@ -614,6 +702,25 @@ pub fn dispatch(
             session.unread_alerts(),
             session.last_usage(),
         ))),
+        // 三个会话命令：渲染与状态变更都落到 `Session` 的方法与纯渲染函数，这里只做接线。
+        Slash::New => {
+            session.start_new_session();
+            Ok(Dispatch::Lines(vec![new_session_line()]))
+        }
+        Slash::Sessions => Ok(Dispatch::Lines(sessions_lines(
+            &session.sessions()?,
+            session.current_session(),
+        ))),
+        Slash::Resume => match args {
+            [arg] => {
+                let messages = session.resume_session(arg)?;
+                // 成功路径刚切过指针：回显用的是解析出的整条 id（参数可能只是一段前缀）
+                let id = session.current_session().unwrap_or(arg);
+                Ok(Dispatch::Lines(resume_lines(id, messages)))
+            }
+            // 少于/多于一个位置都是用法错误（不查库、不动状态）
+            _ => Err(RESUME_USAGE.to_string()),
+        },
         // 三个复用面命令：数据面取会话字段（`/tasks` 的库、`/skills` 的目录）或落回既有命令
         // 助手（`/memory` 的读写与回执），渲染与文案都不在这里另写一份。
         Slash::Memory => Ok(Dispatch::Lines(memory_lines(session, args)?)),
@@ -636,14 +743,18 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    use ignis_core::config::OutputMode;
+    use ignis_core::config::{Config, OutputMode};
     use ignis_core::memory::{FactScope, MemoryStore};
     use ignis_core::skills::SkillCatalog;
-    use ignis_runtime::Usage;
-    use ignis_storage::{Db, NewTask};
+    use ignis_core::task::TaskKind;
+    use ignis_runtime::test_support::{ScriptStep, ScriptedModel, ScriptedModelHandle};
+    use ignis_runtime::{ChatMessage, Role, Usage};
+    use ignis_storage::{
+        Db, NewSession, NewSessionMessage, NewTask, SessionRecord, SessionSummary,
+    };
 
     use super::*;
-    use crate::commands::fixtures::session_fixture;
+    use crate::commands::fixtures::{session_fixture, session_fixture_with_config};
     use crate::commands::skills;
 
     /// 分发一条命令并取出它的输出行；退出类命令不该走这里。
@@ -694,6 +805,71 @@ mod tests {
             .unwrap();
     }
 
+    /// 会话行夹具：`/sessions` 的表格只读会话记录与消息条数。
+    fn summary(id: &str, title: &str, updated_at: i64, message_count: usize) -> SessionSummary {
+        SessionSummary {
+            session: SessionRecord {
+                id: id.to_string(),
+                title: title.to_string(),
+                workspace: "/tmp/ws".into(),
+                kernel: "native".into(),
+                model: None,
+                created_at: updated_at,
+                updated_at,
+            },
+            message_count,
+        }
+    }
+
+    /// 往临时 home 的库里插一条会话行（`/sessions` 与 `/resume` 读的就是这份库）。
+    fn insert_session(session: &Session, id: &str, title: &str, at: i64) {
+        session
+            .db()
+            .insert_session(&NewSession {
+                id: id.to_string(),
+                title: title.to_string(),
+                workspace: session.workspace().display().to_string(),
+                kernel: "native".into(),
+                model: None,
+                created_at: at,
+            })
+            .unwrap();
+    }
+
+    /// 追加一轮 canonical 消息（user + assistant），并把 `updated_at` 刷成 `at`。
+    fn append_turn(session: &Session, id: &str, prompt: &str, reply: &str, at: i64) {
+        session
+            .db()
+            .append_session_messages(
+                id,
+                &[
+                    NewSessionMessage {
+                        role: "user".into(),
+                        content: prompt.into(),
+                    },
+                    NewSessionMessage {
+                        role: "assistant".into(),
+                        content: reply.into(),
+                    },
+                ],
+                at,
+            )
+            .unwrap();
+    }
+
+    /// 指向脚本化假模型的 native 配置（`/new` 的用例要先真的跑一轮把会话落库）。
+    fn scripted_config(model: &ScriptedModelHandle) -> Config {
+        Config {
+            api_key: Some("test-key".into()),
+            model: ignis_runtime::ModelConfig {
+                base_url: model.base_url(),
+                model: "test-model".into(),
+                ..ignis_runtime::ModelConfig::default()
+            },
+            ..Config::default()
+        }
+    }
+
     /// 解析表：空行、认识命令、未知命令与任务各一条路。
     #[test]
     fn parse_table_covers_commands_tasks_and_unknown() {
@@ -736,13 +912,17 @@ mod tests {
     fn help_lines_lists_every_command_in_its_group() {
         let lines = help_lines();
 
-        // 组名独占一行、按固定顺序（`SESSION` 组属 P3，本阶段不出现）
+        // 组名独占一行、按固定顺序（`SESSION` 组在本任务落地，排在 `AGENT` 之前）
         let groups: Vec<&str> = lines
             .iter()
             .filter(|line| !line.starts_with("  "))
             .map(String::as_str)
             .collect();
-        assert_eq!(groups, ["AGENT", "INTELLIGENCE", "INTERFACE"], "{lines:?}");
+        assert_eq!(
+            groups,
+            ["SESSION", "AGENT", "INTELLIGENCE", "INTERFACE"],
+            "{lines:?}"
+        );
 
         // 命令表里的每个条目在帮助里恰好出现一次（含参数提示、以描述收尾）
         for spec in &COMMANDS {
@@ -780,25 +960,324 @@ mod tests {
         );
     }
 
-    /// 帮助里绝不出现后续阶段的命令（P3/P4 才实现，提前列出来等于说谎）。
+    /// `/help` 的 SESSION 组：组序在最前、三条新条目逐字、列宽由最宽的 `/resume <id>` 决定。
+    #[test]
+    fn help_lines_list_the_new_commands_in_their_groups() {
+        let lines = help_lines();
+
+        // 分组顺序固定：`SESSION` 排在最前
+        let groups: Vec<&str> = lines
+            .iter()
+            .filter(|line| !line.starts_with("  "))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            groups,
+            ["SESSION", "AGENT", "INTELLIGENCE", "INTERFACE"],
+            "{lines:?}"
+        );
+
+        // 三条新条目的「名 + 参数提示」与描述逐字；`/resume <id>` 的 11 列参与组内对齐
+        let session = lines
+            .iter()
+            .position(|line| line == "SESSION")
+            .expect("SESSION 组标题");
+        assert_eq!(
+            &lines[session + 1..session + 4],
+            [
+                "  /new          Start a new session",
+                "  /sessions     List recent sessions in this workspace",
+                "  /resume <id>  Resume a session from this workspace",
+            ]
+        );
+        // SESSION 组之后紧接 AGENT：组里没有多余的行
+        assert_eq!(lines[session + 4], "AGENT", "{lines:?}");
+
+        // 每个新条目在帮助里恰好出现一次（与既有用例同一口径）
+        for spec in COMMANDS.iter().filter(|spec| spec.group == Group::Session) {
+            let label = spec_label(spec);
+            let hits: Vec<&String> = lines
+                .iter()
+                .filter(|line| line.starts_with(&format!("  {label}")))
+                .collect();
+            assert_eq!(hits.len(), 1, "{} 应恰好出现一次：{lines:?}", spec.name);
+            assert!(hits[0].ends_with(spec.summary), "{:?}", hits[0]);
+        }
+    }
+
+    /// 帮助里绝不出现后续阶段（P4）的命令——P3 的会话命令如今是合法条目。
     #[test]
     fn help_lines_never_mentions_later_phases() {
         let help = help_lines().join("\n");
-        for later in [
-            "/new",
-            "/sessions",
-            "/resume",
-            "/context",
-            "/compact",
-            "/learn",
-            "/reload",
-        ] {
+        for later in ["/learn", "/reload"] {
             assert!(
                 !help.contains(later),
-                "{later} 不该出现在 P2 的帮助里：{help}"
+                "{later} 不该出现在 P3 的帮助里：{help}"
             );
         }
-        assert!(!help.contains("SESSION"), "{help}");
+    }
+
+    /// `/sessions` 的表：空表一句、表头逐字、当前会话的 ID 格带 `*`、列宽对齐且行尾不留空格。
+    #[test]
+    fn sessions_lines_matrix() {
+        // 空库：不画空表头
+        assert_eq!(sessions_lines(&[], None), ["(no sessions)"]);
+
+        let newer = "019a1b2c-2222-7f00-8000-000000000002";
+        let older = "019a1b2c-1111-7f00-8000-000000000001";
+        let rows = [
+            summary(newer, "修复配置路径", STARTED_AT + 1_000, 4),
+            summary(older, "你好", STARTED_AT, 2),
+        ];
+
+        let lines = sessions_lines(&rows, Some(older));
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(cells(&lines[0]), ["ID", "MESSAGES", "UPDATED", "TITLE"]);
+        // 新近在前；`*` 只在当前会话（第二条）的 ID 格里
+        assert_eq!(cells(&lines[1])[0], &newer[..13]);
+        assert_eq!(cells(&lines[1])[1], "4");
+        assert_eq!(cells(&lines[1])[2], "2026-10-15T12:00:01Z");
+        assert_eq!(cells(&lines[1])[3], "修复配置路径");
+        assert_eq!(cells(&lines[2])[0], format!("*{}", &older[..13]));
+        assert_eq!(cells(&lines[2])[1], "2");
+        assert_eq!(cells(&lines[2])[2], "2026-10-15T12:00:00Z");
+        assert_eq!(cells(&lines[2])[3], "你好");
+        // UPDATED 是 `task::format_time` 的口径（`YYYY-MM-DDTHH:MM:SSZ`）
+        assert_eq!(cells(&lines[2])[2].len(), 20, "{lines:?}");
+        // 行尾不留空格（`render_table` 的既有口径）
+        for line in &lines {
+            assert_eq!(line.trim_end(), line, "{line:?}");
+        }
+
+        // 没有当前会话：谁都不带 `*`
+        let plain = sessions_lines(&rows, None);
+        assert!(!plain.iter().any(|line| line.contains('*')), "{plain:?}");
+    }
+
+    /// `/resume <前缀>` 的真值表：唯一命中装载、撞车报候选（新近在前、最多 `CANDIDATES` 条）、
+    /// 过短/非法/空串/空库都是同一句 `session not found`。
+    #[test]
+    fn resume_prefix_matrix() {
+        let (_dir, mut session) = session_fixture("slash-resume-prefix", "native");
+        let first = "019a1b2c-1aaa-7f00-8000-000000000001";
+        let second = "019a1b2c-1bbb-7f00-8000-000000000002";
+
+        // 空库：合法前缀也只是一句 not found
+        assert_eq!(
+            session.resume_session("019a1b2c").unwrap_err(),
+            "session not found: 019a1b2c"
+        );
+
+        // 有且只有一条：短前缀唯一命中，历史装载、指针切过去、返回条数
+        insert_session(&session, first, "第一段", STARTED_AT);
+        append_turn(&session, first, "你好", "答复一", STARTED_AT + 1);
+        assert_eq!(session.resume_session("019a1b2c").unwrap(), 2);
+        assert_eq!(session.current_session(), Some(first));
+        assert_eq!(session.history().len(), 2);
+        assert_eq!(session.history()[0].content, "你好");
+
+        // 再来一条同前缀的：`019a1b2c-1` 命中两条 → 歧义错误列出两个短 id（新近在前）
+        insert_session(&session, second, "第二段", STARTED_AT + 2_000);
+        append_turn(&session, second, "再问", "答复二", STARTED_AT + 2_001);
+        let error = session.resume_session("019a1b2c-1").unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "ambiguous session id: 019a1b2c-1（候选：{}, {}）",
+                &second[..13],
+                &first[..13]
+            )
+        );
+        assert_eq!(session.current_session(), Some(first), "歧义不该改指针");
+
+        // 更长的前缀唯一命中：切到第二条，历史换成它的
+        assert_eq!(session.resume_session("019a1b2c-1bbb").unwrap(), 2);
+        assert_eq!(session.current_session(), Some(second));
+        assert_eq!(session.history()[0].content, "再问");
+
+        // 过短 / 非法字符 / 空串：同一句 not found（准入闸门不过就不查库），指针不动
+        for bad in ["short", "ZZZZ", ""] {
+            assert_eq!(
+                session.resume_session(bad).unwrap_err(),
+                format!("session not found: {bad}"),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            session.current_session(),
+            Some(second),
+            "失败的恢复不该动指针"
+        );
+
+        // 候选上限：12 条同前缀的会话只列出最新的 `CANDIDATES` 条（新近在前）
+        let (_dir, mut many) = session_fixture("slash-resume-candidates", "native");
+        for index in 0..12 {
+            insert_session(
+                &many,
+                &format!("019a1b2c-{index:04x}-7f00-8000-000000000000"),
+                "批量",
+                STARTED_AT + index as i64,
+            );
+        }
+        let error = many.resume_session("019a1b2c").unwrap_err();
+        let candidates: Vec<&str> = error
+            .strip_prefix("ambiguous session id: 019a1b2c（候选：")
+            .and_then(|rest| rest.strip_suffix('）'))
+            .unwrap_or_else(|| panic!("{error}"))
+            .split(", ")
+            .collect();
+        assert_eq!(candidates.len(), task::CANDIDATES, "{error}");
+        assert_eq!(candidates[0], "019a1b2c-000b", "{error}");
+        assert!(!error.contains("019a1b2c-0000"), "{error}");
+        assert!(!error.contains("019a1b2c-0001"), "{error}");
+    }
+
+    /// `/sessions` 经 dispatch：空库一句、有库按表格、当前会话带 `*`、条数上限 10 条。
+    #[test]
+    fn dispatch_sessions_lists_the_workspace() {
+        let (_dir, mut session) = session_fixture("slash-sessions-dispatch", "native");
+        assert_eq!(
+            dispatch_lines(&mut session, Slash::Sessions, &[]),
+            ["(no sessions)"]
+        );
+
+        let first = "019a1b2c-1111-7f00-8000-000000000001";
+        let second = "019a1b2c-2222-7f00-8000-000000000002";
+        insert_session(&session, first, "第一段", STARTED_AT);
+        insert_session(&session, second, "第二段", STARTED_AT + 1_000);
+        append_turn(&session, second, "第二句", "答复二", STARTED_AT + 1_001);
+        // 先把当前会话切到第二条：表里它带 `*`，MESSAGES 是库里的原始条数
+        assert_eq!(session.resume_session("019a1b2c-2222").unwrap(), 2);
+
+        let lines = dispatch_lines(&mut session, Slash::Sessions, &[]);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(cells(&lines[0]), ["ID", "MESSAGES", "UPDATED", "TITLE"]);
+        assert_eq!(cells(&lines[1])[0], format!("*{}", &second[..13]));
+        assert_eq!(cells(&lines[1])[1], "2");
+        assert_eq!(cells(&lines[1])[3], "第二段");
+        assert_eq!(cells(&lines[2])[0], &first[..13]);
+        assert_eq!(cells(&lines[2])[1], "0");
+
+        // 条数上限 10：再插 10 条更旧的，表里仍只有 10 行数据（最旧的两条被截掉）
+        for index in 0..10 {
+            insert_session(
+                &session,
+                &format!("019a1b2c-3{index:03x}-7f00-8000-000000000000"),
+                "更旧",
+                STARTED_AT - 10_000 - index as i64,
+            );
+        }
+        let lines = dispatch_lines(&mut session, Slash::Sessions, &[]);
+        assert_eq!(lines.len(), 11, "{lines:?}");
+        assert_eq!(cells(&lines[1])[0], format!("*{}", &second[..13]));
+        for oldest in ["019a1b2c-3008", "019a1b2c-3009"] {
+            assert!(
+                !lines.iter().any(|line| line.contains(oldest)),
+                "第 11、12 新的两条不该出现：{lines:?}"
+            );
+        }
+    }
+
+    /// `/resume` 经 dispatch：装载有效历史、换指针、回显解析出的短 id（参数是前缀也一样）。
+    #[test]
+    fn dispatch_resume_loads_the_history_and_switches_the_pointer() {
+        let (_dir, mut session) = session_fixture("slash-resume-dispatch", "native");
+        let first = "019a1b2c-1111-7f00-8000-000000000001";
+        let second = "019a1b2c-2222-7f00-8000-000000000002";
+        insert_session(&session, first, "第一段", STARTED_AT);
+        insert_session(&session, second, "第二段", STARTED_AT + 1_000);
+        append_turn(&session, first, "你好", "答复一", STARTED_AT + 1);
+        append_turn(&session, second, "再问", "答复二", STARTED_AT + 1_001);
+
+        let lines = dispatch_lines(&mut session, Slash::Resume, &args(&["019a1b2c-1111"]));
+        assert_eq!(lines, ["resumed session 019a1b2c-1111 (2 messages)"]);
+        assert_eq!(session.current_session(), Some(first));
+        let expected = vec![
+            ChatMessage {
+                role: Role::User,
+                content: "你好".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+            },
+            ChatMessage {
+                role: Role::Assistant,
+                content: "答复一".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+            },
+        ];
+        assert_eq!(session.history(), expected.as_slice(), "有效历史逐条相等");
+
+        // 换一条：历史与指针一起换过去
+        let lines = dispatch_lines(&mut session, Slash::Resume, &args(&["019a1b2c-2222"]));
+        assert_eq!(lines, ["resumed session 019a1b2c-2222 (2 messages)"]);
+        assert_eq!(session.current_session(), Some(second));
+        assert_eq!(session.history()[0].content, "再问");
+        assert_eq!(session.history()[1].content, "答复二");
+
+        // 失败原样交回（REPL 打 `error: {…}`），且不改状态
+        for (words, expected) in [
+            (
+                args(&["019a1b2c"]),
+                "ambiguous session id: 019a1b2c（候选：019a1b2c-2222, 019a1b2c-1111）".to_string(),
+            ),
+            (args(&["short"]), "session not found: short".to_string()),
+        ] {
+            let error = dispatch(&mut session, Slash::Resume, &words).unwrap_err();
+            assert_eq!(error, expected, "{words:?}");
+            assert_eq!(
+                session.current_session(),
+                Some(second),
+                "失败的恢复不该动指针"
+            );
+        }
+
+        // 缺参 / 多参：用法错误（不查库、不动状态）
+        for words in [args(&[]), args(&["a", "b"])] {
+            let error = dispatch(&mut session, Slash::Resume, &words).unwrap_err();
+            assert_eq!(error, "resume: usage: /resume <id>", "{words:?}");
+            assert_eq!(session.current_session(), Some(second));
+        }
+    }
+
+    /// `/new` 经 dispatch：清指针/历史/最近用量，旧会话一行不删；三个会话命令都不碰模型。
+    #[tokio::test]
+    async fn dispatch_new_clears_the_session_state() {
+        let model = ScriptedModel::start(vec![ScriptStep::Text("答复一".into())]);
+        let (_dir, mut session) =
+            session_fixture_with_config("slash-new-dispatch", "native", scripted_config(&model));
+        session
+            .run_task("你好".into(), TaskKind::Repl)
+            .await
+            .expect("脚本化模型应答应成功");
+        let old = session
+            .current_session()
+            .expect("首个 REPL 任务应建会话")
+            .to_string();
+        assert!(!session.history().is_empty());
+        assert!(session.last_usage().is_some());
+        assert_eq!(model.requests().len(), 1, "那一轮真的碰过模型");
+
+        let lines = dispatch_lines(&mut session, Slash::New, &[]);
+        assert_eq!(lines, ["new session"]);
+        assert_eq!(session.current_session(), None, "指针回到「还没绑会话」");
+        assert!(session.history().is_empty());
+        assert_eq!(session.last_usage(), None);
+
+        // 旧会话一行不动（不删数据），只是不再带 `*`
+        let listed = dispatch_lines(&mut session, Slash::Sessions, &[]);
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        assert_eq!(cells(&listed[1])[0], &old[..13], "旧会话还在，且没有 `*`");
+        assert_eq!(cells(&listed[1])[1], "2");
+
+        // `/resume` 能回到它；`/new` / `/sessions` / `/resume` 都没有再碰模型
+        let resumed = dispatch_lines(&mut session, Slash::Resume, &args(&[&old[..8]]));
+        assert_eq!(
+            resumed,
+            [format!("resumed session {} (2 messages)", &old[..13])]
+        );
+        assert_eq!(session.current_session(), Some(old.as_str()));
+        assert_eq!(model.requests().len(), 1, "会话命令不碰模型");
     }
 
     /// 未知命令的报错行逐字钉住（REPL 打到 stderr，不送模型）。

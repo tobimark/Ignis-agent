@@ -32,7 +32,9 @@ const FALLBACK_VALUE_CHARS: usize = 40;
 /// 前缀解析允许的最短参数：短于此的输入不当前缀用（否则 `task show 2` 会撞到一半任务）。
 const ID_PREFIX_MIN: usize = 8;
 /// 歧义错误里最多列出的候选数（前缀撞车只用于人工二选一，不需要全量）。
-const CANDIDATES: usize = 10;
+///
+/// `task show <id|前缀>` 与 REPL 的 `/resume <前缀>` 共用这一份上限（`pub(crate)` 只提可见性）。
+pub(crate) const CANDIDATES: usize = 10;
 
 /// `ignis task`：`show` 看一条任务，`list` 看最近若干条。
 pub fn run(command: &TaskCommand) -> Result<ExitCode> {
@@ -96,7 +98,9 @@ fn find_task(db: &Db, arg: &str) -> Result<TaskRecord> {
 }
 
 /// 前缀的准入：至少 [`ID_PREFIX_MIN`] 个字符且只含 uuid 的字符集（`[0-9a-f-]`）。
-fn is_id_prefix(arg: &str) -> bool {
+///
+/// `task show <id|前缀>` 与 REPL 的 `/resume <前缀>` 共用这一份闸门（函数体与文案只有一处）。
+pub(crate) fn is_id_prefix(arg: &str) -> bool {
     arg.chars().count() >= ID_PREFIX_MIN
         && arg
             .chars()
