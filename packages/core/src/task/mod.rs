@@ -188,24 +188,31 @@ impl TaskRunner {
     ///
     /// 组装期向记忆层取事实是 fail-soft 的：读不出来（表缺失、库损坏……）只往 stderr 打一行警告，
     /// 本轮不注入事实，任务照跑——记忆不是任务的前提，技能段与工具装配都不受它影响。
+    ///
+    /// 用户提示词在进入组装之前先过头一次 [`Redactor`]（C1 终审）：模型收到的 user 消息、
+    /// `tasks.prompt` 行、记忆检索与交回调用方的 canonical 消息全部取这一份脱敏文本，提示词里的
+    /// 已知密钥不再可能落到模型上下文或任何落盘面。
     pub async fn run(
         &self,
-        req: TaskRequest,
+        mut req: TaskRequest,
         sink: UnboundedSender<RuntimeEvent>,
         cancel: CancellationToken,
     ) -> Result<TaskOutcome, CoreError> {
         let task_id = uuid::Uuid::now_v7().to_string();
         let kernel = self.runtime.id();
         let workspace = req.workspace.clone();
+        // C1：提示词只在这里脱敏一次（与摘要 / 错误用的是同一道脱敏器），此后 `req.prompt`
+        // 一律是脱敏文本；下面的任务行、模型消息与 JSONL 都从它出发。
+        req.prompt = self.redactor.redact(&req.prompt);
         // 日志目录先就位：建不出来就不留下一条永远 running 的任务行
         let log = TaskLog::new(&self.log_dir)?;
 
         self.db.insert_task(&NewTask {
             id: task_id.clone(),
             kind: kind_str(req.kind).to_string(),
-            // `tasks.prompt` 是 `ignis task show/list` 直接打印的一列：与 JSONL 同一道脱敏，
-            // 否则用户把密钥粘进提示词就等于把它明文写进了库
-            prompt: self.redactor.redact(&req.prompt),
+            // `tasks.prompt` 是 `ignis task show/list` 直接打印的一列：取入口处脱敏过的同一份
+            // 提示词（不再二次 redact），与模型历史、JSONL 同源
+            prompt: req.prompt.clone(),
             kernel: kernel.to_string(),
             workspace: workspace.display().to_string(),
             started_at: now_millis(),
@@ -243,6 +250,8 @@ impl TaskRunner {
         cancel: CancellationToken,
         usage: &mut Usage,
     ) -> Result<TaskOutcome, CoreError> {
+        // 首行不含提示词：提示词只落 `tasks.prompt`（已在 `run` 入口脱敏）；JSONL 每行另有
+        // 整行脱敏兜底，两条路都到不了明文
         self.append_jsonl(
             log,
             task_id,
@@ -255,7 +264,8 @@ impl TaskRunner {
             }),
         )?;
 
-        // 上下文：历史轮次 + 本轮输入；工具执行器按本次任务（task_id/工作区/上限）装配
+        // 上下文：历史轮次 + 本轮输入（`req.prompt` 已在 `run` 入口脱敏，与模型、任务行同源）；
+        // 工具执行器按本次任务（task_id/工作区/上限）装配
         let workspace = req.workspace.clone();
         let mut messages = req.history;
         messages.push(chat_message(Role::User, req.prompt.clone()));
@@ -1313,6 +1323,90 @@ mod tests {
             !env.log_raw().contains("sk-test-secret"),
             "{}",
             env.log_raw()
+        );
+    }
+
+    /// C1（终审）：用户提示词里的已知密钥不得随任何一条链路泄漏——提示词在进入组装之前先过
+    /// 一次脱敏，模型收到的请求体、`tasks.prompt` 行、JSONL 与交回调用方的 `outcome.messages`
+    /// 因此同源，都是那份脱敏文本。
+    #[tokio::test]
+    async fn prompt_secrets_never_reach_the_model_the_task_row_or_the_jsonl() {
+        let dir = TempDir::new("prompt-redacted");
+        let db = Arc::new(Db::open(&dir.path().join("ignis.db")).unwrap());
+        let model = ScriptedModel::start(vec![ScriptStep::Text("答复".into())]);
+        let config = Arc::new(Config {
+            workspace_root: dir.path().to_path_buf(),
+            api_key: Some("sk-test-secret".into()),
+            model: ModelConfig {
+                base_url: model.base_url(),
+                model: "test-model".into(),
+                ..ModelConfig::default()
+            },
+            ..Config::default()
+        });
+        let runtime: Arc<dyn Runtime> = Arc::new(NativeRuntime::new(
+            OpenAiClient::new(&config.model, "sk-test-secret".into()).unwrap(),
+        ));
+        let runner = TaskRunner::new(
+            Arc::clone(&db),
+            Arc::clone(&config),
+            runtime,
+            Arc::new(Policy::new(ApprovalMode::Preauthorized {
+                unsafe_ops: false,
+            })),
+            ScriptedApproval::new(Vec::new()),
+            dir.path().join("logs"),
+            MemoryStore::new(Arc::clone(&db), dir.path().join("memory")),
+            SkillCatalog::load(&dir.path().join("skills")),
+            Arc::new(RecordingNotifier::new()),
+            None,
+        );
+
+        let (sink, _received) = mpsc::unbounded_channel();
+        let outcome = runner
+            .run(
+                TaskRequest {
+                    prompt: "请记录 sk-test-secret 这个密钥".into(),
+                    history: Vec::new(),
+                    kind: TaskKind::Run,
+                    workspace: dir.path().to_path_buf(),
+                    job_id: None,
+                    session_id: None,
+                },
+                sink,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("端到端运行不应返回 Err");
+
+        // 1. 假模型收到的请求体：整份 body 无明文，user 正文是脱敏后的提示词
+        let requests = model.requests();
+        let body = serde_json::to_string(&requests).unwrap();
+        assert!(!body.contains("sk-test-secret"), "{body}");
+        assert_eq!(requests[0]["messages"][1]["role"], "user");
+        assert_eq!(
+            requests[0]["messages"][1]["content"],
+            json!("请记录 *** 这个密钥")
+        );
+
+        // 2. `tasks.prompt` 行（`ignis task show/list` 直接打印的一列）
+        let row = db.get_task(&outcome.id).unwrap().expect("任务行");
+        assert_eq!(row.prompt, "请记录 *** 这个密钥");
+
+        // 3. JSONL 整行（含 `task_start`）：任何一行都不带明文
+        let mut logs: Vec<PathBuf> = fs::read_dir(dir.path().join("logs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .collect();
+        assert_eq!(logs.len(), 1, "每次运行应恰好写一个日志文件：{logs:?}");
+        let raw = fs::read_to_string(logs.pop().unwrap()).unwrap();
+        assert!(!raw.contains("sk-test-secret"), "{raw}");
+
+        // 4. 交回调用方的 canonical 消息：user 正文与模型看到的是同一份脱敏文本
+        assert_eq!(
+            outcome.messages,
+            vec![user("请记录 *** 这个密钥"), assistant("答复")]
         );
     }
 

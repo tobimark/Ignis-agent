@@ -24,7 +24,7 @@ use anyhow::{Result, bail};
 use ignis_core::alerts::{MultiNotifier, Notifier};
 use ignis_core::config::{Config, OutputMode, ensure_home, ignis_home, load_config};
 use ignis_core::memory::MemoryStore;
-use ignis_core::security::{ApprovalMode, Policy};
+use ignis_core::security::{ApprovalMode, Policy, Redactor};
 use ignis_core::session::{
     COMPACT_KEEP_TURNS, EARLIER_SUMMARY_PREFIX, HistoryMessage, SessionStore, render_transcript,
     split_turns, summarize_turns,
@@ -303,6 +303,15 @@ impl Session {
         SessionStore::new(Arc::clone(&self.db))
     }
 
+    /// 会话面的脱敏器：与每轮任务的 `TaskRunner` / `ToolRuntime` 同一来源（`config.api_key`，
+    /// 已在 `Session::new` 里回填生效值）。
+    ///
+    /// 标题、轮次落库与压缩摘要都先过它——命令层写下的会话行因此与运行器写的历史同源，
+    /// 用户粘贴过的已知密钥不会从 REPL 这一侧泄漏。
+    fn redactor(&self) -> Redactor {
+        Redactor::new(self.config.api_key.iter().cloned().collect())
+    }
+
     /// 首个 REPL 任务：懒创建会话行（标题 = 首条用户消息）并记住 id；已有会话直接返回。
     ///
     /// 错误只交回人话文本（调用方 fail-soft：警告一行、本轮不绑会话，任务照跑）。
@@ -428,9 +437,9 @@ impl Session {
     /// 2. 还没绑定会话 → `compact: no session yet`；
     /// 3. 有效历史的 user 消息 ≤ [`COMPACT_KEEP_TURNS`] 条（没有可压段）→
     ///    `Ok(["compact: nothing to compact"])`——普通回显，不是错误；
-    /// 4. 否则把被压缩段渲染成一次**无工具**的 native 请求交给模型，成功后落一条 compaction 记录、
-    ///    把内存历史重建为「摘要消息 + 保留段」、清掉组装统计（下一次组装会重算；用量保持最近一轮的
-    ///    真实值），返回回显行。
+    /// 4. 否则把被压缩段渲染成一次**无工具**的 native 请求交给模型（正文与交回的摘要都先过
+    ///    会话脱敏器），成功后落一条 compaction 记录、把内存历史重建为「摘要消息 + 保留段」、
+    ///    清掉组装统计（下一次组装会重算；用量保持最近一轮的真实值），返回回显行。
     ///
     /// 切分读的是 `store().effective_history(id)`——库里的 canonical 视图：某一轮的 append 被
     /// fail-soft 跳过时，内存历史可能比库里更富，压缩**有意**以这份持久化视图为准重建，否则切点算错
@@ -462,16 +471,19 @@ impl Session {
         // 被压缩段的上界：摘要消息的 seq 与后续切点都按它算
         let upto_seq = last_compacted.seq;
 
-        // 4. 一次无工具的 native 请求（会话级模型覆盖经 `effective_config` 对摘要同样生效）
+        // 4. 一次无工具的 native 请求（会话级模型覆盖经 `effective_config` 对摘要同样生效）。
+        //    C1：送给模型的旧轮次正文与模型交回的摘要各过一道会话脱敏器（这条路径不经过
+        //    `TaskRunner`）——落库的摘要与重建后的历史因此与运行器写下的会话面同源。
         let config = self.effective_config();
-        let transcript = render_transcript(&older);
+        let transcript = self.redactor().redact(&render_transcript(&older));
         let runtime = mk_runtime(NATIVE_KERNEL, &config, &self.workspace)?;
         let summary = summarize_turns(runtime, &config, &transcript, CancellationToken::new())
             .await
             .map_err(|error| error.to_string())?;
+        let summary = self.redactor().redact(&summary);
 
         // 成功才动状态：先落库（重建视图的起点），再把内存历史换成「摘要消息 + 保留段」。
-        // 摘要消息的正文用与 `effective_history` 同一份常量拼法。
+        // 摘要消息的正文用与 `effective_history` 同一份常量拼法（脱敏后的摘要文本）。
         self.store()
             .record_compaction(&id, upto_seq, &summary)
             .map_err(|error| error.to_string())?;
@@ -572,9 +584,17 @@ impl Session {
     /// fail-soft：只打一行 `warning: session write failed: …`，本轮照跑、上下文照常推进——
     /// 写库失败不该把一轮对话丢掉。`TaskKind::Run`（`ignis run`）不建会话、不追加。
     ///
+    /// 提示词在会话面先过一道脱敏器（C1 终审）：会话标题、轮次落库与送给运行器的请求取同一份
+    /// 文本，与运行器写下 `tasks.prompt` 的那一份逐字相同。
+    ///
     /// 审批提示是审批层对 stdout 的直接写入（不经渲染器），异步管线下它与工具行的硬写序做不到
     /// ——记为已知限制，P2/P5 单一写者时收口。
     pub async fn run_task(&mut self, prompt: String, kind: TaskKind) -> Result<TaskOutcome> {
+        // C1：提示词先过会话面的脱敏器再用——标题（`ensure_session`）、轮次落库（`append_turn`）
+        // 与送给运行器的 `TaskRequest` 都取这一份（运行器入口另有一道同源脱敏，重复替换幂等），
+        // 三面同源；提示词里的已知密钥因此既到不了模型，也写不进 `sessions.title` /
+        // `session_messages`。
+        let prompt = self.redactor().redact(&prompt);
         // REPL 轮次先懒创建会话：失败只警告一行，本轮不绑会话照跑（见上文的 fail-soft 口径）
         let session_id = match kind {
             TaskKind::Repl => match self.ensure_session(&prompt) {
@@ -1191,6 +1211,57 @@ mod tests {
         );
     }
 
+    /// C1（终审）：REPL 轮次的提示词含已知密钥时，会话标题（`/sessions` 的展示面）、
+    /// `session_messages` 的 user 行、跨轮历史与模型请求体里都不许出现明文——命令层与
+    /// `TaskRunner` 用的是同一道 `Redactor`、同一份脱敏文本。
+    #[tokio::test]
+    async fn prompt_secrets_never_reach_the_session_surfaces_or_the_model() {
+        let model = ScriptedModel::start(vec![ScriptStep::Text("答复一".into())]);
+        let config = Config {
+            api_key: Some("sk-test-secret".into()),
+            ..scripted_config(&model)
+        };
+        let (dir, mut session) = session_fixture_with_config("session-redacted", "native", config);
+
+        let outcome = session
+            .run_task("把 sk-test-secret 记下来".into(), TaskKind::Repl)
+            .await
+            .expect("脚本化模型应答应成功");
+        assert_eq!(outcome.status, RunStatus::Success);
+
+        // 1. 会话标题（`/sessions` 的 TITLE 列直接打印它）
+        let session_id = session
+            .current_session()
+            .expect("首个 REPL 任务应建会话")
+            .to_string();
+        let rows = session.store().list_for_workspace(dir.path(), 10).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].session.title, "把 *** 记下来");
+
+        // 2. `session_messages` 的 user 行（恢复会话时读回的就是它）
+        let messages = session.db().session_messages_from(&session_id, 1).unwrap();
+        let user_row = messages
+            .iter()
+            .find(|message| message.role == "user")
+            .expect("user 行");
+        assert_eq!(user_row.content, "把 *** 记下来");
+        // 整表都不带明文（assistant 行同样过脱敏）
+        let raw = messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!raw.contains("sk-test-secret"), "{raw}");
+
+        // 3. 模型请求体：那一次任务真的碰过模型，body 里没有明文
+        let body = serde_json::to_string(&model.requests()).unwrap();
+        assert!(!body.contains("sk-test-secret"), "{body}");
+        assert!(body.contains("把 *** 记下来"), "{body}");
+
+        // 4. 跨轮历史（下一轮送进内核的那一份）
+        assert_eq!(session.history()[0].content, "把 *** 记下来");
+    }
+
     /// `TaskKind::Run`（`ignis run`）是一次性运行：不建会话、不追加轮次，任务行的
     /// `session_id` 为 NULL。
     #[tokio::test]
@@ -1545,6 +1616,50 @@ mod tests {
             serde_json::json!("user: 第一句\n\nassistant: 答复一")
         );
         assert!(requests[0].get("tools").is_none(), "{:#?}", requests[0]);
+    }
+
+    /// C1（终审）：`/compact` 的摘要先过一道脱敏再落库、再进重建后的历史——模型把用户
+    /// 粘贴过的已知密钥复述进摘要，也不会被持久化、回显或带给下一轮内核。
+    #[tokio::test]
+    async fn compact_summary_is_redacted_before_storage_and_history() {
+        let model = ScriptedModel::start(vec![ScriptStep::Text("早前提到 sk-test-secret".into())]);
+        let config = Config {
+            api_key: Some("sk-test-secret".into()),
+            ..scripted_config(&model)
+        };
+        let (_dir, mut session) = session_fixture_with_config("compact-redacted", "native", config);
+        let id = session_with_three_turns(&mut session, "compact-redacted");
+
+        let lines = session.compact().await.expect("脚本化模型应给出摘要");
+
+        // 落库的摘要、重建后的历史与库里的有效历史视图三处都只有脱敏文本
+        let latest = session
+            .db()
+            .latest_compaction(&id)
+            .unwrap()
+            .expect("compaction 行");
+        assert_eq!(latest.summary, "早前提到 ***");
+        assert_eq!(latest.upto_seq, 2, "切点仍是被压缩段的上界");
+        let expected = format!("{EARLIER_SUMMARY_PREFIX}\n\n早前提到 ***");
+        assert_eq!(session.history()[0].content, expected);
+        assert!(
+            !session
+                .history()
+                .iter()
+                .any(|message| message.content.contains("sk-test-secret")),
+            "{:?}",
+            session.history()
+        );
+        let db_view = session.store().effective_history(&id).unwrap();
+        assert_eq!(db_view[0].content, expected, "内存与库里同源");
+        // 回显按脱敏后的字符数算
+        assert_eq!(
+            lines,
+            [format!(
+                "compacted: 2 messages → summary ({} chars)",
+                "早前提到 ***".chars().count()
+            )]
+        );
     }
 
     /// 二次压缩（ledger 预检 #6 的口径）：可压段只剩上一份摘要消息，`upto_seq` 沿用旧上界、
