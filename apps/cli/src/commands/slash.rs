@@ -10,10 +10,14 @@
 use std::path::Path;
 
 use ignis_core::config::OutputMode;
+use ignis_core::memory::FactScope;
 use ignis_runtime::Usage;
+use ignis_storage::TaskRecord;
 
 use super::Session;
 use super::kernel::{KERNELS, NATIVE_KERNEL, kernel_note};
+use super::{memory, skills, task};
+use crate::render::short_id;
 
 /// 一条斜杠命令的行为（[`parse`] 查表命中后交给 [`dispatch`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,11 +32,11 @@ pub enum Slash {
     Model,
     /// `/status`：内核 / 模型 / 工作区 / 未读告警 / 最近一轮用量。
     Status,
-    /// `/tasks [N]`：最近任务表（Task 6 接上）。
+    /// `/tasks [N]`：最近任务表（默认 10 条 + `ignis task show` 提示）。
     Tasks,
-    /// `/skills`：技能目录（Task 6 接上）。
+    /// `/skills`：技能目录（与 `ignis skills list` 同一份渲染）。
     Skills,
-    /// `/memory …`：长期记忆（Task 6 接上）。
+    /// `/memory …`：长期记忆（list/search/add/edit/delete，复用 `ignis memory …` 的口径）。
     Memory,
     /// `/details [minimal|normal|debug]`：显示或切换输出模式。
     Details,
@@ -79,6 +83,18 @@ const KERNEL_USAGE: &str = "kernel: usage: /kernel [native|codex|claude]";
 const MODEL_USAGE: &str = "model: usage: /model [name]";
 /// 会话级模型覆盖的持久化提示（`/model` 有无参两条路径共用同一份文案）。
 const MODEL_NOTE: &str = "note: session override; persist with `ignis config set model.model`";
+/// `/memory` 的形状不对时的用法行（未知子命令与 `list` 的非法旗标共用）。
+const MEMORY_USAGE: &str = "usage: /memory <list|search|add|edit|delete>";
+/// `/memory add` 缺参（`<scope> <key> <text>` 任一为空）时的用法行。
+const MEMORY_ADD_USAGE: &str = "usage: /memory add <user|project|global> <key> <text>";
+/// `/memory edit` 缺参（没有 `<text>`）时的用法行。
+const MEMORY_EDIT_USAGE: &str = "usage: /memory edit <id> <text>";
+/// `/memory delete` 缺参（没有 `<id>`）时的用法行。
+const MEMORY_DELETE_USAGE: &str = "usage: /memory delete <id>";
+/// `/tasks` 的条数不是正整数时的错误（`0`/负数/非数字/多余词同一条）。
+const TASKS_LIMIT_ERROR: &str = "tasks: limit must be a positive number";
+/// `/tasks` 无参时的条数（与帮助里的 `(default 10)` 同一口径）。
+const TASKS_DEFAULT_LIMIT: usize = 10;
 
 /// 帮助分组（顺序即 [`help_lines`] 的输出顺序）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,7 +401,7 @@ pub fn complete(buffer: &str) -> Completion {
     }
     match spec_by_name(first) {
         Some(spec) if spec.command == Slash::Kernel => complete_kernel_value(spec.name, argument),
-        // 已知命令但参数面还没有候选（`/memory` 的子命令补全随 Task 6），未知命令更没有
+        // 已知命令但参数面还没有候选（`/memory` 的子命令补全留待后续阶段），未知命令更没有
         _ => Completion::None,
     }
 }
@@ -437,6 +453,95 @@ fn complete_kernel_value(name: &str, prefix: &str) -> Completion {
                 .collect(),
         ),
     }
+}
+
+/// 渲染助手给的是「带尾换行的整段文本」：REPL 要的是逐行（`lines` 不吐尾换行后面那个空行）。
+fn lines_of(text: &str) -> Vec<String> {
+    text.lines().map(str::to_string).collect()
+}
+
+/// 既有助手的结果 → REPL 的输出行：`anyhow` 的人话错误取顶层文本（REPL 打 `error: {…}`），
+/// 整段文本落成逐行。
+fn helper_lines(out: anyhow::Result<String>) -> Result<Vec<String>, String> {
+    out.map(|text| lines_of(&text))
+        .map_err(|error| error.to_string())
+}
+
+/// `/memory …` 的输出行：参数在这里解析，数据面全部落回 `commands::memory` 的既有助手
+/// （五条子命令的回执与报错文案只有那一份）。
+///
+/// 无参等价于 `list`；`search`/`add`/`edit` 的多词参数用一个空格拼回（解析层已按空白切分）；
+/// `add` 的 `project` 绑定**当前会话工作区**——REPL 里没有 `--workspace`/配置可解析，会话的
+/// 工作区就是用户此刻所在的那一份（`Session::new` 已经校验过它是目录）。
+fn memory_lines(session: &Session, args: &[String]) -> Result<Vec<String>, String> {
+    let home = session.home();
+    let Some((sub, rest)) = args.split_first() else {
+        // 无参 = `list`（只看 active）
+        return helper_lines(memory::list_at(home, false));
+    };
+    match sub.as_str() {
+        // `--all` 是 `list` 唯一的可选旗标：别的取值按形状不对处理（与未知子命令同一句用法行）
+        "list" => match rest {
+            [] => helper_lines(memory::list_at(home, false)),
+            [all] if all == "--all" => helper_lines(memory::list_at(home, true)),
+            _ => Err(MEMORY_USAGE.to_string()),
+        },
+        // 检索词为空时由助手报「检索词不能为空」（不在 REPL 侧另写一份）
+        "search" => helper_lines(memory::search_at(home, &rest.join(" "))),
+        "add" => match rest {
+            [scope, key, text @ ..] if !text.is_empty() => {
+                let scope = memory::parse_scope(scope).map_err(|error| error.to_string())?;
+                let workspace = match scope {
+                    FactScope::Project => Some(session.workspace()),
+                    FactScope::User | FactScope::Global => None,
+                };
+                helper_lines(memory::add_at(home, scope, workspace, key, &text.join(" ")))
+            }
+            _ => Err(MEMORY_ADD_USAGE.to_string()),
+        },
+        "edit" => match rest {
+            [id, text @ ..] if !text.is_empty() => {
+                let id = memory::parse_id(id).map_err(|error| error.to_string())?;
+                helper_lines(memory::edit_at(home, id, &text.join(" ")))
+            }
+            _ => Err(MEMORY_EDIT_USAGE.to_string()),
+        },
+        "delete" => match rest {
+            [id] => {
+                let id = memory::parse_id(id).map_err(|error| error.to_string())?;
+                helper_lines(memory::delete_at(home, id))
+            }
+            // 少一个 id 或多一个词都是同一条用法行（`delete` 只收一个位置）
+            _ => Err(MEMORY_DELETE_USAGE.to_string()),
+        },
+        _ => Err(MEMORY_USAGE.to_string()),
+    }
+}
+
+/// `/tasks [N]` 的条数：无参给默认值，有参必须是正整数（`0`/负数/非数字/多余词同一条错误）。
+fn tasks_limit(args: &[String]) -> Result<usize, String> {
+    match args {
+        [] => Ok(TASKS_DEFAULT_LIMIT),
+        [raw] => match raw.parse::<usize>() {
+            Ok(limit) if limit > 0 => Ok(limit),
+            _ => Err(TASKS_LIMIT_ERROR.to_string()),
+        },
+        _ => Err(TASKS_LIMIT_ERROR.to_string()),
+    }
+}
+
+/// `/tasks` 的输出：最近任务表 + 一行 `ignis task show` 提示。
+///
+/// 空表只给一句 `(no tasks)`（空表头与提示对没有任何任务的人没有信息量）；有行时表与
+/// `ignis task list` 逐行同形（同一个 [`task::render_list`]），提示带上**最近一条**的短 id——
+/// 表的第一列就是它，`ignis task show` 接受这种 ≥8 字符的唯一前缀，可以直接复制。
+pub fn tasks_lines(rows: &[TaskRecord]) -> Vec<String> {
+    let Some(latest) = rows.first() else {
+        return vec!["(no tasks)".to_string()];
+    };
+    let mut lines = lines_of(&task::render_list(rows));
+    lines.push(format!("hint: ignis task show {}", short_id(&latest.id)));
+    lines
 }
 
 /// 执行一条本地命令：读会话字段 → 调渲染函数 / 调 setter。
@@ -497,23 +602,37 @@ pub fn dispatch(
             session.unread_alerts(),
             session.last_usage(),
         ))),
-        // Task 6 接上三个复用面命令：命令名已在表里（帮助完整、未知命令口径正确），
-        // 这里先给一句占位错误——静默无输出会让用户以为命令生效了。
-        Slash::Memory => Err("/memory: not implemented yet".to_string()),
-        Slash::Skills => Err("/skills: not implemented yet".to_string()),
-        Slash::Tasks => Err("/tasks: not implemented yet".to_string()),
+        // 三个复用面命令：数据面取会话字段（`/tasks` 的库、`/skills` 的目录）或落回既有命令
+        // 助手（`/memory` 的读写与回执），渲染与文案都不在这里另写一份。
+        Slash::Memory => Ok(Dispatch::Lines(memory_lines(session, args)?)),
+        // 多余参数不解释（与 `/status`、`/help` 同口径）；`reload` 属 P4
+        Slash::Skills => Ok(Dispatch::Lines(lines_of(&skills::render(session.skills())))),
+        Slash::Tasks => {
+            let limit = tasks_limit(args)?;
+            let rows = session
+                .db()
+                .list_tasks(limit)
+                .map_err(|error| error.to_string())?;
+            Ok(Dispatch::Lines(tasks_lines(&rows)))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
+    use std::sync::Arc;
 
     use ignis_core::config::OutputMode;
+    use ignis_core::memory::{FactScope, MemoryStore};
+    use ignis_core::skills::SkillCatalog;
     use ignis_runtime::Usage;
+    use ignis_storage::{Db, NewTask};
 
     use super::*;
     use crate::commands::fixtures::session_fixture;
+    use crate::commands::skills;
 
     /// 分发一条命令并取出它的输出行；退出类命令不该走这里。
     fn dispatch_lines(session: &mut Session, command: Slash, args: &[String]) -> Vec<String> {
@@ -529,6 +648,37 @@ mod tests {
             Completion::Listing(lines) => lines,
             other => panic!("{buffer:?} 应该有候选：{other:?}"),
         }
+    }
+
+    /// 一条命令行 → [`dispatch`] 的实参（`parse` 做的也是按空白切分）。
+    fn args(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| word.to_string()).collect()
+    }
+
+    /// 一行拆成单元格：表格用两个空格分隔，列宽不足处补空格（列宽由最宽单元格决定）。
+    fn cells(line: &str) -> Vec<&str> {
+        line.split("  ")
+            .map(str::trim)
+            .filter(|cell| !cell.is_empty())
+            .collect()
+    }
+
+    /// `2026-10-15T12:00:00Z` 的 epoch 毫秒（与 `task`/`memory` 侧测试同源）。
+    const STARTED_AT: i64 = 1_792_065_600_000;
+
+    /// 往临时 home 的库里插一条任务（`/tasks` 读的就是这份库）。
+    fn insert_task(home: &Path, id: &str, started_at: i64) {
+        Db::open(&home.join("ignis.db"))
+            .unwrap()
+            .insert_task(&NewTask {
+                id: id.to_string(),
+                kind: "run".into(),
+                prompt: "修复配置路径".into(),
+                kernel: "native".into(),
+                workspace: "/tmp/project".into(),
+                started_at,
+            })
+            .unwrap();
     }
 
     /// 解析表：空行、认识命令、未知命令与任务各一条路。
@@ -976,20 +1126,378 @@ mod tests {
         assert_eq!(session.output_mode(), OutputMode::Normal);
     }
 
-    /// Task 6 才接上的三个复用面命令：命令名已在表里（帮助完整），分发先给一句占位错误。
-    /// Task 6 落地时把这条用例换成真断言。
+    /// `/memory` 无参 = `list`：与 `ignis memory list` 同一张表（同一个 `render_facts`）。
     #[test]
-    fn dispatch_later_phase_commands_report_not_implemented() {
-        let (_dir, mut session) = session_fixture("slash-placeholder", "native");
+    fn memory_list_shows_the_active_facts_table() {
+        let (_dir, mut session) = session_fixture("slash-memory-list", "native");
 
-        for (command, name) in [
-            (Slash::Memory, "/memory"),
-            (Slash::Skills, "/skills"),
-            (Slash::Tasks, "/tasks"),
-        ] {
-            let error = dispatch(&mut session, command, &[]).unwrap_err();
-            assert_eq!(error, format!("{name}: not implemented yet"), "{command:?}");
+        // 空库：只剩表头（列名逐字）
+        assert_eq!(
+            dispatch_lines(&mut session, Slash::Memory, &[]),
+            ["ID  SCOPE  KEY  TEXT  UPDATED"]
+        );
+
+        // 写入一条：无参与 `list` 是同一条路（表头 + 一行一条 active 事实）
+        let added = dispatch_lines(
+            &mut session,
+            Slash::Memory,
+            &args(&["add", "user", "pkg_manager", "使用 uv 管理依赖"]),
+        );
+        assert_eq!(added, ["已记住（user/pkg_manager）：使用 uv 管理依赖"]);
+
+        for command in [args(&[]), args(&["list"])] {
+            let lines = dispatch_lines(&mut session, Slash::Memory, &command);
+            assert_eq!(lines.len(), 2, "{command:?}: {lines:?}");
+            assert_eq!(
+                cells(&lines[0]),
+                ["ID", "SCOPE", "KEY", "TEXT", "UPDATED"],
+                "{command:?}: {lines:?}"
+            );
+            let row = cells(&lines[1]);
+            assert_eq!(row[0], "1", "{command:?}: {lines:?}");
+            assert_eq!(row[1], "user", "{command:?}: {lines:?}");
+            assert_eq!(row[2], "pkg_manager", "{command:?}: {lines:?}");
+            assert_eq!(row[3], "使用 uv 管理依赖", "{command:?}: {lines:?}");
+            // UPDATED 是当前时间：只钉形状（`YYYY-MM-DDTHH:MM:SSZ`）
+            assert_eq!(row[4].len(), 20, "{command:?}: {lines:?}");
+            assert!(row[4].ends_with('Z'), "{command:?}: {lines:?}");
         }
+    }
+
+    /// `/memory add|search|edit|delete` 全部走既有助手：回执、检索、改写与删除落在同一个库上。
+    #[test]
+    fn memory_add_search_edit_delete_go_through_the_store() {
+        let (dir, mut session) = session_fixture("slash-memory-crud", "native");
+
+        // add：多词文本用一个空格拼回，回执逐字复用 `memory add`
+        let added = dispatch_lines(
+            &mut session,
+            Slash::Memory,
+            &args(&["add", "user", "pkg_manager", "使用", "uv", "管理依赖"]),
+        );
+        assert_eq!(added, ["已记住（user/pkg_manager）：使用 uv 管理依赖"]);
+
+        // search：命中（表头 + 一行）；多个检索词也用一个空格拼回
+        for words in [&["search", "uv"][..], &["search", "使用", "uv"][..]] {
+            let hit = dispatch_lines(&mut session, Slash::Memory, &args(words));
+            assert_eq!(hit.len(), 2, "{words:?}: {hit:?}");
+            assert!(hit[1].contains("使用 uv 管理依赖"), "{words:?}: {hit:?}");
+        }
+        // 没有命中：只剩表头（与 `ignis memory search` 一致）
+        assert_eq!(
+            dispatch_lines(&mut session, Slash::Memory, &args(&["search", "poetry"])).len(),
+            1
+        );
+
+        // edit：id 就是列表的第一列，文本多词拼回
+        let store = MemoryStore::new(
+            Arc::new(Db::open(&dir.path().join("ignis.db")).unwrap()),
+            dir.path().join("memory"),
+        );
+        let id = store.list(false).unwrap()[0].id.to_string();
+        let edited = dispatch_lines(
+            &mut session,
+            Slash::Memory,
+            &args(&["edit", id.as_str(), "改用", "pip"]),
+        );
+        assert_eq!(edited, [format!("已改写（id={id}）：改用 pip")]);
+        let listed = dispatch_lines(&mut session, Slash::Memory, &args(&["list"]));
+        assert!(listed[1].contains("改用 pip"), "{listed:?}");
+        assert!(
+            !listed.iter().any(|line| line.contains("使用 uv")),
+            "{listed:?}"
+        );
+
+        // delete：回执 + 列表回到只剩表头
+        let deleted = dispatch_lines(&mut session, Slash::Memory, &args(&["delete", id.as_str()]));
+        assert_eq!(deleted, [format!("已删除（id={id}）")]);
+        assert_eq!(
+            dispatch_lines(&mut session, Slash::Memory, &args(&["list"])),
+            ["ID  SCOPE  KEY  TEXT  UPDATED"]
+        );
+
+        // 不存在的 id：既有助手的报错原样交回（REPL 打 `error: memory not found: {id}`）
+        for words in [
+            args(&["delete", id.as_str()]),
+            args(&["edit", id.as_str(), "新文本"]),
+        ] {
+            let error = dispatch(&mut session, Slash::Memory, &words).unwrap_err();
+            assert_eq!(error, format!("memory not found: {id}"), "{words:?}");
+        }
+    }
+
+    /// `/memory add project` 绑定**当前会话工作区**：REPL 里没有 `--workspace` 可解析。
+    #[test]
+    fn memory_project_scope_binds_the_session_workspace() {
+        let (dir, mut session) = session_fixture("slash-memory-project", "native");
+
+        let added = dispatch_lines(
+            &mut session,
+            Slash::Memory,
+            &args(&["add", "project", "env", "使用 uv"]),
+        );
+        assert_eq!(added, ["已记住（project/env）：使用 uv"]);
+
+        // 事实落在会话工作区上（消息回执、列表的 SCOPE 列与库里同一行）
+        let store = MemoryStore::new(
+            Arc::new(Db::open(&dir.path().join("ignis.db")).unwrap()),
+            dir.path().join("memory"),
+        );
+        let stored = store
+            .recall_by_key(FactScope::Project, Some(session.workspace()), "env")
+            .unwrap()
+            .expect("project 事实应绑在会话工作区上");
+        assert_eq!(stored.workspace.as_deref(), session.workspace().to_str());
+        // 换一个工作区就查不到：不是「任何目录都命中」的宽绑定
+        assert!(
+            store
+                .recall_by_key(FactScope::Project, Some(Path::new("/tmp/other")), "env")
+                .unwrap()
+                .is_none(),
+            "project 事实不应绑在别的工作区上"
+        );
+
+        let listed = dispatch_lines(&mut session, Slash::Memory, &args(&["list"]));
+        assert_eq!(cells(&listed[1])[1], "project", "{listed:?}");
+    }
+
+    /// `/memory` 的参数用法与复用来的报错逐字钉住（五条 usage 只写在这一处）。
+    #[test]
+    fn memory_usage_errors_are_pinned() {
+        let (_dir, mut session) = session_fixture("slash-memory-usage", "native");
+
+        // 未知子命令：一句总用法行（`list` 只认 `--all`，别的旗标同一条）
+        for words in [args(&["nope"]), args(&["list", "--bogus"])] {
+            let error = dispatch(&mut session, Slash::Memory, &words).unwrap_err();
+            assert_eq!(
+                error, "usage: /memory <list|search|add|edit|delete>",
+                "{words:?}"
+            );
+        }
+        // 三条缺参的用法行（scope/key/text、id/text、id 任一为空都算缺参）
+        assert_eq!(
+            dispatch(&mut session, Slash::Memory, &args(&["add"])).unwrap_err(),
+            "usage: /memory add <user|project|global> <key> <text>"
+        );
+        assert_eq!(
+            dispatch(&mut session, Slash::Memory, &args(&["add", "user", "key"])).unwrap_err(),
+            "usage: /memory add <user|project|global> <key> <text>"
+        );
+        assert_eq!(
+            dispatch(&mut session, Slash::Memory, &args(&["edit", "3"])).unwrap_err(),
+            "usage: /memory edit <id> <text>"
+        );
+        assert_eq!(
+            dispatch(&mut session, Slash::Memory, &args(&["delete"])).unwrap_err(),
+            "usage: /memory delete <id>"
+        );
+        assert_eq!(
+            dispatch(
+                &mut session,
+                Slash::Memory,
+                &args(&["delete", "3", "extra"])
+            )
+            .unwrap_err(),
+            "usage: /memory delete <id>"
+        );
+
+        // 用法错误不改库：`list` 仍是空的
+        assert_eq!(
+            dispatch_lines(&mut session, Slash::Memory, &args(&["list"])),
+            ["ID  SCOPE  KEY  TEXT  UPDATED"]
+        );
+
+        // 非法 scope / id / 空检索词沿用既有助手的文案（不另写一份）
+        assert_eq!(
+            dispatch(
+                &mut session,
+                Slash::Memory,
+                &args(&["add", "Project", "k", "t"])
+            )
+            .unwrap_err(),
+            "--scope 只能是 user、project 或 global，收到「Project」"
+        );
+        assert_eq!(
+            dispatch(&mut session, Slash::Memory, &args(&["edit", "abc", "t"])).unwrap_err(),
+            "memory id 必须是数字：abc"
+        );
+        assert_eq!(
+            dispatch(&mut session, Slash::Memory, &args(&["search"])).unwrap_err(),
+            "检索词不能为空"
+        );
+    }
+
+    /// `/memory list` 默认只看 active，`--all` 才把被取代的历史行带出来。
+    #[test]
+    fn memory_list_all_includes_superseded() {
+        let (_dir, mut session) = session_fixture("slash-memory-all", "native");
+
+        // 同一个 (scope, workspace, key) 写两次：旧值被取代
+        dispatch_lines(
+            &mut session,
+            Slash::Memory,
+            &args(&["add", "user", "pkg_manager", "使用 uv"]),
+        );
+        let added = dispatch_lines(
+            &mut session,
+            Slash::Memory,
+            &args(&["add", "user", "pkg_manager", "改用 pip"]),
+        );
+        assert_eq!(
+            added,
+            ["已记住（user/pkg_manager）：改用 pip（旧值已失效）"]
+        );
+
+        // 默认（与无参同路）：只剩新值
+        for command in [args(&["list"]), args(&[])] {
+            let active = dispatch_lines(&mut session, Slash::Memory, &command);
+            assert_eq!(active.len(), 2, "{command:?}: {active:?}");
+            assert!(active[1].contains("改用 pip"), "{command:?}: {active:?}");
+        }
+        // `--all`：历史行也出来（表头 + 两行）
+        let all = dispatch_lines(&mut session, Slash::Memory, &args(&["list", "--all"]));
+        assert_eq!(all.len(), 3, "{all:?}");
+        assert!(all.iter().any(|line| line.contains("使用 uv")), "{all:?}");
+    }
+
+    /// `/skills` 与 `ignis skills list` 逐行相等：同一个 `render`，读的也是同一个目录。
+    #[test]
+    fn skills_lines_match_the_cli_render() {
+        let (dir, mut session) = session_fixture("slash-skills", "native");
+        let skills_dir = dir.path().join("skills");
+
+        // 一个用户技能 + 一个坏技能（后者按既有口径产生 `!` 警告行）
+        fs::create_dir_all(skills_dir.join("zzz")).unwrap();
+        fs::write(
+            skills_dir.join("zzz").join("SKILL.md"),
+            "---\nname: zzz-skill\ndescription: Sorts last.\n---\n# 正文\n",
+        )
+        .unwrap();
+        fs::create_dir_all(skills_dir.join("broken")).unwrap();
+        fs::write(
+            skills_dir.join("broken").join("SKILL.md"),
+            "# 没有 frontmatter\n只有正文\n",
+        )
+        .unwrap();
+
+        // 会话里的是构造时的快照（reload 属 P4）：按 `skills::run` 的同一加载路径取一份目录，
+        // 先渲染出 CLI 那边的逐行输出，再把它交给会话——断言的是「同一目录 → 同一逐行输出」。
+        let catalog = SkillCatalog::load(&skills_dir);
+        let expected: Vec<String> = skills::render(&catalog)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let table_rows = catalog.metas().len() + 1;
+        let warnings = catalog.warnings().len();
+        session.skills = catalog;
+
+        let lines = dispatch_lines(&mut session, Slash::Skills, &[]);
+        assert_eq!(lines, expected, "与 `ignis skills list` 不同");
+        // 形状：表头 + 每个技能一行 + `! {warning}` 行（不是「空的成功」）
+        assert_eq!(lines.len(), table_rows + warnings, "{lines:?}");
+        assert_eq!(cells(&lines[0]), ["NAME", "SOURCE", "DESCRIPTION"]);
+        assert!(
+            lines.iter().any(|line| line.starts_with("zzz-skill")),
+            "{lines:?}"
+        );
+        assert!(
+            lines[table_rows..]
+                .iter()
+                .all(|line| line.starts_with("! ")),
+            "警告只能跟在表后：{lines:?}"
+        );
+    }
+
+    /// `/tasks` 的表与 `ignis task list` 逐行同形，后面跟一行 `ignis task show` 提示。
+    #[test]
+    fn tasks_lines_are_the_table_plus_hint() {
+        let (dir, mut session) = session_fixture("slash-tasks", "native");
+
+        // 空库：一句 `(no tasks)`（空表头与提示对没有任务的人没有信息量）
+        assert_eq!(
+            dispatch_lines(&mut session, Slash::Tasks, &[]),
+            ["(no tasks)"]
+        );
+
+        insert_task(
+            dir.path(),
+            "019a1b2c-1111-7f00-8000-000000000001",
+            STARTED_AT,
+        );
+        insert_task(
+            dir.path(),
+            "019a1b2c-2222-7f00-8000-000000000002",
+            STARTED_AT + 1_000,
+        );
+
+        let lines = dispatch_lines(&mut session, Slash::Tasks, &[]);
+        // 表头 + 两条 + 提示；最近的在前（与 `task list` 同一排序）
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(
+            cells(&lines[0]),
+            ["ID", "STATUS", "KIND", "STARTED", "PROMPT"]
+        );
+        assert!(lines[1].starts_with("019a1b2c-2222"), "{lines:?}");
+        assert!(lines[2].starts_with("019a1b2c-1111"), "{lines:?}");
+        assert!(lines[1].contains("修复配置路径"), "{lines:?}");
+        assert!(
+            lines[1].contains("success") || lines[1].contains("running"),
+            "{lines:?}"
+        );
+        // 提示带最近一条的短 id（表的第一列，`task show` 接受这种唯一前缀）
+        assert_eq!(lines[3], "hint: ignis task show 019a1b2c-2222");
+
+        // 有参：条数照给出（表头 + 一行 + 提示）
+        assert_eq!(
+            dispatch_lines(&mut session, Slash::Tasks, &args(&["1"])).len(),
+            3
+        );
+
+        // 非正整数：`abc`/`0`/负数/多余词都是同一条错误（也不读库）
+        for words in [
+            args(&["abc"]),
+            args(&["0"]),
+            args(&["-1"]),
+            args(&["5", "6"]),
+        ] {
+            let error = dispatch(&mut session, Slash::Tasks, &words).unwrap_err();
+            assert_eq!(error, "tasks: limit must be a positive number", "{words:?}");
+        }
+    }
+
+    /// `/tasks` 无参给 10 条（与 `/help` 的 `(default 10)` 同一口径）。
+    #[test]
+    fn tasks_default_limit_is_ten() {
+        let (dir, mut session) = session_fixture("slash-tasks-limit", "native");
+        // 12 条任务：越后越新（`short_id` 的前 13 字符各不相同，方便认出哪 10 条进了表）
+        let ids: Vec<String> = (0..12)
+            .map(|index| format!("019a1b2c-{index:04x}-7f00-8000-000000000000"))
+            .collect();
+        for (index, id) in ids.iter().enumerate() {
+            insert_task(dir.path(), id, STARTED_AT + index as i64 * 1_000);
+        }
+
+        let lines = dispatch_lines(&mut session, Slash::Tasks, &[]);
+        // 表头 + 默认 10 行 + 提示
+        assert_eq!(lines.len(), 12, "{lines:?}");
+        assert!(lines[1].starts_with(&ids[11][..13]), "{lines:?}");
+        assert!(lines[10].starts_with(&ids[2][..13]), "{lines:?}");
+        for oldest in [&ids[0], &ids[1]] {
+            assert!(
+                !lines.iter().any(|line| line.starts_with(&oldest[..13])),
+                "第 11、12 新的两条不该出现：{lines:?}"
+            );
+        }
+        assert_eq!(
+            lines[11],
+            format!("hint: ignis task show {}", &ids[11][..13])
+        );
+
+        // 显式给 N 时不替用户砍：`/tasks 12` 出 12 行数据
+        assert_eq!(
+            dispatch_lines(&mut session, Slash::Tasks, &args(&["12"])).len(),
+            14
+        );
     }
 
     /// `/kernel` 的两行输出：当前内核名 + 非 native 的那行能力提示（从 `repl` 原样搬来）。

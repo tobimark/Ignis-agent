@@ -151,7 +151,7 @@ fn render_task(
 }
 
 /// 最近任务表：id 短 id（13 字符）、status、kind、started、prompt 前 40 字符。
-fn render_list(tasks: &[TaskRecord]) -> String {
+pub(crate) fn render_list(tasks: &[TaskRecord]) -> String {
     let mut rows = vec![vec![
         "ID".to_string(),
         "STATUS".to_string(),

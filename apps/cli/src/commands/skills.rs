@@ -22,7 +22,7 @@ pub fn run(command: &SkillsCommand) -> Result<ExitCode> {
 }
 
 /// 技能表：每行 `{name}  {source}  {description}`；加载警告按 `! {msg}` 跟在表后。
-fn render(catalog: &SkillCatalog) -> String {
+pub(crate) fn render(catalog: &SkillCatalog) -> String {
     let mut rows = vec![vec![
         "NAME".to_string(),
         "SOURCE".to_string(),

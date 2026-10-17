@@ -263,6 +263,16 @@ impl Session {
         &self.home
     }
 
+    /// 任务库：REPL 的 `/tasks`（与 banner 的未读告警计数）共用会话这一份连接，不重新开库。
+    pub(crate) fn db(&self) -> &Db {
+        &self.db
+    }
+
+    /// 技能目录：REPL 的 `/skills` 复用会话构造时的那一份（不重新扫描；reload 属 P4）。
+    pub(crate) fn skills(&self) -> &SkillCatalog {
+        &self.skills
+    }
+
     /// 本轮任务的生效配置：native 且有会话级模型覆盖时克隆一份并换掉 `model.model`（覆盖不写回
     /// 配置文件，也不影响别家内核）；其余情形与 `self.config` 是同一个 `Arc`，不为每轮白克隆。
     fn effective_config(&self) -> Arc<Config> {

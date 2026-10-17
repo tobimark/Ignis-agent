@@ -54,7 +54,7 @@ fn store_at(home: &Path) -> Result<Arc<MemoryStore>> {
 }
 
 /// 列出事实（新近在前）；`all = false` 只看 `active`。
-fn list_at(home: &Path, all: bool) -> Result<String> {
+pub(crate) fn list_at(home: &Path, all: bool) -> Result<String> {
     Ok(render_facts(&store_at(home)?.list(all)?))
 }
 
@@ -62,7 +62,7 @@ fn list_at(home: &Path, all: bool) -> Result<String> {
 ///
 /// 空白检索词在碰库之前报错：空串会落进 storage 的 `LIKE` 分支（`LIKE '%%'`）并匹配**全部**
 /// active 行，看起来像一次「什么都没输入」的全量转储。首尾空白按记忆写入路径的一贯口径裁掉。
-fn search_at(home: &Path, query: &str) -> Result<String> {
+pub(crate) fn search_at(home: &Path, query: &str) -> Result<String> {
     let query = query.trim();
     if query.is_empty() {
         bail!("检索词不能为空");
@@ -83,7 +83,7 @@ fn project_workspace(cli: &Cli, home: &Path) -> Result<PathBuf> {
 /// 回执也走元工具那份 [`remembered_notice`]（core 里的唯一实现，两边逐字节一致）：用的是**入库后**
 /// 的 key/text（写入路径已归一化单行并截断），命令行里带换行的原文不会撑成多行回执；
 /// `project` 的工作区由调用方解析后传入。
-fn add_at(
+pub(crate) fn add_at(
     home: &Path,
     scope: FactScope,
     workspace: Option<&Path>,
@@ -103,13 +103,13 @@ fn add_at(
 }
 
 /// 改写一条事实的文本（镜像随之刷新）；id 不存在时上抛 `memory not found: {id}`。
-fn edit_at(home: &Path, id: i64, text: &str) -> Result<String> {
+pub(crate) fn edit_at(home: &Path, id: i64, text: &str) -> Result<String> {
     let record = store_at(home)?.edit(id, text)?;
     Ok(format!("已改写（id={}）：{}\n", record.id, record.text))
 }
 
 /// 删除一条事实（镜像随之刷新）；id 不存在时上抛 `memory not found: {id}`。
-fn delete_at(home: &Path, id: i64) -> Result<String> {
+pub(crate) fn delete_at(home: &Path, id: i64) -> Result<String> {
     store_at(home)?.delete(id)?;
     Ok(format!("已删除（id={id}）\n"))
 }
@@ -136,7 +136,7 @@ fn render_facts(facts: &[FactRecord]) -> String {
 }
 
 /// 事实 id：`memory list` 的第一列。非数字直接报错（`error: …` 退出 1，不走 clap 的用法错误）。
-fn parse_id(raw: &str) -> Result<i64> {
+pub(crate) fn parse_id(raw: &str) -> Result<i64> {
     let Ok(id) = raw.parse::<i64>() else {
         bail!("memory id 必须是数字：{raw}");
     };
@@ -144,7 +144,7 @@ fn parse_id(raw: &str) -> Result<i64> {
 }
 
 /// `--scope` 的字面量：与 `facts.scope` 的取值一一对应。
-fn parse_scope(raw: &str) -> Result<FactScope> {
+pub(crate) fn parse_scope(raw: &str) -> Result<FactScope> {
     match raw {
         "user" => Ok(FactScope::User),
         "project" => Ok(FactScope::Project),
