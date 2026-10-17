@@ -15,6 +15,10 @@ use ignis_runtime::{RunStatus, RuntimeEvent, Usage};
 // 私有/`pub(crate)` 会让 `dead_code` 在门禁（`-D warnings`）下报错。
 pub mod width;
 
+// Markdown 子集与流式装配（Task 8 的渲染器消费，本任务先落地装配器）。同样一律 `pub`：
+// 消费方还没接上，收紧成私有/`pub(crate)` 会让 `dead_code` 在门禁（`-D warnings`）下报错。
+pub mod markdown;
+
 /// ANSI：暗色（工具执行行）。
 const DIM: &str = "\x1b[2m";
 /// ANSI：红色（工具失败行）。
