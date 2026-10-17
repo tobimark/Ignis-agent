@@ -11,6 +11,10 @@ use std::time::Duration;
 
 use ignis_runtime::{RunStatus, RuntimeEvent, Usage};
 
+// 宽度/折行模块（Task 6/8 消费）。声明与入口一律 `pub`：此刻它只被自身测试引用，收紧成
+// 私有/`pub(crate)` 会让 `dead_code` 在门禁（`-D warnings`）下报错。
+pub mod width;
+
 /// ANSI：暗色（工具执行行）。
 const DIM: &str = "\x1b[2m";
 /// ANSI：红色（工具失败行）。
