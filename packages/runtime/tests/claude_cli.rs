@@ -207,10 +207,13 @@ async fn spawns_claude_print_with_pinned_flags_and_rendered_prompt() {
             "你是 Ignis 的助手\n\n---\nUser: 说一句 ok\n".to_string(),
         )
     );
-    // 只映射文本与终局：`thinking` 块、`system` 前导行、`result.usage` 都不出事件
+    // 映射推理、文本与终局：`thinking` 块出 ReasoningDelta，`system` 前导行、`result.usage` 不出事件
     assert_eq!(
         events,
         vec![
+            RuntimeEvent::ReasoningDelta {
+                text: "确认一下要说什么".into()
+            },
             RuntimeEvent::TextDelta { text: "OK".into() },
             RuntimeEvent::Done {
                 status: RunStatus::Success,
@@ -247,11 +250,12 @@ async fn omits_model_flag_when_no_model_was_configured() {
             "sys\n\n---\nUser: 说一句 ok\n".to_string(),
         )
     );
-    assert_eq!(events.len(), 2, "{events:?}");
+    // 推理 + 文本 + 终局：3 条
+    assert_eq!(events.len(), 3, "{events:?}");
 }
 
-/// `system` 前导行、未知顶层类型、`user`（工具结果回流）行、未知内容块、非 JSON 行一律静默跳过
-/// （容忍 schema 漂移），流照常收束。
+/// `system` 前导行、未知顶层类型、未知内容块、非 JSON 行一律静默跳过（容忍 schema 漂移）；
+/// 已知的 `thinking` 块与 `user` 行的 `tool_result` 照常映射，流照常收束。
 #[tokio::test]
 async fn unknown_lines_are_skipped_silently() {
     let workspace = TempWorkspace::new("noise");
@@ -266,8 +270,17 @@ async fn unknown_lines_are_skipped_silently() {
     assert_eq!(
         events,
         vec![
+            RuntimeEvent::ReasoningDelta {
+                text: "先想一下".into()
+            },
             RuntimeEvent::TextDelta {
                 text: "noise ok".into()
+            },
+            RuntimeEvent::ToolResult {
+                name: "tool_result".into(),
+                ok: true,
+                output: Some("a.txt".into()),
+                call_id: "toolu_1".into(),
             },
             RuntimeEvent::Done {
                 status: RunStatus::Success,
@@ -278,10 +291,11 @@ async fn unknown_lines_are_skipped_silently() {
     );
 }
 
-/// 工具调用只观察：`tool_use` 块映射成一条 `ToolExec`，不发 `ToolResult`
-/// （外部内核的工具执行结果不回流到 Ignis 的执行器）。
+/// 工具调用与结果收口（v0.2）：`thinking` 块 → `ReasoningDelta`、`tool_use` 块 → `ToolExec`
+/// （`call_id` = 块 id）、`user` 行的 `tool_result` → `ToolResult`（`call_id` = `tool_use_id`）
+/// ——同一 call_id 成对且 id 非空。结果只进事件流，不回填执行器。
 #[tokio::test]
-async fn tool_use_maps_to_observation_only_tool_exec() {
+async fn tool_use_and_tool_result_map_to_a_paired_exec_and_result() {
     let workspace = TempWorkspace::new("tool");
     let runtime = ClaudeRuntime::with_command(fake_claude(), workspace.path(), None);
     let events = collect(
@@ -291,39 +305,58 @@ async fn tool_use_maps_to_observation_only_tool_exec() {
     )
     .await;
 
-    let tool_execs: Vec<&RuntimeEvent> = events
-        .iter()
-        .filter(|event| matches!(event, RuntimeEvent::ToolExec { .. }))
-        .collect();
-    assert_eq!(tool_execs.len(), 1, "{events:?}");
-    let RuntimeEvent::ToolExec {
-        name,
-        summary,
-        args,
-        ..
-    } = tool_execs[0]
-    else {
-        unreachable!()
-    };
-    // 名字是内容块类型名（与 codex 的 `command_execution` 同构）；摘要 = 工具名 + 一行参数提示
-    assert_eq!(name, "tool_use");
-    assert_eq!(summary, "Bash ls -la");
-    assert_eq!(args["name"], "Bash");
-    assert_eq!(args["input"]["command"], "ls -la");
-    assert_eq!(args["id"], "call_function_1");
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, RuntimeEvent::ToolResult { .. })),
-        "外部内核不回流工具结果：{events:?}"
-    );
     assert_eq!(
-        events.last(),
-        Some(&RuntimeEvent::Done {
-            status: RunStatus::Success,
-            summary: Some("列完了".into()),
-            error: None,
+        events,
+        vec![
+            RuntimeEvent::ReasoningDelta {
+                text: "先看看目录".into()
+            },
+            RuntimeEvent::ToolExec {
+                name: "tool_use".into(),
+                summary: "Bash ls -la".into(),
+                args: serde_json::json!({"type":"tool_use","id":"call_function_1","name":"Bash","input":{"command":"ls -la","description":"List files"}}),
+                call_id: "call_function_1".into(),
+            },
+            RuntimeEvent::ToolResult {
+                name: "tool_result".into(),
+                ok: true,
+                output: Some("total 4\n-rw-rw-r-- 1 tobi tobi 6 a.txt".into()),
+                call_id: "call_function_1".into(),
+            },
+            RuntimeEvent::TextDelta {
+                text: "列完了".into()
+            },
+            RuntimeEvent::Done {
+                status: RunStatus::Success,
+                summary: Some("列完了".into()),
+                error: None,
+            },
+        ]
+    );
+    // T1 遗留的空串占位在此收口：同 call_id 成对且 id 非空
+    let exec_ids: Vec<&String> = events
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::ToolExec { call_id, .. } => Some(call_id),
+            _ => None,
         })
+        .collect();
+    let result_ids: Vec<&String> = events
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::ToolResult { call_id, .. } => Some(call_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(exec_ids.len(), 1, "{events:?}");
+    assert_eq!(result_ids.len(), 1, "{events:?}");
+    assert_eq!(
+        exec_ids[0], result_ids[0],
+        "ToolExec/ToolResult 必须同 call_id 配对：{events:?}"
+    );
+    assert!(
+        !exec_ids[0].is_empty(),
+        "call_id 不得是空串占位：{events:?}"
     );
 }
 
@@ -462,6 +495,9 @@ async fn result_short_circuits_a_cli_that_does_not_exit() {
     assert_eq!(
         events,
         vec![
+            RuntimeEvent::ReasoningDelta {
+                text: "用户只是想聊一句".into()
+            },
             RuntimeEvent::TextDelta {
                 text: "完成了但进程不退出".into()
             },

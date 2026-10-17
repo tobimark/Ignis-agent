@@ -6,15 +6,17 @@
 //!
 //! 与 native 的差别在能力声明：外部内核自带工具循环，Ignis 不注入工具（`tools: false`）、
 //! 不经手审批（`approvals: false`）、也不拿它的用量记账（`usage: false`；设计文档 §6.8：
-//! 外部内核降级为时间/步数上限）。因此 `tool_use` 内容块只映射成 `ToolExec`（只观察，不发
-//! `ToolResult`），`result.usage` 不出 `Usage` 事件。
+//! 外部内核降级为时间/步数上限）。事件映射因此只做观察与分道，不改变工具循环：`thinking`
+//! 内容块出 `ReasoningDelta`；`tool_use` 块 → `ToolExec`（`call_id` = 块 `id`）、顶层 `user`
+//! 行里的 `tool_result` 块 → `ToolResult`（`call_id` = `tool_use_id`），同一调用成对；结果不回填
+//! 执行器。`result.usage` 不出 `Usage` 事件。
 //!
 //! 所有异常路径都收束成恰好一条 [`RuntimeEvent::Done`]：非零退出 / 流结束而未见 `result` 终局 →
 //! `Failed` + 人话；取消 → `Aborted`；墙钟到点 → `LimitReached` + `task_timeout`（与 native
 //! 同一枚标记字符串）。`result` 一到手就停止读流——之后只给进程 2s
 //! （[`cli_process::TERMINAL_REAP_GRACE`]）的退出收尾时间，免得「已完成却不退出」被拖成超时、
-//! 真实失败原因被丢掉。未知行静默跳过（`system` 前导行、`user` 工具结果回流行、非 JSON 行都不
-//! 映射），容忍 CLI 的 schema 漂移。
+//! 真实失败原因被丢掉。未知行静默跳过（`system` 前导行、未知顶层类型、非 JSON 行都不映射），
+//! 容忍 CLI 的 schema 漂移。
 //!
 //! 与 codex 逐字相同的进程/事件基础设施在 [`cli_process`] 里（含 stderr 收尾的上限，评审 #1）。
 
@@ -47,6 +49,9 @@ const ERR_TEXT_CHARS: usize = 200;
 const TOOL_ARG_CHARS: usize = 80;
 /// `tool_use` 块映射成 `ToolExec` 时的名字（内容块类型名，与 codex 的 `command_execution` 同构）。
 const TOOL_USE_ITEM: &str = "tool_use";
+/// `user` 行里 `tool_result` 块映射成 `ToolResult` 时的名字（内容块类型名；与 `ToolExec` 侧
+/// 的来源块名相对应，渲染层配对计时仍以 `call_id` 为准）。
+const TOOL_RESULT_ITEM: &str = "tool_result";
 /// `result.is_error == true` 但没带 `result` 文本时的兜底人话（终局确实到了，不能退回
 /// 「未见终局」的文案）。
 const ERR_RESULT_FAILED_NO_REASON: &str = "claude 报告失败（未提供原因）";
@@ -223,15 +228,44 @@ async fn drive(
                                 return None;
                             }
                         }
-                        ClaudeEvent::ToolUse { summary, args } => {
+                        ClaudeEvent::Reasoning { text } => {
+                            if !emit(tx, RuntimeEvent::ReasoningDelta { text }).await {
+                                terminate(&mut child, pid).await;
+                                return None;
+                            }
+                        }
+                        ClaudeEvent::ToolUse {
+                            summary,
+                            args,
+                            call_id,
+                        } => {
                             if !emit(
                                 tx,
                                 RuntimeEvent::ToolExec {
                                     name: TOOL_USE_ITEM.into(),
                                     summary,
                                     args,
-                                    // Task 3 改填真实 tool id；本任务先占位空串（旧日志兼容语义）
-                                    call_id: String::new(),
+                                    call_id,
+                                },
+                            )
+                            .await
+                            {
+                                terminate(&mut child, pid).await;
+                                return None;
+                            }
+                        }
+                        ClaudeEvent::ToolResult {
+                            call_id,
+                            ok,
+                            output,
+                        } => {
+                            if !emit(
+                                tx,
+                                RuntimeEvent::ToolResult {
+                                    name: TOOL_RESULT_ITEM.into(),
+                                    ok,
+                                    output,
+                                    call_id,
                                 },
                             )
                             .await
@@ -346,12 +380,24 @@ fn spawn_error_text(program: &Path, err: &std::io::Error) -> String {
 enum ClaudeEvent {
     /// `assistant.message.content[].type == "text"`：助手文本（块里的 `text`）。
     Text { text: String },
-    /// `assistant.message.content[].type == "tool_use"`：工具调用（只观察）。摘要取
-    /// 「工具名 + 一行参数提示」，`args` 留原始块（`name` / `input` / `id` 都在里面，
-    /// 供任务日志还原现场）。
+    /// `assistant.message.content[].type == "thinking"`：推理文本（块里的 `thinking`），
+    /// 走 `ReasoningDelta` 分道。
+    Reasoning { text: String },
+    /// `assistant.message.content[].type == "tool_use"`：工具调用（观察流）。摘要取
+    /// 「工具名 + 一行参数提示」，`args` 留原始块（`name` / `input` 都在里面，供任务日志还原
+    /// 现场），`call_id` 取块 `id`（schema 漂移下缺失为空串，渲染层退化为 FIFO 配对）。
     ToolUse {
         summary: String,
         args: serde_json::Value,
+        call_id: String,
+    },
+    /// `user.message.content[].type == "tool_result"`：工具结果回流（观察流）。`call_id` 取
+    /// `tool_use_id`（缺失为空串）；`ok = !is_error`（`is_error` 缺失按失败的安全默认）；
+    /// `output` 取 `content`（字符串；数组拼接各 `text` 块；其余形状或空为 `None`）。
+    ToolResult {
+        call_id: String,
+        ok: bool,
+        output: Option<String>,
     },
     /// `result`：本轮终局。`is_error` 决定成败（判别终局只看顶层 `type`，不因字段缺失而漏掉
     /// 终局）；`text` 即 `result` 字段——成功时是最终答复，失败时是原因（schema 漂移下可能没有）。
@@ -370,23 +416,26 @@ enum TurnEnd {
     Failed(Option<String>),
 }
 
-/// 按行映射：一行可以带多个事件（`assistant` 的多个内容块），认不出的行返回空表。
+/// 按行映射：一行可以带多个事件（`assistant` 的多个内容块、`user` 的多个结果块），认不出的行
+/// 返回空表。
 ///
-/// 两个映射只按顶层 `type` 判别：`assistant` 取 `message.content` 里的 `text` / `tool_use`
-/// 块；`result` 一律认作终局。静默跳过的四类（容忍 schema 漂移）：`system` 前导行
-/// （`init` / `thinking_tokens` 等）、`user`（工具结果回流）行、未知顶层类型、非 JSON 行；
-/// 已知的 `thinking` 内容块也不映射（对任务日志没有执行语义，T3 之后按需再收）。
+/// 三个映射只按顶层 `type` 判别：`assistant` 取 `message.content` 里的 `thinking` / `text` /
+/// `tool_use` 块；`user` 取 `message.content` 里的 `tool_result` 块（工具结果回流，`call_id`
+/// 与 `tool_use` 侧配对）；`result` 一律认作终局。静默跳过的四类（容忍 schema 漂移）：`system`
+/// 前导行（`init` / `thinking_tokens` 等）、未知顶层类型、未知内容块、非 JSON 行。
 fn parse_line(line: &str) -> Vec<ClaudeEvent> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
         return Vec::new();
     };
     match value.get("type").and_then(|kind| kind.as_str()) {
-        Some("assistant") => value
-            .get("message")
-            .and_then(|message| message.get("content"))
-            .and_then(|content| content.as_array())
-            .map(|blocks| blocks.iter().filter_map(parse_block).collect())
-            .unwrap_or_default(),
+        Some("assistant") => content_blocks(&value)
+            .iter()
+            .filter_map(parse_block)
+            .collect(),
+        Some("user") => content_blocks(&value)
+            .iter()
+            .filter_map(parse_tool_result)
+            .collect(),
         Some("result") => vec![ClaudeEvent::Result {
             // 缺失 `is_error` 时按失败收：schema 漂移下宁可误报失败，也不把漂移静默当成功
             is_error: value
@@ -402,21 +451,70 @@ fn parse_line(line: &str) -> Vec<ClaudeEvent> {
     }
 }
 
-/// `message.content` 里的单个块：只认 `text` 与 `tool_use`，其余（`thinking` 等）跳过。
+/// `message.content` 数组；缺失或形状不对时视为空（整行照旧静默跳过）。
+fn content_blocks(value: &serde_json::Value) -> &[serde_json::Value] {
+    value
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+/// `assistant.message.content` 里的单个块：认 `thinking` / `text` / `tool_use`，其余跳过。
 fn parse_block(block: &serde_json::Value) -> Option<ClaudeEvent> {
     match block.get("type")?.as_str()? {
         "text" => Some(ClaudeEvent::Text {
             text: block.get("text")?.as_str()?.to_string(),
+        }),
+        "thinking" => Some(ClaudeEvent::Reasoning {
+            text: block.get("thinking")?.as_str()?.to_string(),
         }),
         "tool_use" => {
             let name = block.get("name")?.as_str()?;
             Some(ClaudeEvent::ToolUse {
                 summary: tool_summary(name, block.get("input")),
                 args: block.clone(),
+                call_id: block
+                    .get("id")
+                    .and_then(|id| id.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
             })
         }
         _ => None,
     }
+}
+
+/// `user.message.content` 里的单个块：只认 `tool_result`，其余跳过。
+fn parse_tool_result(block: &serde_json::Value) -> Option<ClaudeEvent> {
+    if block.get("type")?.as_str()? != TOOL_RESULT_ITEM {
+        return None;
+    }
+    Some(ClaudeEvent::ToolResult {
+        call_id: block
+            .get("tool_use_id")
+            .and_then(|id| id.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        // 与 `result.is_error` 同一安全默认：字段缺失 / 形状不对按失败收，不把漂移静默当成功
+        ok: block.get("is_error").and_then(|flag| flag.as_bool()) == Some(false),
+        output: tool_result_output(block.get("content")),
+    })
+}
+
+/// `tool_result.content` → 输出文本：字符串直接取；数组按序拼接各 `text` 块（非文本块跳过）；
+/// 其余形状或空串为 `None`。
+fn tool_result_output(content: Option<&serde_json::Value>) -> Option<String> {
+    let text = match content? {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+            .collect(),
+        _ => return None,
+    };
+    (!text.is_empty()).then_some(text)
 }
 
 /// `tool_use` 的摘要：工具名 + 一行参数提示；`input` 取不到提示时只剩工具名。
@@ -456,22 +554,68 @@ mod tests {
     /// 逐行映射：探测记录里的已知行各归其位，未知/不映射的行一律空表。
     #[test]
     fn maps_known_lines_and_skips_the_rest() {
-        // 助手文本；同一行的 `thinking` 块被跳过
+        // 同一行的 `thinking` + `text` 块：推理分道 + 正文，按块序展开
         let assistant = parse_line(
             r#"{"type":"assistant","parent_tool_use_id":null,"session_id":"s","message":{"id":"m","type":"message","role":"assistant","content":[{"type":"thinking","thinking":"先想一下"},{"type":"text","text":"OK"}],"model":"MiniMax-M2"}}"#,
         );
-        assert_eq!(assistant, vec![ClaudeEvent::Text { text: "OK".into() }]);
-        // 工具调用块：摘要 = 工具名 + 一行参数提示，args 留原始块
+        assert_eq!(
+            assistant,
+            vec![
+                ClaudeEvent::Reasoning {
+                    text: "先想一下".into()
+                },
+                ClaudeEvent::Text { text: "OK".into() },
+            ]
+        );
+        // 工具调用块：摘要 = 工具名 + 一行参数提示，call_id = 块 id，args 留原始块
         let blocks = parse_line(
             r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"call_function_1","name":"Bash","input":{"command":"ls -la","description":"List files"}}]}}"#,
         );
-        let Some(ClaudeEvent::ToolUse { summary, args }) = blocks.into_iter().next() else {
+        let Some(ClaudeEvent::ToolUse {
+            summary,
+            args,
+            call_id,
+        }) = blocks.into_iter().next()
+        else {
             panic!("tool_use 应映射成 ToolUse");
         };
         assert_eq!(summary, "Bash ls -la");
+        assert_eq!(call_id, "call_function_1");
         assert_eq!(args["name"], "Bash");
         assert_eq!(args["input"]["command"], "ls -la");
         assert_eq!(args["id"], "call_function_1");
+        // 工具结果回流：`is_error:false` → ok，`content` 字符串即输出
+        assert_eq!(
+            parse_line(
+                r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t","type":"tool_result","content":"a.txt","is_error":false}]}}"#
+            ),
+            vec![ClaudeEvent::ToolResult {
+                call_id: "t".into(),
+                ok: true,
+                output: Some("a.txt".into())
+            }]
+        );
+        // `is_error:true` → 失败；缺 `is_error` → 按失败的安全默认；两种情况 output 照留
+        assert_eq!(
+            parse_line(
+                r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t2","type":"tool_result","content":"boom","is_error":true}]}}"#
+            ),
+            vec![ClaudeEvent::ToolResult {
+                call_id: "t2".into(),
+                ok: false,
+                output: Some("boom".into())
+            }]
+        );
+        assert_eq!(
+            parse_line(
+                r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t3","type":"tool_result","content":"missing"}]}}"#
+            ),
+            vec![ClaudeEvent::ToolResult {
+                call_id: "t3".into(),
+                ok: false,
+                output: Some("missing".into())
+            }]
+        );
         // `result` 终局：`is_error` 决定成败，`result` 字段是文本
         assert_eq!(
             parse_line(
@@ -491,7 +635,7 @@ mod tests {
                 text: Some("API Error: Request rejected (429)".into())
             }]
         );
-        // 过程性行：`system/init`、`system/thinking_tokens`、`user`（工具结果回流）、未知顶层类型
+        // 过程性行：`system/init`、`system/thinking_tokens`、未知顶层类型
         assert_eq!(
             parse_line(
                 r#"{"type":"system","subtype":"init","model":"MiniMax-M2","permissionMode":"default","apiKeySource":"ANTHROPIC_API_KEY"}"#
@@ -505,19 +649,19 @@ mod tests {
             Vec::new()
         );
         assert_eq!(
+            parse_line(r#"{"type":"future.event","payload":{"n":1}}"#),
+            Vec::new()
+        );
+        // 未知内容块 / 未知块形状 / 缺字段的思考块 / 非 JSON：跳过而不报错
+        assert_eq!(
             parse_line(
-                r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t","type":"tool_result","content":"a.txt","is_error":false}]}}"#
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"future_block","text":"x"}]}}"#
             ),
             Vec::new()
         );
         assert_eq!(
-            parse_line(r#"{"type":"future.event","payload":{"n":1}}"#),
-            Vec::new()
-        );
-        // 未知内容块 / 未知块形状 / 非 JSON / 缺字段：跳过而不报错
-        assert_eq!(
             parse_line(
-                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"future_block","text":"x"}]}}"#
+                r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":42}]}}"#
             ),
             Vec::new()
         );
@@ -537,22 +681,119 @@ mod tests {
         );
     }
 
-    /// 同一行里的多个可映射块按顺序展开（`thinking` 不占位）。
+    /// 同一行里的多个可映射块按顺序展开（`thinking` / `text` / `tool_use` 都占位）。
     #[test]
     fn expands_multiple_blocks_in_one_line_in_order() {
         assert_eq!(
             parse_line(
-                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"先说一句"},{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"a.txt"}}]}}"#
+                r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"想一下"},{"type":"text","text":"先说一句"},{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"a.txt"}}]}}"#
             ),
             vec![
+                ClaudeEvent::Reasoning {
+                    text: "想一下".into()
+                },
                 ClaudeEvent::Text {
                     text: "先说一句".into()
                 },
                 ClaudeEvent::ToolUse {
                     summary: "Read a.txt".into(),
                     args: serde_json::json!({"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"a.txt"}}),
+                    call_id: "t1".into(),
                 },
             ]
+        );
+    }
+
+    /// 同一行 `user` 里的多个 `tool_result` 块按序展开；非 `tool_result` 块不占位。
+    #[test]
+    fn expands_multiple_tool_results_in_one_user_line_in_order() {
+        assert_eq!(
+            parse_line(
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"a","content":"a","is_error":false},{"type":"text","text":"不是结果"},{"type":"tool_result","tool_use_id":"b","content":"b","is_error":true}]}}"#
+            ),
+            vec![
+                ClaudeEvent::ToolResult {
+                    call_id: "a".into(),
+                    ok: true,
+                    output: Some("a".into()),
+                },
+                ClaudeEvent::ToolResult {
+                    call_id: "b".into(),
+                    ok: false,
+                    output: Some("b".into()),
+                },
+            ]
+        );
+    }
+
+    /// `tool_result` 的输出形状：数组拼接各 `text` 块；空串 / 空数组 / 非字符串形状 / 缺
+    /// `content` 一律 `None`；缺 `tool_use_id` 与 `tool_use` 缺 id 都退化为空串 call_id
+    /// （旧日志兼容语义，渲染层按 FIFO 配对）。
+    #[test]
+    fn tool_result_output_shapes_and_missing_ids_degrade_to_empty() {
+        // 数组：按序拼接各 `text` 块（非 text 块跳过）
+        assert_eq!(
+            parse_line(
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t","content":[{"type":"text","text":"a"},{"type":"image","source":{}},{"type":"text","text":"b"}]}]}}"#
+            ),
+            vec![ClaudeEvent::ToolResult {
+                call_id: "t".into(),
+                ok: false,
+                output: Some("ab".into())
+            }]
+        );
+        // 空串 / 空数组 / 非字符串形状 → None
+        for content in [r#""""#, "[]", "123"] {
+            let line = format!(
+                r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"t","content":{content}}}]}}}}"#
+            );
+            assert_eq!(
+                parse_line(&line),
+                vec![ClaudeEvent::ToolResult {
+                    call_id: "t".into(),
+                    ok: false,
+                    output: None
+                }],
+                "content = {content}"
+            );
+        }
+        // 缺 content / 缺 tool_use_id：输出 None、call_id 空串
+        assert_eq!(
+            parse_line(
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"x"}]}}"#
+            ),
+            vec![ClaudeEvent::ToolResult {
+                call_id: String::new(),
+                ok: false,
+                output: Some("x".into())
+            }]
+        );
+        assert_eq!(
+            parse_line(
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t"}]}}"#
+            ),
+            vec![ClaudeEvent::ToolResult {
+                call_id: "t".into(),
+                ok: false,
+                output: None
+            }]
+        );
+        // tool_use 缺 id → 空串 call_id；缺 name → 整块跳过
+        assert_eq!(
+            parse_line(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#
+            ),
+            vec![ClaudeEvent::ToolUse {
+                summary: "Bash ls".into(),
+                args: serde_json::json!({"type":"tool_use","name":"Bash","input":{"command":"ls"}}),
+                call_id: String::new()
+            }]
+        );
+        assert_eq!(
+            parse_line(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","input":{}}]}}"#
+            ),
+            Vec::new()
         );
     }
 

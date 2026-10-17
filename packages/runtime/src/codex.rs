@@ -6,8 +6,11 @@
 //!
 //! 与 native 的差别在能力声明：外部内核自带工具循环，Ignis 不注入工具（`tools: false`）、
 //! 不经手审批（`approvals: false`）、也不拿它的用量记账（`usage: false`；设计文档 §6.8：
-//! 外部内核降级为时间/步数上限）。因此命令条目只映射成 `ToolExec`（只观察，不发
-//! `ToolResult`），`turn.completed.usage` 不出 `Usage` 事件。
+//! 外部内核降级为时间/步数上限）。事件映射因此只做观察与分道，不改变工具循环：`reasoning` /
+//! `agent_reasoning` 条目出 `ReasoningDelta`；`command_execution` 按相位收口——`item.started` →
+//! `ToolExec`（`call_id = item.id`）、`item.completed` → `ToolResult`（成败与输出取自完成条目），
+//! `item.updated` 跳过（同一 `call_id` 只出一次 `ToolExec`）；`turn.completed.usage` 不出 `Usage`
+//! 事件。
 //!
 //! 所有异常路径都收束成恰好一条 [`RuntimeEvent::Done`]：非零退出 / 流结束而未见成功终局 →
 //! `Failed` + 人话；取消 → `Aborted`；墙钟到点 → `LimitReached` + `task_timeout`（与 native
@@ -38,7 +41,8 @@ use crate::{BoxStream, Capabilities, Limits, RunRequest, RunStatus, Runtime, Run
 /// 沙箱档位（任务书钉死）：`--help` 的可选值只有 `read-only` / `workspace-write` /
 /// `danger-full-access`，这里取「能干活、又不出工作区」的那档，适配器不自行放宽。
 const SANDBOX_MODE: &str = "workspace-write";
-/// `command_execution` 条目映射成 `ToolExec` 时的名字（探测记录里的条目类型名）。
+/// `command_execution` 条目映射成工具事件时的名字（探测记录里的条目类型名；`ToolExec` 与
+/// `ToolResult` 共用，与 native「同一调用两侧同名」的惯例一致）。
 const COMMAND_ITEM: &str = "command_execution";
 
 /// codex 兼容内核：工作区、可选模型与可执行文件路径随构造固定。
@@ -210,15 +214,44 @@ async fn drive(
                         return None;
                     }
                 }
-                Some(CodexEvent::Command { summary, args }) => {
+                Some(CodexEvent::Reasoning { text }) => {
+                    if !emit(tx, RuntimeEvent::ReasoningDelta { text }).await {
+                        terminate(&mut child, pid).await;
+                        return None;
+                    }
+                }
+                Some(CodexEvent::CommandStarted {
+                    call_id,
+                    summary,
+                    args,
+                }) => {
                     if !emit(
                         tx,
                         RuntimeEvent::ToolExec {
                             name: COMMAND_ITEM.into(),
                             summary,
                             args,
-                            // Task 3 改填真实 tool id；本任务先占位空串（旧日志兼容语义）
-                            call_id: String::new(),
+                            call_id,
+                        },
+                    )
+                    .await
+                    {
+                        terminate(&mut child, pid).await;
+                        return None;
+                    }
+                }
+                Some(CodexEvent::CommandCompleted {
+                    call_id,
+                    ok,
+                    output,
+                }) => {
+                    if !emit(
+                        tx,
+                        RuntimeEvent::ToolResult {
+                            name: COMMAND_ITEM.into(),
+                            ok,
+                            output,
+                            call_id,
                         },
                     )
                     .await
@@ -328,11 +361,22 @@ fn spawn_error_text(program: &Path, err: &std::io::Error) -> String {
 enum CodexEvent {
     /// `item.completed` + `item.type == "agent_message"`：助手文本（`item.text`）。
     Text { text: String },
-    /// `command_execution` 的任一生命周期行：摘要取 `item.command`，`args` 留原始条目
-    /// （`status` / `exit_code` / `aggregated_output` 都在里面，供任务日志还原现场）。
-    Command {
+    /// `reasoning` / `agent_reasoning` 条目：推理文本（`item.text`），走 `ReasoningDelta` 分道。
+    Reasoning { text: String },
+    /// `item.started` + `command_execution`：命令开始（`ToolExec` 侧）。`call_id = item.id`；
+    /// 摘要取 `item.command`，`args` 留原始条目（供任务日志还原现场）。
+    CommandStarted {
+        call_id: String,
         summary: String,
         args: serde_json::Value,
+    },
+    /// `item.completed` + `command_execution`：命令收束（`ToolResult` 侧）。`call_id = item.id`；
+    /// `ok = exit_code == 0 且 status == "completed"`（缺字段 / `null` 按失败）；`output` 取
+    /// `aggregated_output`，空串视为无输出。没有前置 `item.started` 时也照发本事件。
+    CommandCompleted {
+        call_id: String,
+        ok: bool,
+        output: Option<String>,
     },
     /// `turn.completed`：本轮成功收束。
     TurnCompleted,
@@ -358,13 +402,18 @@ const ERR_TURN_FAILED_NO_REASON: &str = "codex 报告失败（未提供原因）
 /// 两个终局只按顶层 `type` 判别：`turn.failed` 的原因缺失（或 `error` 不是对象）时仍认作终局，
 /// 只是原因为 `None`——把整行当成「未知行」会让一次真实的失败终局丢掉。
 ///
+/// 命令条目按相位逐行映射、不跨行记状态：`item.started` → [`CodexEvent::CommandStarted`]、
+/// `item.completed` → [`CodexEvent::CommandCompleted`]；没有前置 `item.started` 的完成条目照发
+/// 结果事件（`drive` 不补发 `ToolExec`）。`item.updated` 一律跳过（任何条目类型；同一 `call_id`
+/// 只出一次 `ToolExec`，若某版本只发 `updated`，工具行只在完成时出现——已知限制）。
+///
 /// 静默跳过的三类（容忍 schema 漂移）：未知顶层事件类型（如 `thread.started`、重连用的
-/// `error`）、未知条目类型、非 JSON 行。本轮不映射的已知条目也只有跳过一种处理：
-/// `reasoning` / `file_change` / `mcp_tool_call` / `web_search` / `todo_list` / `error` 条目
-/// 对任务日志没有执行语义，T3 之后按需再收。
+/// `error`）、未知条目类型、非 JSON 行。已知但不映射的条目只有跳过一种处理：`file_change` /
+/// `mcp_tool_call` / `web_search` / `todo_list` / `error`（对任务日志没有执行语义，后续按需再收）。
 fn parse_line(line: &str) -> Option<CodexEvent> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    match value.get("type")?.as_str()? {
+    let phase = value.get("type")?.as_str()?;
+    match phase {
         "turn.completed" => Some(CodexEvent::TurnCompleted),
         "turn.failed" => Some(CodexEvent::TurnFailed {
             message: value
@@ -373,21 +422,49 @@ fn parse_line(line: &str) -> Option<CodexEvent> {
                 .and_then(|message| message.as_str())
                 .map(str::to_string),
         }),
-        "item.started" | "item.updated" | "item.completed" => {
+        // 进行中更新一律跳过（同一事件只在起始/完成相映射，避免重复出事件）
+        "item.updated" => None,
+        "item.started" | "item.completed" => {
             let item = value.get("item")?;
             match item.get("type")?.as_str()? {
                 "agent_message" => Some(CodexEvent::Text {
                     text: item.get("text")?.as_str()?.to_string(),
                 }),
-                "command_execution" => Some(CodexEvent::Command {
-                    summary: item.get("command")?.as_str()?.to_string(),
-                    args: item.clone(),
+                "reasoning" | "agent_reasoning" => Some(CodexEvent::Reasoning {
+                    text: item.get("text")?.as_str()?.to_string(),
+                }),
+                COMMAND_ITEM => Some(match phase {
+                    "item.started" => CodexEvent::CommandStarted {
+                        call_id: item_id(item),
+                        summary: item.get("command")?.as_str()?.to_string(),
+                        args: item.clone(),
+                    },
+                    // 到这里只可能是 `item.completed`（updated 已在上层跳过）
+                    _ => CodexEvent::CommandCompleted {
+                        call_id: item_id(item),
+                        ok: item.get("exit_code").and_then(serde_json::Value::as_i64) == Some(0)
+                            && item.get("status").and_then(serde_json::Value::as_str)
+                                == Some("completed"),
+                        output: item
+                            .get("aggregated_output")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|output| !output.is_empty())
+                            .map(str::to_string),
+                    },
                 }),
                 _ => None,
             }
         }
         _ => None,
     }
+}
+
+/// `item.id` 作 `call_id`；schema 漂移下缺失取空串（渲染层按旧日志语义退化为 FIFO 配对）。
+fn item_id(item: &serde_json::Value) -> String {
+    item.get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -404,15 +481,52 @@ mod tests {
             ),
             Some(CodexEvent::Text { text: "OK.".into() })
         );
-        // 命令事件：摘要取 `command`，原始条目整个留作 args
-        let Some(CodexEvent::Command { summary, args }) = parse_line(
-            r#"{"type":"item.completed","item":{"id":"item_2","type":"command_execution","command":"bash -lc ls","aggregated_output":"docs\n","exit_code":0,"status":"completed"}}"#,
-        ) else {
-            panic!("command_execution 应映射成 Command");
+        // 命令条目的两个相位：`item.started` → CommandStarted（摘要 + 原始条目留作 args），
+        // `item.completed` → CommandCompleted（成败与输出收口）
+        let started = parse_line(
+            r#"{"type":"item.started","item":{"id":"item_2","type":"command_execution","command":"bash -lc ls","aggregated_output":"","exit_code":null,"status":"in_progress"}}"#,
+        );
+        let Some(CodexEvent::CommandStarted {
+            call_id,
+            summary,
+            args,
+        }) = started
+        else {
+            panic!("item.started 的 command_execution 应映射成 CommandStarted");
         };
+        assert_eq!(call_id, "item_2");
         assert_eq!(summary, "bash -lc ls");
-        assert_eq!(args["exit_code"], 0);
-        assert_eq!(args["aggregated_output"], "docs\n");
+        assert_eq!(args["status"], "in_progress");
+        assert_eq!(args["exit_code"], serde_json::Value::Null);
+        assert_eq!(
+            parse_line(
+                r#"{"type":"item.completed","item":{"id":"item_2","type":"command_execution","command":"bash -lc ls","aggregated_output":"docs\n","exit_code":0,"status":"completed"}}"#,
+            ),
+            Some(CodexEvent::CommandCompleted {
+                call_id: "item_2".into(),
+                ok: true,
+                output: Some("docs\n".into()),
+            })
+        );
+        // `item.updated` 一律跳过：command_execution（避免重复出 ToolExec）与文本/推理条目都算
+        assert_eq!(
+            parse_line(
+                r#"{"type":"item.updated","item":{"id":"item_2","type":"command_execution","command":"bash -lc ls","aggregated_output":"doc","exit_code":null,"status":"in_progress"}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            parse_line(
+                r#"{"type":"item.updated","item":{"id":"i","type":"agent_message","text":"半截"}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            parse_line(
+                r#"{"type":"item.updated","item":{"id":"i","type":"reasoning","text":"半截"}}"#
+            ),
+            None
+        );
         // 两个终局事件
         assert_eq!(
             parse_line(r#"{"type":"turn.completed","usage":{"input_tokens":21}}"#),
@@ -433,10 +547,26 @@ mod tests {
             parse_line(r#"{"type":"error","message":"Reconnecting... 2/5"}"#),
             None
         );
+        // 推理条目（`reasoning` / `agent_reasoning`）：`item.text` 走推理分道
         assert_eq!(
             parse_line(
                 r#"{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"**x**"}}"#
             ),
+            Some(CodexEvent::Reasoning {
+                text: "**x**".into()
+            })
+        );
+        assert_eq!(
+            parse_line(
+                r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_reasoning","text":"再想想"}}"#
+            ),
+            Some(CodexEvent::Reasoning {
+                text: "再想想".into()
+            })
+        );
+        // 推理条目缺 `text`（形状漂移）同样跳过
+        assert_eq!(
+            parse_line(r#"{"type":"item.completed","item":{"id":"i","type":"reasoning"}}"#),
             None
         );
         assert_eq!(
@@ -458,6 +588,79 @@ mod tests {
         assert_eq!(
             parse_line(r#"{"type":"turn.failed","error":"stream ended"}"#),
             Some(CodexEvent::TurnFailed { message: None })
+        );
+    }
+
+    /// 命令完成条目的成败判据与输出：`exit_code == 0` 且 `status == "completed"` 才算成功
+    /// （缺字段 / `null` 一律 false）；`aggregated_output` 空串视为无输出。
+    #[test]
+    fn command_completion_ok_and_output_follow_the_pinned_rule() {
+        let completed = |line: &str| match parse_line(line) {
+            Some(CodexEvent::CommandCompleted { ok, output, .. }) => (ok, output),
+            other => panic!("应映射成 CommandCompleted：{other:?}"),
+        };
+        // 成功基线：0 + completed + 非空输出
+        assert_eq!(
+            completed(
+                r#"{"type":"item.completed","item":{"id":"i","type":"command_execution","command":"c","aggregated_output":"out","exit_code":0,"status":"completed"}}"#
+            ),
+            (true, Some("out".into()))
+        );
+        // `exit_code:null`（完成前形状 / schema 漂移）→ 失败
+        assert_eq!(
+            completed(
+                r#"{"type":"item.completed","item":{"id":"i","type":"command_execution","command":"c","aggregated_output":"out","exit_code":null,"status":"completed"}}"#
+            ),
+            (false, Some("out".into()))
+        );
+        // status 不是 `completed`（failed / declined 等）→ 失败
+        assert_eq!(
+            completed(
+                r#"{"type":"item.completed","item":{"id":"i","type":"command_execution","command":"c","aggregated_output":"out","exit_code":0,"status":"failed"}}"#
+            ),
+            (false, Some("out".into()))
+        );
+        // 缺 exit_code / status → 失败
+        assert_eq!(
+            completed(
+                r#"{"type":"item.completed","item":{"id":"i","type":"command_execution","command":"c","aggregated_output":"out"}}"#
+            ),
+            (false, Some("out".into()))
+        );
+        // 空串输出（真机 started 条目的形状）→ None；缺 aggregated_output → None
+        assert_eq!(
+            completed(
+                r#"{"type":"item.completed","item":{"id":"i","type":"command_execution","command":"c","aggregated_output":"","exit_code":0,"status":"completed"}}"#
+            ),
+            (true, None)
+        );
+        assert_eq!(
+            completed(
+                r#"{"type":"item.completed","item":{"id":"i","type":"command_execution","command":"c","exit_code":0,"status":"completed"}}"#
+            ),
+            (true, None)
+        );
+    }
+
+    /// 相位映射逐行无状态：`item.completed` 没有前置 `item.started` 也照常映射成完成事件
+    /// （`drive` 只发 `ToolResult`，不补发 `ToolExec`）；started 条目缺 `command` 时跳过。
+    #[test]
+    fn command_phases_are_mapped_per_line_without_cross_line_state() {
+        assert_eq!(
+            parse_line(
+                r#"{"type":"item.completed","item":{"id":"item_9","type":"command_execution","command":"bash -lc pwd","aggregated_output":"/x\n","exit_code":0,"status":"completed"}}"#
+            ),
+            Some(CodexEvent::CommandCompleted {
+                call_id: "item_9".into(),
+                ok: true,
+                output: Some("/x\n".into()),
+            })
+        );
+        assert_eq!(
+            parse_line(
+                r#"{"type":"item.started","item":{"id":"item_9","type":"command_execution"}}"#
+            ),
+            None
         );
     }
 

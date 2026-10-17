@@ -204,10 +204,13 @@ async fn spawns_codex_exec_with_pinned_flags_and_rendered_prompt() {
             "你是 Ignis 的助手\n\n---\nUser: 说一句 ok\n".to_string(),
         )
     );
-    // 只映射文本与终局：reasoning 条目、`turn.completed.usage` 都不出事件
+    // 映射推理、文本与终局：`reasoning` 条目出 ReasoningDelta，`turn.completed.usage` 不出事件
     assert_eq!(
         events,
         vec![
+            RuntimeEvent::ReasoningDelta {
+                text: "**Confirming readiness for response**".into()
+            },
             RuntimeEvent::TextDelta { text: "OK.".into() },
             RuntimeEvent::Done {
                 status: RunStatus::Success,
@@ -245,7 +248,8 @@ async fn omits_model_flag_when_no_model_was_configured() {
             "sys\n\n---\nUser: 说一句 ok\n".to_string(),
         )
     );
-    assert_eq!(events.len(), 2, "{events:?}");
+    // 推理 + 文本 + 终局：3 条
+    assert_eq!(events.len(), 3, "{events:?}");
 }
 
 /// 未知事件类型、未知条目类型、非 JSON 行一律静默跳过（容忍 schema 漂移），流照常收束。
@@ -275,10 +279,11 @@ async fn unknown_lines_are_skipped_silently() {
     );
 }
 
-/// 命令事件只观察：`command_execution` 的每个生命周期行映射成一条 `ToolExec`，不发 `ToolResult`
-/// （外部内核的工具执行结果不回流到 Ignis 的执行器）。
+/// 命令生命周期按相位收口（v0.2）：`item.started` → `ToolExec`、`item.completed` → `ToolResult`
+/// ——同一 `call_id` 成对且 id 非空；`item.updated` 跳过（同一调用只出一次 `ToolExec`）。
+/// 结果只进事件流，不回填执行器。
 #[tokio::test]
-async fn command_execution_maps_to_observation_only_tool_exec() {
+async fn command_execution_lifecycle_maps_to_paired_exec_and_result() {
     let workspace = TempWorkspace::new("tool");
     let runtime = CodexRuntime::with_command(fake_codex(), workspace.path(), None);
     let events = collect(
@@ -288,48 +293,95 @@ async fn command_execution_maps_to_observation_only_tool_exec() {
     )
     .await;
 
-    let tool_execs: Vec<&RuntimeEvent> = events
+    assert_eq!(
+        events,
+        vec![
+            RuntimeEvent::ToolExec {
+                name: "command_execution".into(),
+                summary: "bash -lc ls".into(),
+                args: serde_json::json!({"id":"item_0","type":"command_execution","command":"bash -lc ls","aggregated_output":"","exit_code":null,"status":"in_progress"}),
+                call_id: "item_0".into(),
+            },
+            RuntimeEvent::ToolResult {
+                name: "command_execution".into(),
+                ok: true,
+                output: Some("docs\nsrc\n".into()),
+                call_id: "item_0".into(),
+            },
+            RuntimeEvent::TextDelta {
+                text: "列完了".into()
+            },
+            RuntimeEvent::Done {
+                status: RunStatus::Success,
+                summary: Some("列完了".into()),
+                error: None,
+            },
+        ]
+    );
+    // T1 遗留的空串占位在此收口：同 call_id 成对且 id 非空
+    let exec_ids: Vec<&String> = events
         .iter()
-        .filter(|event| matches!(event, RuntimeEvent::ToolExec { .. }))
+        .filter_map(|event| match event {
+            RuntimeEvent::ToolExec { call_id, .. } => Some(call_id),
+            _ => None,
+        })
         .collect();
-    assert_eq!(tool_execs.len(), 2, "{events:?}");
-    for event in tool_execs {
-        let RuntimeEvent::ToolExec {
-            name,
-            summary,
-            args,
-            ..
-        } = event
-        else {
-            unreachable!()
-        };
-        assert_eq!(name, "command_execution");
-        assert_eq!(summary, "bash -lc ls");
-        assert_eq!(args["command"], "bash -lc ls");
-    }
-    // 生命周期差别留在原始条目里（`in_progress` → `completed` + exit_code）
-    let RuntimeEvent::ToolExec { args, .. } = &events[0] else {
-        panic!("首条应为 ToolExec：{events:?}")
-    };
-    assert_eq!(args["status"], "in_progress");
-    let RuntimeEvent::ToolExec { args, .. } = &events[1] else {
-        panic!("次条应为 ToolExec：{events:?}")
-    };
-    assert_eq!(args["status"], "completed");
-    assert_eq!(args["exit_code"], 0);
+    let result_ids: Vec<&String> = events
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::ToolResult { call_id, .. } => Some(call_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(exec_ids.len(), 1, "{events:?}");
+    assert_eq!(result_ids.len(), 1, "{events:?}");
+    assert_eq!(
+        exec_ids[0], result_ids[0],
+        "ToolExec/ToolResult 必须同 call_id 配对：{events:?}"
+    );
+    assert!(
+        !exec_ids[0].is_empty(),
+        "call_id 不得是空串占位：{events:?}"
+    );
+}
+
+/// `item.completed` 没有前置 `item.started`（相位映射逐行无状态）：只发 `ToolResult`，
+/// 不补发 `ToolExec`。
+#[tokio::test]
+async fn command_completed_without_started_emits_only_a_result() {
+    let workspace = TempWorkspace::new("tool-complete-only");
+    let runtime = CodexRuntime::with_command(fake_codex(), workspace.path(), None);
+    let events = collect(
+        &runtime,
+        request("sys", "TOOL_COMPLETE_ONLY", 60),
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(
+        events,
+        vec![
+            RuntimeEvent::ToolResult {
+                name: "command_execution".into(),
+                ok: true,
+                output: Some("/tmp\n".into()),
+                call_id: "item_7".into(),
+            },
+            RuntimeEvent::TextDelta {
+                text: "只有完成相".into()
+            },
+            RuntimeEvent::Done {
+                status: RunStatus::Success,
+                summary: Some("只有完成相".into()),
+                error: None,
+            },
+        ]
+    );
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event, RuntimeEvent::ToolResult { .. })),
-        "外部内核不回流工具结果：{events:?}"
-    );
-    assert_eq!(
-        events.last(),
-        Some(&RuntimeEvent::Done {
-            status: RunStatus::Success,
-            summary: Some("列完了".into()),
-            error: None,
-        })
+            .any(|event| matches!(event, RuntimeEvent::ToolExec { .. })),
+        "没有前置 item.started 不得补发 ToolExec：{events:?}"
     );
 }
 

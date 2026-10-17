@@ -3,7 +3,9 @@
 # （形状来源：docs/spikes/2026-10-15-external-kernels-probe.md 的 claude 小节）。
 #
 # 行为由最后一个位置参数（渲染好的 prompt）里的关键词决定：
-#   TOOL            assistant 里带 tool_use 块（只观察，不发 ToolResult）
+#   TOOL           assistant 里带 thinking + tool_use 块，随后 user 行的 tool_result 回流
+#                  （thinking → ReasoningDelta、tool_use → ToolExec、tool_result → ToolResult，
+#                  同 call_id 配对；结果只进事件流，不回填执行器）
 #   NOISE           system/未知类型/未知内容块/非 JSON 行混在正常文本流里
 #   RESULT_ERR      result.is_error == true（退出码 0，证明失败判定不看退出码）
 #   RESULT_BARE     result.is_error == true 但不带 result 文本，之后挂起（证明终局一到手即收束、

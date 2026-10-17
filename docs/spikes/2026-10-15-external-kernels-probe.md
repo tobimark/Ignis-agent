@@ -131,13 +131,20 @@ MM_KEY=<键> codex exec --json -C <临时工作区> --sandbox workspace-write --
 
 ### 真机轨迹 ↔ 适配器映射对照
 
-| 真机行 | 适配器处置 | 对得上？ |
+> **v0.2 修订（2026-10-16）**：reasoning → `ReasoningDelta`；`item.started`/`item.completed` →
+> 配对的 `ToolExec`/`ToolResult`（`call_id = item.id`）；`item.updated` 跳过。下表的「适配器处置」
+> 已按 v0.2 行为更新；历史轨迹与结论不变。
+
+| 真机行 | 适配器处置（v0.2） | 对得上？ |
 |---|---|---|
 | `thread.started` / `turn.started` | 未知顶层类型 → 静默跳过 | ✓ |
 | `item.completed` + `item.type == "error"`（配置/元数据告警、流级错误条目） | 不映射的条目 → 跳过 | ✓ |
 | `type:"error"`（重连、`invalid params`） | 非终局 → 跳过（不当终局） | ✓ |
 | `item.completed` + `agent_message` | `TextDelta`（`item.text`） | ✓ |
-| `item.started` / `item.completed` + `command_execution` | `ToolExec`（name = 条目类型名、summary = `item.command`、args = 原始条目） | ✓ |
+| `item.completed` + `reasoning` / `agent_reasoning` | `ReasoningDelta`（`item.text`） | ✓ |
+| `item.started` + `command_execution` | `ToolExec`（name = 条目类型名、summary = `item.command`、args = 原始条目、`call_id = item.id`） | ✓ |
+| `item.completed` + `command_execution` | `ToolResult`（name = 条目类型名、`call_id = item.id`、`ok = exit_code==0 且 status=="completed"`（缺字段/`null` 按失败）、`output = aggregated_output`（空串→`None`）） | ✓ |
+| `item.updated` + `command_execution` | 跳过（同一 `call_id` 只出一次 `ToolExec`） | ✓ |
 | `turn.completed`（带 `usage`） | `Done{Success, summary = 最后一段助手文本}`；`usage` 不出事件（能力声明 `usage:false`） | ✓ |
 | `turn.failed`（`error.message`） | `Done{Failed, 「codex 报告失败：<原因>」}` | ✓ |
 
@@ -316,13 +323,17 @@ schema；另一轮 400 的同形状轨迹文案是 `API Error: 400 Upstream requ
 
 ## 真机轨迹 ↔ 适配器映射对照
 
-| 真机行 | 适配器处置 | 对得上？ |
+> **v0.2 修订（2026-10-16）**：`thinking` → `ReasoningDelta`；`tool_use` → `ToolExec`（`call_id` = 块
+> id）；顶层 `user` 行的 `tool_result` → `ToolResult`（`call_id = tool_use_id`）。下表的「适配器处置」
+> 已按 v0.2 行为更新；历史轨迹与结论不变。
+
+| 真机行 | 适配器处置（v0.2） | 对得上？ |
 |---|---|---|
 | `system` / `init`、`system` / `thinking_tokens`（每轮很多条） | 未知顶层语义 → 静默跳过 | ✓ |
-| `assistant` + `content[].type == "thinking"` | 不映射的内容块 → 跳过 | ✓ |
+| `assistant` + `content[].type == "thinking"` | `ReasoningDelta`（块的 `thinking`） | ✓ |
 | `assistant` + `content[].type == "text"` | `TextDelta`（块里的 `text`） | ✓ |
-| `assistant` + `content[].type == "tool_use"` | `ToolExec`（name = 块类型名 `tool_use`、summary = 工具名 + 一行参数提示、args = 原始块） | ✓ |
-| `user` + `content[].type == "tool_result"`（工具结果回流） | 未知顶层类型 → 跳过（不回流到执行器） | ✓ |
+| `assistant` + `content[].type == "tool_use"` | `ToolExec`（name = 块类型名 `tool_use`、summary = 工具名 + 一行参数提示、args = 原始块、`call_id` = 块 `id`） | ✓ |
+| `user` + `content[].type == "tool_result"`（工具结果回流） | `ToolResult`（name = 块类型名 `tool_result`、`call_id = tool_use_id`、`ok = !is_error`（缺失按失败）、`output = content`（数组拼接各 `text` 块，空→`None`）） | ✓ |
 | `result`（`is_error:false`） | `Done{Success, summary = result 文本}`；`usage` 不出事件（`usage:false`） | ✓ |
 | `result`（`is_error:true`） | `Done{Failed, 「claude 报告失败：<首行原因>」}` | ✓ |
 | 非 JSON 行 / 未知类型 / 未知内容块 | 跳过 | ✓ |

@@ -3,7 +3,10 @@
 # （形状来源：docs/spikes/2026-10-15-external-kernels-probe.md）。
 #
 # 行为由最后一个位置参数（渲染好的 prompt）里的关键词决定：
-#   TOOL          工具/命令事件（只观察，不执行）
+#   TOOL          命令生命周期（item.started → ToolExec、item.completed → ToolResult 配对；
+#                 item.updated 跳过；结果只进事件流，不回填执行器）
+#   TOOL_COMPLETE_ONLY 只有 item.completed 的命令条目（无前置 started）：只发 ToolResult，
+#                 不补发 ToolExec。
 #   TURNFAIL      turn.failed 终局（退出码 0，证明失败判定不看退出码）
 #   TURNFAIL_BARE turn.failed 不带 error.message，之后挂起（证明终局一到手即收束、
 #                 缺失原因也走「失败」而不是「没见到终局」或超时）
@@ -116,10 +119,18 @@ case "$prompt" in
   emit '{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"noise ok"}}'
   emit '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}'
   ;;
+*TOOL_COMPLETE_ONLY*)
+  emit '{"type":"thread.started","thread_id":"00000000-0000-7000-8000-000000000001"}'
+  emit '{"type":"turn.started"}'
+  emit '{"type":"item.completed","item":{"id":"item_7","type":"command_execution","command":"bash -lc pwd","aggregated_output":"/tmp\n","exit_code":0,"status":"completed"}}'
+  emit '{"type":"item.completed","item":{"id":"item_8","type":"agent_message","text":"只有完成相"}}'
+  emit '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}'
+  ;;
 *TOOL*)
   emit '{"type":"thread.started","thread_id":"00000000-0000-7000-8000-000000000001"}'
   emit '{"type":"turn.started"}'
   emit '{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"bash -lc ls","aggregated_output":"","exit_code":null,"status":"in_progress"}}'
+  emit '{"type":"item.updated","item":{"id":"item_0","type":"command_execution","command":"bash -lc ls","aggregated_output":"docs\n","exit_code":null,"status":"in_progress"}}'
   emit '{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"bash -lc ls","aggregated_output":"docs\nsrc\n","exit_code":0,"status":"completed"}}'
   emit '{"type":"item.completed","item":{"id":"item_1","type":"file_change","changes":[{"path":"docs/x.md","kind":"add"}],"status":"completed"}}'
   emit '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"列完了"}}'
