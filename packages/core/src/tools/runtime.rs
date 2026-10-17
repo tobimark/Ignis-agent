@@ -4,8 +4,9 @@
 //! [`is_dangerous_command`]；路径按工作区内的解析结果判定，`notes.txt -> .env` 这类别名
 //! 同样算敏感），再由 [`Policy`] 判定：`Allow` 直接执行、`Deny` 拒绝、`Ask` 交给
 //! [`ApprovalHandler`] 询问。需要判定的调用（非 `Safe`）无论放行还是拒绝都在 `approvals`
-//! 表留一条记录——**记录写不进去就不执行**（fail-closed）。摘要进入审批提示与审批表之前先过
-//! [`Redactor`]；真正执行前再检查取消信号；工具输出与错误文本统一过 [`Redactor`] 后才回填给模型。
+//! 表留一条记录——**记录写不进去就不执行**（fail-closed）。摘要与交给审批方的参数在进入审批
+//! 提示（含 `[d]etails` 打印的 JSON）前先过 [`Redactor`]；真正执行前再检查取消信号；工具输出
+//! 与错误文本统一过 [`Redactor`] 后才回填给模型。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -93,10 +94,15 @@ impl ToolRuntime {
                 Some(self.result(false, format!("denied by policy: {reason}")))
             }
             PolicyDecision::Ask => {
+                // 审批参数会进交互提示的 `[d]etails`（原样打印这份 JSON）：摘要的脱敏兜不住它，
+                // 交给审批方之前先 `redact_value`。只改这一份副本——判定与真正执行的参数仍是
+                // `call.args` 原文，工具照旧以模型给的参数运行。
+                let mut args = call.args.clone();
+                self.redactor.redact_value(&mut args);
                 let request = ApprovalRequest {
                     tool: call.name.clone(),
                     summary: summary.clone(),
-                    args: call.args.clone(),
+                    args,
                     risk,
                 };
                 let (decision, allowed, remember_session) =
@@ -641,6 +647,36 @@ mod tests {
         // 工具输出也不带明文
         let output = result.output.unwrap();
         assert!(!output.contains("sk-x"), "{output}");
+    }
+
+    /// P1 终审遗留：摘要脱敏兜不住审批参数——交互提示的 `[d]etails` 会原样打印
+    /// `ApprovalRequest.args` 的 JSON。参数必须自己过一遍脱敏，且脱敏不改判定：工具照旧以
+    /// 原始参数执行。
+    #[tokio::test]
+    async fn approval_request_args_are_redacted() {
+        let env = Env::with_redactor(
+            ApprovalMode::Interactive,
+            vec![ApprovalDecision::AllowOnce],
+            Redactor::new(vec!["sk-test-secret".into()]),
+        );
+
+        let result = env
+            .call("shell_run", json!({"command": "echo sk-test-secret"}))
+            .await;
+
+        // 脱敏不改判定：审批放行，命令真的跑过了（拿得到 exit code 与输出）
+        assert!(result.ok, "{:?}", result.output);
+        let output = result.output.unwrap();
+        assert!(output.starts_with("exit code: 0\n"), "{output}");
+        assert!(!output.contains("sk-test-secret"), "{output}");
+
+        // 审批方拿到的参数已脱敏，摘要同形
+        let seen = env.approval.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].args["command"], json!("echo ***"));
+        assert_eq!(seen[0].summary, "Running: echo ***");
+        let raw = serde_json::to_string(&seen[0].args).unwrap();
+        assert!(!raw.contains("sk-test-secret"), "{raw}");
     }
 
     #[tokio::test]

@@ -1,5 +1,7 @@
 //! 输出脱敏：把已知密钥从工具输出与日志文本里抹掉。
 
+use serde_json::Value;
+
 /// 脱敏器：密钥集合在构造时固定，[`Redactor::redact`] 只做字面替换。
 pub struct Redactor {
     /// 每个密钥的待替换字面形式：JSON 转义形式在前、原文在后（见 [`Redactor::new`]）。
@@ -38,6 +40,30 @@ impl Redactor {
             }
         }
         redacted
+    }
+
+    /// 原地递归脱敏一个 JSON 值：只替换**字符串叶子**。
+    ///
+    /// 对象键是事件字段名 / 工具参数名（不是用户文本），一律不动；数组与对象的形状原样保留；
+    /// 数字 / 布尔 / Null 不碰。两条调用链共用本方法：`TaskRunner::redact_for_sink` 转发的
+    /// [`ignis_runtime::RuntimeEvent`] 副本，以及 [`crate::tools::ToolRuntime`] 交给审批方的
+    /// `ApprovalRequest.args`（交互提示的 `[d]etails` 会原样打印这份 JSON）。
+    pub fn redact_value(&self, value: &mut Value) {
+        match value {
+            Value::String(text) => *text = self.redact(text),
+            Value::Array(items) => {
+                for item in items {
+                    self.redact_value(item);
+                }
+            }
+            Value::Object(fields) => {
+                for field in fields.values_mut() {
+                    self.redact_value(field);
+                }
+            }
+            // 数字 / 布尔 / Null 不带可替换的文本
+            Value::Number(_) | Value::Bool(_) | Value::Null => {}
+        }
     }
 }
 
@@ -106,6 +132,65 @@ mod tests {
 
         // 原文形式（非 JSON 文本里的密钥）照旧被替换
         assert_eq!(redactor.redact(&format!("pw={secret}")), "pw=***");
+    }
+
+    /// [`Redactor::redact_value`] 只替换字符串叶子：对象键是事件字段名 / 工具参数名（不是用户
+    /// 文本，原样保留），数组与对象的形状原样保留，数字 / 布尔 / Null 不碰。
+    #[test]
+    fn redact_value_replaces_string_leaves_only() {
+        let redactor = Redactor::new(vec!["sk-test-secret".into()]);
+
+        let mut value = json!({
+            // 键名（字段名 / 参数名）不是值：一律不动
+            "sk-test-secret_note": "键名不动",
+            "command": "echo sk-test-secret",
+            "nested": {
+                "list": ["sk-test-secret", 7, true, null],
+                "deep": { "text": "a sk-test-secret b" },
+            },
+            "count": 3,
+            "enabled": false,
+            "missing": null,
+        });
+
+        redactor.redact_value(&mut value);
+
+        assert_eq!(
+            value,
+            json!({
+                "sk-test-secret_note": "键名不动",
+                "command": "echo ***",
+                "nested": {
+                    "list": ["***", 7, true, null],
+                    "deep": { "text": "a *** b" },
+                },
+                "count": 3,
+                "enabled": false,
+                "missing": null,
+            })
+        );
+        // 标量与形状逐项复核：数字 / 布尔 / Null 不参与替换，数组长度与对象字段数不变
+        assert_eq!(value["count"], json!(3));
+        assert_eq!(value["enabled"], json!(false));
+        assert!(value["missing"].is_null());
+        assert_eq!(value["nested"]["list"].as_array().unwrap().len(), 4);
+        assert_eq!(value["nested"].as_object().unwrap().len(), 2);
+
+        // 密钥只出现在值里时（审批参数的实际形状），整值序列化后不含明文
+        let mut args = json!({
+            "command": "echo sk-test-secret",
+            "nested": { "list": ["sk-test-secret"] },
+        });
+        redactor.redact_value(&mut args);
+        let serialized = serde_json::to_string(&args).unwrap();
+        assert!(!serialized.contains("sk-test-secret"), "{serialized}");
+
+        // 不带密钥的值原样返回（空密钥集合同理）
+        let mut plain = json!({"n": 1, "s": "nothing to hide"});
+        redactor.redact_value(&mut plain);
+        assert_eq!(plain, json!({"n": 1, "s": "nothing to hide"}));
+        Redactor::new(Vec::new()).redact_value(&mut plain);
+        assert_eq!(plain, json!({"n": 1, "s": "nothing to hide"}));
     }
 
     #[test]

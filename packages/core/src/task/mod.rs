@@ -65,11 +65,13 @@ pub struct TaskRequest {
     pub job_id: Option<String>,
 }
 
-/// 一次任务的结果；`messages` 即下一轮应当带上的上下文。
+/// 一次任务的结果；`messages` 即下一轮应当带上的上下文（末尾的 assistant 消息与
+/// [`TaskOutcome::final_text`] 同源，取的都是脱敏后的摘要）。
 pub struct TaskOutcome {
     pub id: String,
     pub status: RunStatus,
-    /// 仅成功时有值，取内核 `Done.summary`。
+    /// 仅成功时有值，取内核 `Done.summary`（已过 [`Redactor`]）：网关把它转写成
+    /// `job_runs.summary`，与落库的 `tasks.summary` 是同一份文本。
     pub final_text: Option<String>,
     /// 内核给出的失败原因（`Done.error`，已过 [`Redactor`]）：命令层把它打到终端，
     /// `ignis task show` 打印的 `tasks.error` 是同一份文本；成功终态下内核不给原因，
@@ -358,16 +360,17 @@ impl TaskRunner {
             None,
             Some("内核事件流未以 done 收尾（内核任务可能 panic），按失败处理".to_string()),
         ));
-        // 只有成功才把 `Done.summary` 当最终答复交回调用方
+        // 落库、交回调用方与追加进 `messages` 的文本只脱敏一次、同源：`tasks.summary` /
+        // `tasks.error` 会被 `ignis task show` 原样打印，`TaskOutcome::error` 会被命令层直接
+        // 打到终端，`TaskOutcome::final_text` 与 assistant 消息还会落进会话、并作为下一轮的
+        // 内核上下文。JSONL 收尾行的整体脱敏不依赖这两份值，但同一份文本两次脱敏是幂等的。
+        let summary = summary.map(|text| self.redactor.redact(&text));
+        let error = error.map(|text| self.redactor.redact(&text));
+        // 脱敏先于派生：只有成功才把（已脱敏的）`Done.summary` 当最终答复交回调用方
         let final_text = match status {
             RunStatus::Success => summary.clone(),
             _ => None,
         };
-        // 落库与交回调用方的文本先过脱敏：`tasks.summary` / `tasks.error` 会被
-        // `ignis task show` 原样打印，`TaskOutcome::error` 会被命令层直接打到终端。
-        // JSONL 收尾行的整体脱敏不依赖这两份值，但同一份文本两次脱敏是幂等的。
-        let summary = summary.map(|text| self.redactor.redact(&text));
-        let error = error.map(|text| self.redactor.redact(&text));
         self.db.finish_task(
             task_id,
             status.as_str(),
@@ -392,7 +395,9 @@ impl TaskRunner {
             }),
         )?;
 
-        // P1 约定：跨轮上下文只带最终答复，不带内核内部的工具调用细节
+        // P1 约定：跨轮上下文只带最终答复，不带内核内部的工具调用细节；`text` 即
+        // `final_text`（与落库的 `tasks.summary` 同为脱敏后的同一份文本），会话存储与下一轮
+        // 内核上下文因此都拿不到明文
         if let Some(text) = &final_text {
             messages.push(chat_message(Role::Assistant, text.clone()));
         }
@@ -466,7 +471,7 @@ impl TaskRunner {
             // 也转发原事件：宁可少一道替换，不能 panic，也不能把事件从 UI 流里吞掉。
             return event.clone();
         };
-        redact_strings(&self.redactor, &mut value);
+        self.redactor.redact_value(&mut value);
         match serde_json::from_value(value) {
             Ok(redacted) => redacted,
             Err(_) => {
@@ -475,26 +480,6 @@ impl TaskRunner {
                 event.clone()
             }
         }
-    }
-}
-
-/// 递归脱敏一个 JSON 值：只替换字符串叶子（对象键是事件字段名，不可能携带密钥），
-/// 数组与对象的形状原样保留。
-fn redact_strings(redactor: &Redactor, value: &mut Value) {
-    match value {
-        Value::String(text) => *text = redactor.redact(text),
-        Value::Array(items) => {
-            for item in items {
-                redact_strings(redactor, item);
-            }
-        }
-        Value::Object(fields) => {
-            for field in fields.values_mut() {
-                redact_strings(redactor, field);
-            }
-        }
-        // 数字 / 布尔 / Null 不带可替换的文本
-        Value::Number(_) | Value::Bool(_) | Value::Null => {}
     }
 }
 
@@ -1245,6 +1230,44 @@ mod tests {
         assert_eq!(error, "鉴权失败：拒绝 ***");
         // JSONL 收尾行与任务行一致
         assert_eq!(report.task_end_line()["error"], json!("鉴权失败：拒绝 ***"));
+        assert!(
+            !env.log_raw().contains("sk-test-secret"),
+            "{}",
+            env.log_raw()
+        );
+    }
+
+    /// P1 终审遗留：`TaskOutcome.final_text` 与追加进 `messages` 的 assistant 消息此前是原始摘要
+    /// ——它们要进 P3 的会话存储，也是下一轮送进内核的历史，还会成为守护进程转写
+    /// `job_runs.summary` 的来源。三条面（JSONL / sink / `TaskOutcome`）必须与 `tasks.summary`
+    /// 同源，取同一份脱敏后的文本。
+    #[tokio::test]
+    async fn final_text_and_assistant_messages_are_redacted() {
+        let env = Env::new(
+            "outcome-redacted",
+            vec![success(Some("答复里带 sk-test-secret"))],
+            Some("sk-test-secret"),
+        );
+
+        let report = env.run(env.request("把 sk-test-secret 读出来")).await;
+
+        assert_eq!(report.outcome.status, RunStatus::Success);
+        // 成功时 `final_text` 就是脱敏后的摘要
+        assert_eq!(report.outcome.final_text.as_deref(), Some("答复里带 ***"));
+        // 追加的 assistant 消息与 `final_text` 是同一份文本：会话与下一轮上下文里没有明文
+        assert_eq!(
+            report.outcome.messages.last(),
+            Some(&assistant("答复里带 ***"))
+        );
+        // 任务行（`job_runs.summary` 与 `ignis task show` 的来源）同为脱敏文本
+        let row = env
+            .db
+            .get_task(&report.outcome.id)
+            .unwrap()
+            .expect("任务行");
+        assert_eq!(row.summary.as_deref(), Some("答复里带 ***"));
+        // 落盘面同样带的是脱敏文本，且整行不含明文
+        assert_eq!(report.task_end_line()["summary"], json!("答复里带 ***"));
         assert!(
             !env.log_raw().contains("sk-test-secret"),
             "{}",
