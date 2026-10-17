@@ -4,8 +4,9 @@
 //! `task_start` → 向记忆层取已知事实（失败只警告，见 [`TaskRunner::run`] 的说明）、把内置工具与
 //! 元工具组装成 [`ToolRuntime`]，连事实与技能目录一起交给 [`prompts::build_system_prompt`]
 //! → 消费内核事件（每行带 `ts` 且整行过 [`Redactor`] 后落盘，同时转发给 sink、累加用量、记下
-//! 真正加载过的技能）→ 终态时 `finish_task` 并补 JSONL 收尾行 `task_end`（与首行 `task_start`
-//! 对称；内核自己的 `Done` 事件已落成一行 `done`，收尾行不能与它同名）。
+//! 真正加载过的技能并数出本轮的 `ToolExec` 条数）→ 终态时 `finish_task` 并补 JSONL 收尾行
+//! `task_end`（与首行 `task_start` 对称；内核自己的 `Done` 事件已落成一行 `done`，收尾行不能与
+//! 它同名）。
 
 pub mod prompts;
 
@@ -79,6 +80,10 @@ pub struct TaskOutcome {
     /// 本次任务真正加载过的技能：事件流里 `load_skill` 调用按首次出现顺序去重（重复加载只记一次）；
     /// 事件流没以 `Done` 收尾时只记已经看到的那些。命令层的结束行据此标注 `skills: …`。
     pub skills_used: Vec<String>,
+    /// 本轮工具调用次数：事件流里 `RuntimeEvent::ToolExec` 的条数（同名工具的重复调用各算一次，
+    /// `load_skill` 同样计入，`ToolResult` 不算）。事件流没以 `Done` 收尾时统计的也是已经看到的
+    /// 那些；与 [`TaskOutcome::skills_used`] 一样是本轮统计，不落库，供命令层结束行标注 `N tools`。
+    pub tool_calls: usize,
 }
 
 /// 任务编排的失败原因；内核自身的失败是 `Done{Failed}` 事件，不走这里。
@@ -305,6 +310,8 @@ impl TaskRunner {
         let mut done = None;
         // 用过的技能：只认 `load_skill` 的调用，按首次出现顺序去重；无终态事件时也带着已看到的那些
         let mut skills_used: Vec<String> = Vec::new();
+        // 工具调用计数：每个 `ToolExec` 事件算一次，无终态事件时也带着已看到的那些
+        let mut tool_calls: usize = 0;
         let mut stream = self.runtime.run(request, cancel).await;
         while let Some(event) = stream.next().await {
             self.append_jsonl(log, task_id, serde_json::to_value(&event)?)?;
@@ -321,13 +328,16 @@ impl TaskRunner {
                     usage.output_tokens = usage.output_tokens.saturating_add(*output_tokens);
                     usage.estimated |= *estimated;
                 }
-                // 参数缺 `name` 或类型不是字符串的调用不算数：没读到任何一个技能
-                RuntimeEvent::ToolExec { name, args, .. }
+                // 每次 `ToolExec` 都计一次数：不看工具名、不看参数是否合法，也不去重
+                RuntimeEvent::ToolExec { name, args, .. } => {
+                    tool_calls += 1;
+                    // 参数缺 `name` 或类型不是字符串的调用不算数：没读到任何一个技能
                     if name == "load_skill"
                         && let Some(skill) = args.get("name").and_then(Value::as_str)
-                        && !skills_used.iter().any(|seen| seen == skill) =>
-                {
-                    skills_used.push(skill.to_owned());
+                        && !skills_used.iter().any(|seen| seen == skill)
+                    {
+                        skills_used.push(skill.to_owned());
+                    }
                 }
                 RuntimeEvent::Done {
                     status,
@@ -390,6 +400,7 @@ impl TaskRunner {
             usage: *usage,
             messages,
             skills_used,
+            tool_calls,
         })
     }
 
@@ -978,6 +989,50 @@ mod tests {
         );
     }
 
+    /// `TaskOutcome::tool_calls`：本轮 `ToolExec` 事件数——同名工具的重复调用各算一次，
+    /// 同一次调用的 `ToolResult` 不算（命令层的结束行据此标注 `2 tools`）。
+    #[tokio::test]
+    async fn tool_calls_counts_tool_exec_events() {
+        let env = Env::new(
+            "tool-calls",
+            vec![
+                tool_exec("fs_read", json!({ "path": "a.txt" })),
+                RuntimeEvent::ToolResult {
+                    name: "fs_read".into(),
+                    ok: true,
+                    output: Some("contents".into()),
+                    call_id: "call_1".into(),
+                },
+                tool_exec("fs_read", json!({ "path": "b.txt" })),
+                success(Some("done")),
+            ],
+            None,
+        );
+
+        let report = env.run(env.request("读两个文件")).await;
+
+        assert_eq!(report.outcome.tool_calls, 2);
+    }
+
+    /// 纯文本一轮没有工具调用：计数为 0。
+    #[tokio::test]
+    async fn tool_calls_is_zero_for_a_text_only_run() {
+        let env = Env::new(
+            "tool-calls-zero",
+            vec![
+                RuntimeEvent::TextDelta {
+                    text: "纯文本一轮".into(),
+                },
+                success(Some("done")),
+            ],
+            None,
+        );
+
+        let report = env.run(env.request("你好")).await;
+
+        assert_eq!(report.outcome.tool_calls, 0);
+    }
+
     #[tokio::test]
     async fn jsonl_is_redacted() {
         // `ToolExecutor::summarize()` 不做脱敏，摘要会原样进 `ToolExec.summary`：
@@ -1358,6 +1413,8 @@ mod tests {
         let report = env.run(env.request("用技能干活")).await;
 
         assert_eq!(report.outcome.skills_used, ["my-skill", "server-health"]);
+        // 计数不去重、也不看参数合法性：五条 `ToolExec` 全算（`load_skill` 同样计入）
+        assert_eq!(report.outcome.tool_calls, 5);
     }
 
     /// 事件流没以 `Done` 收尾（内核实现缺陷）时，已看到的技能照样交回调用方。
