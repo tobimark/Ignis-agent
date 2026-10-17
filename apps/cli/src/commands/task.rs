@@ -273,7 +273,8 @@ fn event_detail(event: &RuntimeEvent) -> String {
         RuntimeEvent::TextDelta { text } => {
             format!("text_delta {}", truncate(&one_line(text), DETAIL_CHARS))
         }
-        // 推理通道的最终形态由 Task 8 重写；本任务只打类型名 + 首行截断
+        // 推理通道的形态已定型（v0.2 起标记在内核分道处剥掉，文本只走 `ReasoningDelta`）：
+        // 事件流只打类型名 + 首行截断，终端怎么摆是渲染器的事
         RuntimeEvent::ReasoningDelta { text } => {
             format!(
                 "reasoning_delta {}",
@@ -303,7 +304,9 @@ fn event_detail(event: &RuntimeEvent) -> String {
             summary,
             error,
         } => {
-            // 契约字符串只在 `RunStatus::as_str` 一处映射（与 `tasks.status`、结束行同一份口径）
+            // 契约字符串只在 `RunStatus::as_str` 一处映射（`tasks.status` 与日志的 `done` 行
+            // 共用）；终端结束行的词是另一套（`render::status_word` 的 `Done` /
+            // `Limit reached`），两条口径各自单一来源，互不代劳
             let mut detail = format!("done status={}", status.as_str());
             if let Some(summary) = summary {
                 detail.push_str(&format!(
