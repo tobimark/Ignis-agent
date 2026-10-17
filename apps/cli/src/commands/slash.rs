@@ -337,15 +337,25 @@ pub fn model_lines(kernel: &str, model: &str, overridden: bool) -> Result<Vec<St
     Ok(lines)
 }
 
-/// `/status` 的输出：内核、模型、工作区、未读告警、最近一轮用量（顺序固定）。
+/// banner 与 `/status` 共用的会话行取值：`new` 或 13 字符短 id（与任务短 id 同一 helper——
+/// 两处的「哪一段可复制去给 `/resume`」保持同一口径）。
+pub fn session_label(current: Option<&str>) -> String {
+    match current {
+        Some(id) => short_id(id),
+        None => "new".to_string(),
+    }
+}
+
+/// `/status` 的输出：内核、模型、工作区、会话、未读告警、最近一轮用量（顺序固定）。
 ///
 /// 非 native 的内核在 `kernel:` 行后追加能力提示行（与 `/kernel` 同一份文案），模型行给
 /// `(kernel default)`——它们用各自 CLI 的默认模型，Ignis 这边的模型名对它们没有意义。
-/// P2 还没有会话行（P3 才加）。
+/// 会话行插在 `workspace:` 之后：`new` = 本进程还没落过会话行，否则是 13 字符短 id。
 pub fn status_lines(
     kernel: &str,
     model: &str,
     workspace: &Path,
+    session: Option<&str>,
     unread: Option<usize>,
     usage: Option<&Usage>,
 ) -> Vec<String> {
@@ -362,6 +372,7 @@ pub fn status_lines(
         }
     ));
     lines.push(format!("workspace: {}", workspace.display()));
+    lines.push(format!("session: {}", session_label(session)));
     lines.push(match unread {
         Some(count) => format!("unread alerts: {count}"),
         None => "unread alerts: unavailable".to_string(),
@@ -599,6 +610,7 @@ pub fn dispatch(
             session.kernel(),
             session.model(),
             session.workspace(),
+            session.current_session(),
             session.unread_alerts(),
             session.last_usage(),
         ))),
@@ -856,7 +868,7 @@ mod tests {
         }
     }
 
-    /// `/status` 的真值表：五行固定顺序，非 native 追加能力提示行。
+    /// `/status` 的真值表：六行固定顺序（会话行插在 workspace 之后），非 native 追加能力提示行。
     #[test]
     fn status_lines_matrix() {
         let path = Path::new("/tmp/ws");
@@ -870,13 +882,15 @@ mod tests {
             output_tokens: 3,
             estimated: true,
         };
+        let session_id = "019a1b2c-3d4e-7f00-8000-000000000001";
 
         assert_eq!(
-            status_lines("native", "test-model", path, Some(2), Some(&usage)),
+            status_lines("native", "test-model", path, None, Some(2), Some(&usage)),
             [
                 "kernel: native",
                 "model: test-model",
                 "workspace: /tmp/ws",
+                "session: new",
                 "unread alerts: 2",
                 "last turn usage: in=1234 out=567 tokens (exact)",
             ]
@@ -884,31 +898,58 @@ mod tests {
 
         // 告警计数读失败 / 本会话还没跑过任务
         assert_eq!(
-            status_lines("native", "test-model", path, None, None),
+            status_lines("native", "test-model", path, None, None, None),
             [
                 "kernel: native",
                 "model: test-model",
                 "workspace: /tmp/ws",
+                "session: new",
                 "unread alerts: unavailable",
                 "last turn usage: -",
             ]
         );
 
+        // 会话命中：13 字符短 id（与任务短 id 同一 helper），就插在 workspace 之后
+        let with_session = status_lines("native", "test-model", path, Some(session_id), None, None);
+        assert_eq!(with_session[2], "workspace: /tmp/ws");
+        assert_eq!(with_session[3], "session: 019a1b2c-3d4e");
+
         // 估算用量按 `(estimated)` 标出；0 条未读照实显示
-        let lines = status_lines("native", "test-model", path, Some(0), Some(&estimated));
-        assert_eq!(lines.len(), 5, "{lines:?}");
-        assert_eq!(lines[3], "unread alerts: 0");
-        assert_eq!(lines[4], "last turn usage: in=12 out=3 tokens (estimated)");
+        let lines = status_lines(
+            "native",
+            "test-model",
+            path,
+            Some(session_id),
+            Some(0),
+            Some(&estimated),
+        );
+        assert_eq!(lines.len(), 6, "{lines:?}");
+        assert_eq!(lines[3], "session: 019a1b2c-3d4e");
+        assert_eq!(lines[4], "unread alerts: 0");
+        assert_eq!(lines[5], "last turn usage: in=12 out=3 tokens (estimated)");
 
         // 非 native：kernel 行后是能力提示行，模型行给 (kernel default)
-        let codex = status_lines("codex", "test-model", path, Some(1), None);
-        assert_eq!(codex.len(), 6, "{codex:?}");
+        let codex = status_lines("codex", "test-model", path, None, Some(1), None);
+        assert_eq!(codex.len(), 7, "{codex:?}");
         assert_eq!(codex[0], "kernel: codex");
         assert_eq!(codex[1], kernel_note("codex").unwrap());
         assert_eq!(codex[2], "model: (kernel default)");
         assert_eq!(codex[3], "workspace: /tmp/ws");
-        assert_eq!(codex[4], "unread alerts: 1");
-        assert_eq!(codex[5], "last turn usage: -");
+        assert_eq!(codex[4], "session: new");
+        assert_eq!(codex[5], "unread alerts: 1");
+        assert_eq!(codex[6], "last turn usage: -");
+    }
+
+    /// banner 与 `/status` 共用的会话行取值：没有会话是 `new`，有就是 13 字符短 id。
+    #[test]
+    fn session_label_pins_new_and_the_thirteen_char_short_id() {
+        assert_eq!(session_label(None), "new");
+        assert_eq!(
+            session_label(Some("019a1b2c-3d4e-7f00-8000-000000000001")),
+            "019a1b2c-3d4e"
+        );
+        // 短于 13 字符的 id 原样返回（与 `short_id` 同一口径）
+        assert_eq!(session_label(Some("short")), "short");
     }
 
     /// Tab 补全：唯一前缀接受、歧义列出、`/kernel` 的取值候选、其它位置不动。

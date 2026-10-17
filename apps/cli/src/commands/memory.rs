@@ -209,6 +209,7 @@ mod tests {
             workspace: workspace.map(Path::to_path_buf),
             yes: false,
             unsafe_ops: false,
+            continue_session: false,
             command: None,
         }
     }

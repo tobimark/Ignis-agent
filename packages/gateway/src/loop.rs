@@ -404,6 +404,8 @@ async fn execute_run(
         kind: TaskKind::Schedule,
         workspace: PathBuf::from(&job.workspace),
         job_id: Some(job.id.clone()),
+        // 调度运行不绑会话：`tasks.session_id` 为 NULL（会话是 REPL 的交互上下文）
+        session_id: None,
     };
     // 事件流不渲染（JSONL 已落盘），sink 只是 `TaskRunner::run` 的必需通道
     let (sink, _events) = mpsc::unbounded_channel();

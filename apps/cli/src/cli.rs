@@ -38,6 +38,10 @@ pub struct Cli {
     #[arg(long = "unsafe", global = true)]
     pub unsafe_ops: bool,
 
+    /// 恢复本工作区最近一次会话（仅交互式 REPL）
+    #[arg(short = 'c', long = "continue", global = true)]
+    pub continue_session: bool,
+
     /// 无子命令时进入 REPL
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -229,11 +233,26 @@ pub struct AlertsCommand {
     pub read: bool,
 }
 
+/// `-c` 与任何子命令同用是用法错误：它是 REPL 专属开关，混用只会让人以为恢复对那条命令生效了
+/// （`dispatch` 顶部调用，`main` 打成 `error: …` 并给退出码 1）。
+pub fn reject_continue_with_subcommand(
+    command: Option<&Command>,
+    continue_session: bool,
+) -> Result<(), String> {
+    if continue_session && command.is_some() {
+        return Err("--continue only applies to the interactive REPL".to_string());
+    }
+    Ok(())
+}
+
 /// 解析参数后分发：错误一律经 `anyhow::Result` 上抛给 `main`。
 ///
 /// `--kernel` 的值域由 clap 把关、配置里的 `default_kernel` 由 [`commands::kernel::resolve_kernel`]
 /// 补齐并同样过白名单，两侧共用一份 [`KERNELS`]；内核可用性由 [`commands::Session::new`] 校验。
 pub async fn dispatch(cli: &Cli) -> Result<ExitCode> {
+    // 用法错误在任何子命令与 REPL 之前拦下（解析期 clap 管不了跨字段的约定）
+    reject_continue_with_subcommand(cli.command.as_ref(), cli.continue_session)
+        .map_err(anyhow::Error::msg)?;
     match &cli.command {
         Some(Command::Run { task }) => commands::run::run(cli, task).await,
         Some(Command::Task { command }) => commands::task::run(command),
@@ -298,6 +317,41 @@ mod tests {
         assert!(
             error.to_string().contains("native, codex, claude"),
             "{error}"
+        );
+    }
+
+    /// `-c` 的解析与守卫：单独用进 REPL；与任何子命令同用是用法错误（文案逐字钉住，
+    /// `main` 会打 `error:` 前缀并给退出码 1）。
+    #[test]
+    fn continue_flag_only_applies_to_the_repl() {
+        // 单独用：无子命令 → REPL；守卫放行
+        let repl = Cli::try_parse_from(["ignis", "-c"]).expect("-c 单独用应可解析");
+        assert!(repl.continue_session);
+        assert!(repl.command.is_none(), "无子命令才进 REPL");
+        assert!(
+            reject_continue_with_subcommand(repl.command.as_ref(), repl.continue_session).is_ok()
+        );
+
+        // 长写法是同一个开关
+        let long = Cli::try_parse_from(["ignis", "--continue"]).expect("--continue 应可解析");
+        assert!(long.continue_session);
+        assert!(long.command.is_none());
+
+        // 与子命令同用：解析照常通过（守卫在分发期），守卫给出人话错误
+        let mixed = Cli::try_parse_from(["ignis", "-c", "run", "x"]).expect("-c 与子命令应可解析");
+        assert!(mixed.continue_session);
+        assert!(mixed.command.is_some());
+        assert_eq!(
+            reject_continue_with_subcommand(mixed.command.as_ref(), mixed.continue_session)
+                .unwrap_err(),
+            "--continue only applies to the interactive REPL"
+        );
+
+        // 不带 -c 的子命令：守卫放行
+        let plain = Cli::try_parse_from(["ignis", "run", "x"]).expect("普通调用应可解析");
+        assert!(!plain.continue_session);
+        assert!(
+            reject_continue_with_subcommand(plain.command.as_ref(), plain.continue_session).is_ok()
         );
     }
 }

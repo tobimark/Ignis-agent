@@ -16,7 +16,6 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow, bail};
 use ignis_core::config::ignis_home;
 use ignis_core::task::TaskKind;
-use ignis_runtime::ChatMessage;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -57,19 +56,22 @@ impl LineReader for StdinReader {
     }
 }
 
-/// REPL banner：固定 4 行（版本号跟 `CARGO_PKG_VERSION` 联动，不写死字面量），有未读告警时追加第 5 行。
+/// REPL banner：固定 5 行（版本号跟 `CARGO_PKG_VERSION` 联动，不写死字面量），有未读告警时追加第 6 行。
 ///
 /// 第 4 行是运行时就绪度：技能目录条数 + active 事实数（0 也照实显示 `Memory: 0 facts`——
-/// 记忆是「有就注入」的可选段，不是开关，不该在 banner 上显示成 `off`）。
+/// 记忆是「有就注入」的可选段，不是开关，不该在 banner 上显示成 `off`）。第 5 行是本会话的
+/// 会话行（`Session: new` 或 13 字符短 id，与 `/status` 共用 [`slash::session_label`]），
+/// `-c` 命中时不去 banner 之外再打一遍会话 id。
 ///
-/// 第 5 行只在有未读告警时出现（spec §6.1：启动时若有未读告警，顶部横幅提示）：`unread` 为
+/// 最后一行只在有未读告警时出现（spec §6.1：启动时若有未读告警，顶部横幅提示）：`unread` 为
 /// `Some(n)` 且 `n > 0` 时给 `⚠ {n} unread alerts — run \`ignis alerts\``；`None`（计数读失败，
-/// 调用方已打警告）与 `Some(0)` 都保持 4 行。
+/// 调用方已打警告）与 `Some(0)` 都保持 5 行。
 pub fn banner_lines(
     workspace: &Path,
     kernel: &str,
     skills: usize,
     memory: usize,
+    session: Option<&str>,
     unread_alerts: Option<usize>,
 ) -> Vec<String> {
     let mut lines = vec![
@@ -77,11 +79,17 @@ pub fn banner_lines(
         "● Ready".to_string(),
         format!("Workspace: {}", workspace.display()),
         format!("Runtime: {kernel} · Skills: {skills} · Memory: {memory} facts"),
+        format!("Session: {}", slash::session_label(session)),
     ];
     if let Some(count) = unread_alerts.filter(|count| *count > 0) {
         lines.push(format!("⚠ {count} unread alerts — run `ignis alerts`"));
     }
     lines
+}
+
+/// `-c` 未命中「本工作区最近一次会话」时的提示行（英文 chrome，逐字钉住）。
+pub fn no_session_note() -> &'static str {
+    "note: no previous session in this workspace; starting a new one"
 }
 
 /// 回退按行输入时的一行说明（英文 chrome；`reason` 来自 [`choose_reader`] 的第二个返回值）。
@@ -141,6 +149,16 @@ pub async fn run(cli: &Cli) -> Result<ExitCode> {
     }
 
     let mut session = Session::new(cli)?;
+    // `-c`：装载本工作区最近一次会话。命中时 banner 的 Session 行带短 id（不另打一行）；
+    // 没有会话打一行 note。读取失败是硬错误——用户点名要恢复，静默起步新会话会让人以为历史还在。
+    if cli.continue_session
+        && session
+            .resume_latest()
+            .map_err(anyhow::Error::msg)?
+            .is_none()
+    {
+        println!("{}", no_session_note());
+    }
     // 计数来自会话里那份存储/技能目录（与运行器同一份），读库失败只退回 0 facts
     // 与「不打未读行」（各自已打一行警告）
     let (skills, memory) = session.banner_counts();
@@ -150,12 +168,13 @@ pub async fn run(cli: &Cli) -> Result<ExitCode> {
         session.kernel(),
         skills,
         memory,
+        session.current_session(),
         unread,
     ) {
         println!("{line}");
     }
     // 选定非 native 内核时能力提示行跟着 banner 一起给出（`/kernel` 切换时是同一份文案）；
-    // native 不加任何行——启动屏的形状保持 4 行（有未读告警时 5 行）
+    // native 不加任何行——启动屏的形状保持 5 行（有未读告警时 6 行）
     if let Some(note) = kernel_note(session.kernel()) {
         println!("{note}");
     }
@@ -178,10 +197,10 @@ pub async fn run(cli: &Cli) -> Result<ExitCode> {
 }
 
 /// REPL 主循环：读取 → 本地分类 → 命令分发 / 任务；返回值原样交回 [`run`]。
+///
+/// 跨轮上下文归 [`Session`]（`run_task` 成功后换成 `outcome.messages`，`-c` 恢复时装库里的
+/// 有效历史）——这里只负责读行与分发，不再自己攒一份 `history`。
 async fn repl_loop(session: &mut Session, reader: Arc<dyn LineReader>) -> Result<ExitCode> {
-    // 跨轮上下文：每次任务结束后换成 `outcome.messages`，内核只带回了最终答复
-    let mut history: Vec<ChatMessage> = Vec::new();
-
     loop {
         // 空闲期：Ctrl-C 退出。任务运行中的 Ctrl-C 由 `run_task` 自己的监听任务处理
         let idle = CancellationToken::new();
@@ -218,10 +237,7 @@ async fn repl_loop(session: &mut Session, reader: Arc<dyn LineReader>) -> Result
                 Err(error) => eprintln!("error: {error}"),
             },
             Parsed::Task(prompt) => {
-                let outcome = session
-                    .run_task(prompt, history.clone(), TaskKind::Repl)
-                    .await?;
-                history = outcome.messages;
+                session.run_task(prompt, TaskKind::Repl).await?;
                 // 轮次之间空一行：上一轮的结束行与下一轮的提示符不至于粘在一起
                 // （`ignis run` 是一锤子买卖，不补这一行）
                 println!();
@@ -310,8 +326,8 @@ mod tests {
     }
 
     #[test]
-    fn banner_is_the_four_locked_lines() {
-        let lines = banner_lines(Path::new("/tmp/ws"), "native", 3, 2, None);
+    fn banner_is_the_five_locked_lines() {
+        let lines = banner_lines(Path::new("/tmp/ws"), "native", 3, 2, None, None);
 
         assert_eq!(
             lines,
@@ -321,6 +337,7 @@ mod tests {
                 "● Ready".to_string(),
                 "Workspace: /tmp/ws".to_string(),
                 "Runtime: native · Skills: 3 · Memory: 2 facts".to_string(),
+                "Session: new".to_string(),
             ]
         );
         assert!(lines.contains(&"● Ready".to_string()), "{lines:?}");
@@ -328,30 +345,68 @@ mod tests {
 
     #[test]
     fn banner_counts_zero_facts_instead_of_turning_memory_off() {
-        let lines = banner_lines(Path::new("/tmp/ws"), "native", 5, 0, None);
+        let lines = banner_lines(Path::new("/tmp/ws"), "native", 5, 0, None, None);
 
         assert_eq!(lines[3], "Runtime: native · Skills: 5 · Memory: 0 facts");
         assert!(!lines[3].contains("off"), "{lines:?}");
     }
 
-    /// 未读告警：有就追加第 5 行（点名条数与下一步命令），没有（0 或计数读失败）保持 4 行。
+    /// 会话行：banner 第 5 行，`Session: new` 或 13 字符短 id（与任务短 id 同一 helper）；
+    /// 有未读告警时它的下标往后挪一位（告警行才排第六）。
+    #[test]
+    fn banner_appends_the_session_line_before_the_alerts() {
+        // 没有会话（还没跑过任务 / `-c` 未命中）：`Session: new`
+        let fresh = banner_lines(Path::new("/tmp/ws"), "native", 3, 2, None, None);
+        assert_eq!(fresh.len(), 5, "{fresh:?}");
+        assert_eq!(fresh[4], "Session: new");
+
+        // 有会话：13 字符短 id
+        let session_id = "019a1b2c-3d4e-7f00-8000-000000000001";
+        let resumed = banner_lines(Path::new("/tmp/ws"), "native", 3, 2, Some(session_id), None);
+        assert_eq!(resumed[4], "Session: 019a1b2c-3d4e");
+
+        // 有未读告警：会话行仍在第 5 行，告警行被挤到第 6 行
+        let alerting = banner_lines(
+            Path::new("/tmp/ws"),
+            "native",
+            3,
+            2,
+            Some(session_id),
+            Some(4),
+        );
+        assert_eq!(alerting.len(), 6, "{alerting:?}");
+        assert_eq!(alerting[4], "Session: 019a1b2c-3d4e");
+        assert_eq!(alerting[5], "⚠ 4 unread alerts — run `ignis alerts`");
+    }
+
+    /// `-c` 未命中时的提示行逐字钉住。
+    #[test]
+    fn no_session_note_is_pinned() {
+        assert_eq!(
+            no_session_note(),
+            "note: no previous session in this workspace; starting a new one"
+        );
+    }
+
+    /// 未读告警：有就追加一行（点名条数与下一步命令），没有（0 或计数读失败）保持五行的常规形状。
     #[test]
     fn banner_appends_an_unread_alerts_line_only_when_there_are_some() {
-        let lines = banner_lines(Path::new("/tmp/ws"), "native", 3, 2, Some(4));
-        assert_eq!(lines.len(), 5, "{lines:?}");
-        assert_eq!(lines[4], "⚠ 4 unread alerts — run `ignis alerts`");
-        // 前四行不受影响
+        let lines = banner_lines(Path::new("/tmp/ws"), "native", 3, 2, None, Some(4));
+        assert_eq!(lines.len(), 6, "{lines:?}");
+        assert_eq!(lines[5], "⚠ 4 unread alerts — run `ignis alerts`");
+        // 前四行不受影响，会话行仍在第 5 行
         assert_eq!(lines[3], "Runtime: native · Skills: 3 · Memory: 2 facts");
+        assert_eq!(lines[4], "Session: new");
 
-        let quiet = banner_lines(Path::new("/tmp/ws"), "native", 3, 2, Some(0));
-        assert_eq!(quiet.len(), 4, "{quiet:?}");
+        let quiet = banner_lines(Path::new("/tmp/ws"), "native", 3, 2, None, Some(0));
+        assert_eq!(quiet.len(), 5, "{quiet:?}");
         assert!(
             !quiet.iter().any(|line| line.contains("unread")),
             "{quiet:?}"
         );
 
         // 计数读失败（`None`，调用方已打警告）：跳过那一行，banner 形状不变
-        let failed = banner_lines(Path::new("/tmp/ws"), "native", 3, 2, None);
+        let failed = banner_lines(Path::new("/tmp/ws"), "native", 3, 2, None, None);
         assert_eq!(failed, quiet, "读失败与「没有未读」对用户是同一屏");
     }
 }

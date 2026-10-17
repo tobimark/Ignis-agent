@@ -25,6 +25,7 @@ use ignis_core::alerts::{MultiNotifier, Notifier};
 use ignis_core::config::{Config, OutputMode, ensure_home, ignis_home, load_config};
 use ignis_core::memory::MemoryStore;
 use ignis_core::security::{ApprovalMode, Policy};
+use ignis_core::session::SessionStore;
 use ignis_core::skills::SkillCatalog;
 use ignis_core::task::{TaskKind, TaskOutcome, TaskRequest, TaskRunner};
 use ignis_runtime::{ApprovalHandler, ChatMessage, RunStatus, Usage};
@@ -71,6 +72,11 @@ pub struct Session {
     /// 会话级模型覆盖（`/model <name>`）：只在 native 内核上生效，也不写回配置文件；
     /// `None` 表示照配置里的 `model.model` 走。
     model_override: Option<String>,
+    /// 跨轮 canonical 上下文（从 `repl_loop` 搬进来）：每轮成功后换成运行器交回的
+    /// `outcome.messages`，运行器返回 `Err` 时不动。
+    history: Vec<ChatMessage>,
+    /// 本进程已绑定的会话 id（懒创建）：`None` = 还没有会话行，首个 REPL 任务才落库。
+    current_session: Option<String>,
     /// 最近一轮任务的用量（`/status` 的 `last turn usage` 行）：`None` = 本会话还没跑过任务。
     last_usage: Option<Usage>,
     /// 本会话是否已经做过自拉起提示（每会话至多一次，REPL 跨轮次共享）。
@@ -186,6 +192,8 @@ impl Session {
             kernel: kernel.to_string(),
             output_mode,
             model_override: None,
+            history: Vec::new(),
+            current_session: None,
             last_usage: None,
             already_prompted: AtomicBool::new(false),
         })
@@ -251,6 +259,69 @@ impl Session {
     /// 最近一轮任务的用量（`/status` 的 `last turn usage` 行）：本会话还没跑过任务时是 `None`。
     pub fn last_usage(&self) -> Option<&Usage> {
         self.last_usage.as_ref()
+    }
+
+    /// 当前会话 id（banner 与 `/status` 的 Session 行读它）：本进程还没落过会话行时是 `None`。
+    pub fn current_session(&self) -> Option<&str> {
+        self.current_session.as_deref()
+    }
+
+    /// 跨轮 canonical 上下文：每轮成功后是运行器交回的 `outcome.messages`，`-c` 恢复后是
+    /// 库里读出的有效历史。
+    pub fn history(&self) -> &[ChatMessage] {
+        &self.history
+    }
+
+    /// 本会话有没有 Ignis 自己的凭据（native 的起步门槛；外部内核用各自 CLI 的凭据）。
+    pub fn has_credentials(&self) -> bool {
+        self.config.api_key.is_some()
+    }
+
+    /// 会话存储：与任务库共用同一个 `Arc<Db>`，只是每次按需包一层薄封装。
+    pub(crate) fn store(&self) -> SessionStore {
+        SessionStore::new(Arc::clone(&self.db))
+    }
+
+    /// 首个 REPL 任务：懒创建会话行（标题 = 首条用户消息）并记住 id；已有会话直接返回。
+    ///
+    /// 错误只交回人话文本（调用方 fail-soft：警告一行、本轮不绑会话，任务照跑）。
+    /// `model` 只在 native 时落库：外部内核用各自的默认模型，Ignis 这边的模型名对它们没有意义。
+    fn ensure_session(&mut self, prompt: &str) -> Result<String, String> {
+        if let Some(id) = &self.current_session {
+            return Ok(id.clone());
+        }
+        let model = self.is_native().then(|| self.model().to_string());
+        let record = self
+            .store()
+            .create_session(&self.workspace, &self.kernel, model.as_deref(), prompt)
+            .map_err(|error| error.to_string())?;
+        self.current_session = Some(record.id.clone());
+        Ok(record.id)
+    }
+
+    /// `-c`：装载本工作区最近一次会话的有效历史并设为当前会话；没有会话给 `Ok(None)`。
+    ///
+    /// 命中时清掉最近用量（Task 6 起连 `last_prompt_stats` 一起清）：那是上一段运行的观察值，
+    /// 恢复后 `last turn usage` 行应显示 `-` 而不是旧值。未命中什么都不改。
+    pub fn resume_latest(&mut self) -> Result<Option<usize>, String> {
+        let store = self.store();
+        let Some(record) = store
+            .latest_for_workspace(&self.workspace)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        let history = store
+            .effective_history(&record.id)
+            .map_err(|error| error.to_string())?;
+        let count = history.len();
+        self.current_session = Some(record.id);
+        self.history = history
+            .into_iter()
+            .map(|message| message.to_chat_message())
+            .collect();
+        self.last_usage = None;
+        Ok(Some(count))
     }
 
     /// 当前内核是不是主路径的 native（`/model` 的能力分档与 `/status` 的模型行看它）。
@@ -323,18 +394,30 @@ impl Session {
     /// 因此 `/kernel` 的切换只影响后续任务。本轮配置由 [`Session::effective_config`] 给出
     /// （native 的会话级模型覆盖在这里生效）。渲染选项每轮重算：模式来自会话状态（`/details`
     /// 切过就按新的来），颜色/主题/宽度来自 `config.ui` + stdout 的 tty 状态（宽度每轮探测一次
-    /// 终端）。结束后先 `finish()` 冲刷挂起内容再打结束行，随后把本轮用量记进会话
-    /// （`/status` 的 `last turn usage` 行读它），再按本轮事件决定要不要提示自拉起守护进程。
+    /// 终端）。结束后先 `finish()` 冲刷挂起内容再打结束行，随后把本轮用量与上下文记进会话
+    /// （`/status` 与下一轮内核都读它们），最后按本轮事件决定要不要提示自拉起守护进程。
     /// 监听任务必须随本次运行结束，否则 REPL 会攒下一串永远不会触发的监听器。
+    ///
+    /// 会话接线（REPL 轮次）：先懒创建会话（首个任务落一行），`TaskRequest.session_id` 带上它；
+    /// 运行结束后把 canonical 的 `user + assistant` 追加进 `session_messages`。两处写库失败都是
+    /// fail-soft：只打一行 `warning: session write failed: …`，本轮照跑、上下文照常推进——
+    /// 写库失败不该把一轮对话丢掉。`TaskKind::Run`（`ignis run`）不建会话、不追加。
     ///
     /// 审批提示是审批层对 stdout 的直接写入（不经渲染器），异步管线下它与工具行的硬写序做不到
     /// ——记为已知限制，P2/P5 单一写者时收口。
-    pub async fn run_task(
-        &mut self,
-        prompt: String,
-        history: Vec<ChatMessage>,
-        kind: TaskKind,
-    ) -> Result<TaskOutcome> {
+    pub async fn run_task(&mut self, prompt: String, kind: TaskKind) -> Result<TaskOutcome> {
+        // REPL 轮次先懒创建会话：失败只警告一行，本轮不绑会话照跑（见上文的 fail-soft 口径）
+        let session_id = match kind {
+            TaskKind::Repl => match self.ensure_session(&prompt) {
+                Ok(id) => Some(id),
+                Err(error) => {
+                    eprintln!("warning: session write failed: {error}");
+                    None
+                }
+            },
+            TaskKind::Run | TaskKind::Schedule => None,
+        };
+
         // 本轮配置：native 的会话级模型覆盖在这里生效（外部内核用各自的默认模型）
         let config = self.effective_config();
         let runtime =
@@ -377,12 +460,14 @@ impl Session {
         // 任务中转。`run` 返回后再把已经入队的剩余事件排干（通道随 sink 析构关闭）。
         let run = runner.run(
             TaskRequest {
-                prompt,
-                history,
+                prompt: prompt.clone(),
+                history: self.history.clone(),
                 kind,
                 workspace: self.workspace.clone(),
                 // 交互运行没有来源 job（调度运行由守护进程填 job.id）
                 job_id: None,
+                // REPL 轮次绑会话；`ignis run` 与调度运行不绑（迁移 004 的关联列）
+                session_id: session_id.clone(),
             },
             sink,
             cancel,
@@ -407,8 +492,18 @@ impl Session {
         renderer.finish();
 
         let outcome = result?;
-        // 记本轮用量：`/status` 的 `last turn usage` 行读它（失败/触限的运行也有用量）
+        // 运行成功才换跨轮上下文与最近用量：运行器返回 `Err` 时 `history` 保持原样（本轮没跑成）
+        self.history = outcome.messages.clone();
         self.last_usage = Some(outcome.usage);
+        // 轮次落库：只追加 REPL 的一轮（user + 有最终答复时的 assistant），写库失败 fail-soft
+        if kind == TaskKind::Repl
+            && let Some(session_id) = session_id.as_deref()
+            && let Err(error) =
+                self.store()
+                    .append_turn(session_id, &prompt, outcome.final_text.as_deref())
+        {
+            eprintln!("warning: session write failed: {error}");
+        }
         println!(
             "{}",
             format_task_end(
@@ -512,17 +607,30 @@ pub(crate) mod fixtures {
     }
 
     /// 两个会话夹具共用的装配体：配置由调用方给（其余字段只求「可实现」）。
-    /// 会话级状态的初值与 [`Session::new`] 一致：输出模式取自配置、模型无覆盖、没有用量。
+    /// 会话级状态的初值与 [`Session::new`] 一致：输出模式取自配置、模型无覆盖、没有用量、
+    /// 没有历史与会话 id（`run_task` 懒创建）。
     pub(crate) fn session_fixture_with_config(
         label: &str,
         kernel: &str,
         config: Config,
     ) -> (TempDir, Session) {
         let dir = TempDir::new(label);
-        let home = dir.path().to_path_buf();
+        let session = build_session(dir.path(), kernel, config);
+        (dir, session)
+    }
+
+    /// 同一个 home 上的又一个最小会话（调用方负责让 home 活着）：`-c` 的恢复用例要先跑一轮、
+    /// 再起一个指向同一份库的会话，空 home 用例则直接拿它当「新进程」。
+    pub(crate) fn session_at_home(home: &Path, kernel: &str, config: Config) -> Session {
+        build_session(home, kernel, config)
+    }
+
+    /// 会话夹具的装配体：临时 home/工作区 + 空记忆与技能目录，绝不碰真实 `~/.ignis`。
+    fn build_session(home: &Path, kernel: &str, config: Config) -> Session {
+        let home = home.to_path_buf();
         let db = Arc::new(Db::open(&home.join("ignis.db")).unwrap());
         let output_mode = config.ui.output_mode;
-        let session = Session {
+        Session {
             home: home.clone(),
             workspace: home.clone(),
             db: Arc::clone(&db),
@@ -538,8 +646,9 @@ pub(crate) mod fixtures {
             output_mode,
             model_override: None,
             last_usage: None,
-        };
-        (dir, session)
+            history: Vec::new(),
+            current_session: None,
+        }
     }
 }
 
@@ -548,8 +657,11 @@ mod tests {
     use std::fs;
 
     use ignis_core::config::{ColorChoice, OutputMode, Theme, UiConfig};
+    use ignis_runtime::test_support::{ScriptStep, ScriptedModel, ScriptedModelHandle};
 
-    use super::fixtures::{keyless_session_fixture, session_fixture};
+    use super::fixtures::{
+        keyless_session_fixture, session_at_home, session_fixture, session_fixture_with_config,
+    };
     use super::*;
     use crate::commands::kernel::fixtures::{TempDir, set_executable};
 
@@ -814,5 +926,180 @@ mod tests {
             no_color_value(Some(OsString::from("1"))).as_deref(),
             Some("1")
         );
+    }
+
+    /// 指向脚本化假模型的 native 配置：`run_task` 真的会走一遍 native 内核（HTTP → SSE），
+    /// 不是挂钩的假内核（本 crate 是二进制，没有注入运行器的接缝）。
+    fn scripted_config(model: &ScriptedModelHandle) -> Config {
+        Config {
+            api_key: Some("test-key".into()),
+            model: ignis_runtime::ModelConfig {
+                base_url: model.base_url(),
+                model: "test-model".into(),
+                ..ignis_runtime::ModelConfig::default()
+            },
+            ..Config::default()
+        }
+    }
+
+    /// 无脚本模型的最小配置（只恢复历史、不跑任务的用例用它）。
+    fn plain_config() -> Config {
+        Config {
+            api_key: Some("test-key".into()),
+            ..Config::default()
+        }
+    }
+
+    /// REPL 的一轮：懒创建会话（标题 = 首条用户消息）、轮次按 canonical 口径追加
+    /// （user + assistant）、跨轮历史与 `tasks.session_id` 都对上。
+    #[tokio::test]
+    async fn run_task_creates_the_session_and_appends_the_turn() {
+        let model = ScriptedModel::start(vec![ScriptStep::Text("答复一".into())]);
+        let (dir, mut session) =
+            session_fixture_with_config("session-create", "native", scripted_config(&model));
+        assert_eq!(
+            session.current_session(),
+            None,
+            "懒创建：没跑任务时没有会话行"
+        );
+        assert!(session.history().is_empty());
+
+        let outcome = session
+            .run_task("你好".into(), TaskKind::Repl)
+            .await
+            .expect("脚本化模型应答应成功");
+        assert_eq!(outcome.final_text.as_deref(), Some("答复一"));
+
+        // sessions 恰好一行：title 是首条用户消息，工作区/内核/模型都照会话记
+        let session_id = session
+            .current_session()
+            .expect("首个 REPL 任务应建会话")
+            .to_string();
+        let rows = session.store().list_for_workspace(dir.path(), 10).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let record = &rows[0].session;
+        assert_eq!(record.id, session_id);
+        assert_eq!(record.title, "你好");
+        assert_eq!(record.workspace, dir.path().display().to_string());
+        assert_eq!(record.kernel, "native");
+        assert_eq!(record.model.as_deref(), Some("test-model"));
+
+        // session_messages 恰好两条：user + assistant（canonical 口径）
+        let messages = session.db().session_messages_from(&session_id, 1).unwrap();
+        let actual: Vec<(&str, &str)> = messages
+            .iter()
+            .map(|message| (message.role.as_str(), message.content.as_str()))
+            .collect();
+        assert_eq!(actual, [("user", "你好"), ("assistant", "答复一")]);
+
+        // 跨轮上下文：本轮 messages 原样接进会话；最近用量来自本轮
+        assert_eq!(session.history().len(), 2);
+        assert_eq!(session.history()[0].content, "你好");
+        assert_eq!(session.history()[1].content, "答复一");
+        assert_eq!(
+            session.last_usage().map(|usage| usage.input_tokens),
+            Some(12),
+            "脚本化模型上报 12/3"
+        );
+
+        // 任务行绑到会话上
+        let task = session.db().get_task(&outcome.id).unwrap().expect("任务行");
+        assert_eq!(task.session_id.as_deref(), Some(session_id.as_str()));
+
+        // 假模型真的收到了这一轮的 user 消息
+        let requests = model.requests();
+        assert_eq!(requests.len(), 1);
+        let sent = requests[0]["messages"].as_array().unwrap();
+        assert!(
+            sent.iter()
+                .any(|message| message["role"] == "user" && message["content"] == "你好"),
+            "{sent:#?}"
+        );
+    }
+
+    /// `TaskKind::Run`（`ignis run`）是一次性运行：不建会话、不追加轮次，任务行的
+    /// `session_id` 为 NULL。
+    #[tokio::test]
+    async fn run_task_is_one_shot_for_taskkind_run() {
+        let model = ScriptedModel::start(vec![ScriptStep::Text("答复".into())]);
+        let (dir, mut session) =
+            session_fixture_with_config("session-one-shot", "native", scripted_config(&model));
+
+        let outcome = session
+            .run_task("一次跑完".into(), TaskKind::Run)
+            .await
+            .expect("一次性运行应成功");
+
+        assert_eq!(session.current_session(), None, "一次性运行不建会话");
+        assert!(
+            session
+                .store()
+                .list_for_workspace(dir.path(), 10)
+                .unwrap()
+                .is_empty(),
+            "sessions 表必须是空的"
+        );
+        let task = session.db().get_task(&outcome.id).unwrap().expect("任务行");
+        assert_eq!(task.session_id, None, "一次性运行不绑会话");
+        assert_eq!(task.kind, "run");
+    }
+
+    /// R2 fail-soft：会话写库失败不丢轮次——建不出会话照跑（本轮不绑会话），
+    /// 失败只落一行 `warning: session write failed: …`（stderr 由进程边界观察，这里钉行为）。
+    #[tokio::test]
+    async fn run_task_survives_a_broken_session_store() {
+        let model = ScriptedModel::start(vec![ScriptStep::Text("答复".into())]);
+        let (_dir, mut session) =
+            session_fixture_with_config("session-broken", "native", scripted_config(&model));
+        // 会话表被删（库损坏 / 迁移中途失败）：`ensure_session` 必失败
+        session
+            .db()
+            .with_conn(|conn| conn.execute_batch("DROP TABLE sessions"))
+            .unwrap();
+
+        let outcome = session
+            .run_task("写库坏了也要跑".into(), TaskKind::Repl)
+            .await
+            .expect("建不出会话不该把这一轮丢掉");
+
+        assert_eq!(outcome.status, RunStatus::Success);
+        assert_eq!(session.current_session(), None, "建不出会话就没有会话可绑");
+        assert_eq!(session.history().len(), 2, "跨轮上下文照常推进");
+        let task = session.db().get_task(&outcome.id).unwrap().expect("任务行");
+        assert_eq!(task.session_id, None);
+    }
+
+    /// `-c` 的装载：命中本工作区最近会话 → 设当前会话、有效历史接进 `history`、清掉最近用量，
+    /// 返回条数；空工作区什么都不改、给 `None`。
+    #[tokio::test]
+    async fn resume_latest_loads_the_newest_workspace_session() {
+        let model = ScriptedModel::start(vec![ScriptStep::Text("答复一".into())]);
+        let (dir, mut session) =
+            session_fixture_with_config("session-resume", "native", scripted_config(&model));
+        session
+            .run_task("你好".into(), TaskKind::Repl)
+            .await
+            .expect("先跑一轮把会话落库");
+        let expected = session.history().to_vec();
+
+        // 同一个 home / 同一工作区的又一个会话（等价于进程重启后的 `Session::new`）
+        let mut resumed = session_at_home(dir.path(), "native", plain_config());
+        assert_eq!(resumed.current_session(), None, "恢复前本进程还没有会话");
+        assert_eq!(resumed.resume_latest().unwrap(), Some(2));
+        assert!(resumed.current_session().is_some());
+        assert_eq!(resumed.history(), expected.as_slice(), "有效历史逐条相等");
+        assert_eq!(resumed.last_usage(), None);
+
+        // 恢复也重置最近用量：同进程里再恢复一次，跑过那一轮的旧观察值必须回落
+        assert!(session.last_usage().is_some(), "跑过一轮后有用量");
+        assert_eq!(session.resume_latest().unwrap(), Some(2));
+        assert_eq!(session.last_usage(), None);
+
+        // 空 home：没有会话，什么都不改
+        let empty = TempDir::new("session-resume-empty");
+        let mut fresh = session_at_home(empty.path(), "native", plain_config());
+        assert_eq!(fresh.resume_latest().unwrap(), None);
+        assert_eq!(fresh.current_session(), None);
+        assert!(fresh.history().is_empty());
     }
 }

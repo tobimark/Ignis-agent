@@ -63,6 +63,9 @@ pub struct TaskRequest {
     /// 来源调度任务 id：守护进程的调度运行填 `job.id`（透传给本轮工具的
     /// [`crate::tools::ToolCtx::job_id`]，`notify_user` 的 provenance 靠它）；交互运行为 `None`。
     pub job_id: Option<String>,
+    /// 本次任务所属的会话（REPL 轮次填 `Session` 当前会话 id）：落进 `tasks.session_id`；
+    /// `ignis run` 与调度运行为 `None`（不绑会话）。
+    pub session_id: Option<String>,
 }
 
 /// 一次任务的结果；`messages` 即下一轮应当带上的上下文（末尾的 assistant 消息与
@@ -187,9 +190,9 @@ impl TaskRunner {
             kernel: kernel.to_string(),
             workspace: workspace.display().to_string(),
             started_at: now_millis(),
-            // 会话关联列（迁移 004）：本次只落存储层，`TaskRequest` 还没有 `session_id`
-            // （`ignis run` 与调度运行不绑会话，写 None 与既有行为一致）
-            session_id: None,
+            // 会话关联列（迁移 004）：REPL 轮次由命令层填当前会话 id；`ignis run` 与调度
+            // 运行不绑会话（`None`）
+            session_id: req.session_id.clone(),
         })?;
 
         // 任务行已落库：此后任何基础设施失败（含事件循环里的落盘失败）都要先把这一行收成
@@ -371,6 +374,9 @@ impl TaskRunner {
             RunStatus::Success => summary.clone(),
             _ => None,
         };
+        // 技能列在收尾前单独写（`finish_task` 是 P1 钉死的形状，签名与调用点都不动；空表写
+        // NULL——展示面靠 `None` 判「没记」）。失败走 `run` 的 `fail_infrastructure` 兜底。
+        self.db.set_task_skills_used(task_id, &skills_used)?;
         self.db.finish_task(
             task_id,
             status.as_str(),
@@ -665,6 +671,7 @@ mod tests {
                 kind: TaskKind::Run,
                 workspace: workspace.to_path_buf(),
                 job_id: None,
+                session_id: None,
             }
         }
 
@@ -1605,6 +1612,46 @@ mod tests {
         assert_eq!(report.outcome.skills_used, ["server-health"]);
     }
 
+    /// tasks 的关联列（迁移 004）：`TaskRequest.session_id` 一路落进 `tasks.session_id`；
+    /// `skills_used` 在 `finish_task` 之前由 `set_task_skills_used` 写入（逗号分隔，空表写 NULL）。
+    #[tokio::test]
+    async fn task_row_carries_the_session_id_and_the_skills_used() {
+        let env = Env::new(
+            "row-session-skills",
+            vec![
+                tool_exec("load_skill", json!({ "name": "my-skill" })),
+                success(Some("done")),
+            ],
+            None,
+        );
+
+        let mut req = env.request("用技能干活");
+        req.session_id = Some("019a1b2c-3d4e-7f00-8000-000000000001".into());
+        let report = env.run(req).await;
+
+        let row = env
+            .db
+            .get_task(&report.outcome.id)
+            .unwrap()
+            .expect("任务行");
+        assert_eq!(
+            row.session_id.as_deref(),
+            Some("019a1b2c-3d4e-7f00-8000-000000000001")
+        );
+        assert_eq!(row.skills_used.as_deref(), Some("my-skill"));
+
+        // 不带 session_id、也没加载技能的一次性运行：两列都是 None（「不绑会话 / 没记过」）
+        let plain = Env::new("row-session-plain", vec![success(Some("done"))], None);
+        let report = plain.run(plain.request("一次跑完")).await;
+        let row = plain
+            .db
+            .get_task(&report.outcome.id)
+            .unwrap()
+            .expect("任务行");
+        assert_eq!(row.session_id, None);
+        assert_eq!(row.skills_used, None);
+    }
+
     /// 端到端：`TaskRunner` 构造期注入的记录型渠道必须真的收到 `notify_user` 的投递；
     /// 调度运行（`TaskRequest.job_id`）的来源 job id 一路透传到 `ToolCtx` 与告警来源。
     ///
@@ -1665,6 +1712,7 @@ mod tests {
                     kind: TaskKind::Schedule,
                     workspace: dir.path().to_path_buf(),
                     job_id: Some("job-7".into()),
+                    session_id: None,
                 },
                 sink,
                 CancellationToken::new(),
