@@ -5,7 +5,9 @@
 //! - **工具调用只出现在交互审批那一例**（[`pty_interactive_approval_prompt_works_under_the_editor`]）：
 //!   pty 里 stdin 是 tty，带工具调用的脚本会走交互审批提问——别的用例一律纯文本步，免得把
 //!   审批输出混进要断言的流里；
-//! - **home/workspace 都建在用例自己的 `TempDir` 里**，绝不碰真实的 `~/.ignis`；
+//! - **home/workspace 都建在用例自己的 `TempDir` 里**，绝不碰真实的 `~/.ignis`；两条要跨进程 /
+//!   跨轮次看库的用例（`-c` 恢复、`/compact`）经 [`spawn_repl_in`] 在同一份目录上再起进程，并
+//!   直读同一份 `home` 下的 `ignis.db` 钉住库里的现场（[`common::read_session_messages`] 一组）；
 //! - **假模型句柄持有到用例结束**：`ScriptedModelHandle::drop` 停服务，`Pty::drop` 杀子进程
 //!   （用例不主动退出 REPL 的那几条靠它收尾）；
 //! - **打字前先等提示符**：raw mode 生效之前，`\r` 会被行规范译成 `\n`（Enter 变成「插换行」），
@@ -27,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use common::TempDir;
 use common::pty::{PTY_TIMEOUT, Pty, PtyOptions};
+use common::{read_session_compactions, read_session_messages, read_sessions};
 use ignis_runtime::test_support::{ScriptStep, ScriptedModel, ScriptedModelHandle};
 use serde_json::{Value, json};
 
@@ -48,22 +51,40 @@ fn spawn_repl_with_env(
 ) -> (Pty, TempDir, ScriptedModelHandle) {
     let model = ScriptedModel::start(script);
     let dir = TempDir::new(label);
+    let pty = spawn_repl_in_with_env(&dir, &model, &[], env);
+    (pty, dir, model)
+}
+
+/// 在**既有**目录上起一个 REPL：home/workspace 与假模型句柄都由调用方给，`args` 原样交给 CLI
+/// （传 `&["-c"]` 就是恢复路径）。
+///
+/// 拆出这一层是为了让「同一份 home/workspace 跑两个进程」的用例（`-c` 恢复：第一个进程跑一轮退出、
+/// 第二个进程接着上一段会话）复用同一份装配；[`spawn_repl`] 与 [`spawn_repl_with_env`] 走的也是
+/// 它，既有用例的装配行为逐字不变。
+fn spawn_repl_in(dir: &TempDir, model: &ScriptedModelHandle, args: &[&str]) -> Pty {
+    spawn_repl_in_with_env(dir, model, args, &[])
+}
+
+/// [`spawn_repl_in`] 的环境覆盖变体：`env` 逐项盖掉夹具的默认取值。
+fn spawn_repl_in_with_env(
+    dir: &TempDir,
+    model: &ScriptedModelHandle,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> Pty {
     let home = dir.join("home");
     let workspace = dir.join("workspace");
     // home 由 CLI 自己建（0700），工作区必须预先存在：CLI 启动时会校验它是目录
     fs::create_dir_all(&workspace).expect("工作区应可创建");
 
-    let pty = Pty::spawn(&PtyOptions {
+    Pty::spawn(&PtyOptions {
         home: &home,
         workspace: &workspace,
         base_url: &model.base_url(),
-        // 无子命令 = 交互式 REPL
-        args: &[],
+        args,
         // 默认环境（模型地址、密钥、NO_COLOR、TERM）由夹具注入
         env,
-    });
-
-    (pty, dir, model)
+    })
 }
 
 /// 请求体里最后一条 user 消息的正文（REPL 把整段输入行原样交给内核）。
@@ -77,6 +98,22 @@ fn last_user_message(request: &Value) -> &str {
         .find(|message| message["role"] == "user")
         .and_then(|message| message["content"].as_str())
         .expect("请求里应有一条带正文的 user 消息")
+}
+
+/// 请求体里去掉 `role == "system"` 之后的消息数组（保留 JSON 形态，便于与 `json!` 整段比对）。
+///
+/// 恢复与压缩两条用例的判据都是「内核看到的消息序列」：system（本机提示词）逐轮重算，与这两条
+/// 断言的契约无关，先从序列里摘掉。
+fn messages_without_system(request: &Value) -> Value {
+    Value::Array(
+        request["messages"]
+            .as_array()
+            .expect("请求体里的 messages 应为数组")
+            .iter()
+            .filter(|message| message["role"] != "system")
+            .cloned()
+            .collect(),
+    )
 }
 
 /// 等 `needle` 出现在 `marker` **最后一次出现之后**：`Pty::expect` 每次从流头重扫，用已经出现过的串
@@ -520,4 +557,175 @@ fn pty_interactive_approval_prompt_works_under_the_editor() {
     wait_for_prompt_after(&pty, "● Done");
     pty.send("\x04");
     assert_eq!(pty.wait(), 0, "Ctrl-D 应以 0 退出：\n{}", pty.output());
+}
+
+/// `-c` 恢复：第一个进程跑完一轮就退出，第二个进程用 `-c` 起在**同一份 home/workspace** 上；
+/// 后续一轮送进模型的消息必须带着上一轮的 user/assistant 两条（恢复判据：模型真的看到了它们）。
+///
+/// 两个进程共用一个假模型句柄（脚本按请求顺序消耗）：第一轮答复「答复一」、第二轮「答复二」。
+#[test]
+fn pty_continue_restores_the_previous_turn_for_the_model() {
+    let model = ScriptedModel::start(vec![
+        ScriptStep::Text("答复一".to_string()),
+        ScriptStep::Text("答复二".to_string()),
+    ]);
+    let dir = TempDir::new("pty-continue");
+
+    // 第一个进程：一轮任务（会话行与 user/assistant 两条消息落库）后 Ctrl-D 干净退出
+    let mut first = spawn_repl_in(&dir, &model, &[]);
+    first.expect("❯ ");
+    first.send("第一句\r");
+    first.expect("答复一");
+    wait_for_prompt_after(&first, "● Done");
+    first.send("\x04");
+    assert_eq!(first.wait(), 0, "Ctrl-D 应以 0 退出：\n{}", first.output());
+    drop(first); // 已收尸：关掉这个 pty，下面在同一份目录上另起一个进程
+
+    // 第二个进程：`-c` 命中本工作区最近一次会话，banner 第 5 行是 `Session: {短 id}`；未命中才会
+    // 打「本工作区没有上一段会话」的 note（note 写在 banner 之前，所以看到 banner 就能断言它没出现）
+    let mut second = spawn_repl_in(&dir, &model, &["-c"]);
+    second.expect("Session: ");
+    let banner = second.output();
+    assert!(
+        !banner.contains("note: no previous session"),
+        "-c 未命中上一轮的会话（只有未命中才会打 note）：\n{banner}"
+    );
+
+    second.expect("❯ ");
+    second.send("第二句\r");
+    second.expect("答复二");
+
+    let requests = wait_for_requests(&model, 2);
+    assert_eq!(requests.len(), 2, "两个进程各跑一轮：{requests:#?}");
+    // 第一个进程是全新会话：请求里只有本轮输入（「恢复」的证据不能来自「第一轮就带历史」）
+    assert_eq!(
+        messages_without_system(&requests[0]),
+        json!([{"role": "user", "content": "第一句"}]),
+        "第一个进程不该带任何历史：{:#?}",
+        requests[0]["messages"]
+    );
+    // 恢复判据：去掉 system 之后逐条是「上一轮 user/assistant + 本轮 user」
+    assert_eq!(
+        messages_without_system(&requests[1]),
+        json!([
+            {"role": "user", "content": "第一句"},
+            {"role": "assistant", "content": "答复一"},
+            {"role": "user", "content": "第二句"},
+        ]),
+        "恢复后模型必须看到上一轮的两条消息：{:#?}",
+        requests[1]["messages"]
+    );
+
+    wait_for_prompt_after(&second, "答复二");
+    second.send("\x04");
+    assert_eq!(
+        second.wait(),
+        0,
+        "Ctrl-D 应以 0 退出：\n{}",
+        second.output()
+    );
+}
+
+/// `/compact`：三轮任务后压缩较早轮次——库里原始消息一条不少、压缩记录恰好一行，第四轮送进
+/// 模型的是「摘要消息 + 保留的两轮 + 本轮输入」。
+///
+/// 脚本按顺序消耗：三轮任务的答复、摘要请求的正文（第 4 步）、第四轮的答复。
+#[test]
+fn pty_compact_summarizes_and_keeps_the_raw_rows() {
+    let model = ScriptedModel::start(vec![
+        ScriptStep::Text("一".to_string()),
+        ScriptStep::Text("二".to_string()),
+        ScriptStep::Text("三".to_string()),
+        ScriptStep::Text("早前对话摘要".to_string()),
+        ScriptStep::Text("答复四".to_string()),
+    ]);
+    let dir = TempDir::new("pty-compact");
+    let mut pty = spawn_repl_in(&dir, &model, &[]);
+
+    // 三轮任务：答复正文（「一」「二」「三」）是下一句提示词的子串，不能拿来当位置标记；结束行
+    // 「● Done」在上一轮就出现过。两处断言都只认**本轮输入行之后**新写出的输出。
+    pty.expect("❯ ");
+    for (turn, prompt) in [(1_usize, "第一句"), (2, "第二句"), (3, "第三句")] {
+        pty.send(&format!("{prompt}\r"));
+        expect_after(&pty, prompt, "● Done");
+        // 请求在答复之前就已送达模型（假模型先记账再响应），等编辑器重新接管提示符时必然已入账
+        wait_for_prompt_after(&pty, "● Done");
+        assert_eq!(
+            model.requests().len(),
+            turn,
+            "第 {turn} 轮应已送出一份请求：{:#?}",
+            model.requests()
+        );
+    }
+
+    // `/compact`：第 4 步脚本被摘要请求消耗；回显行钉住「进入摘要段 2 条」与摘要的**字符**数（6）
+    pty.send("/compact\r");
+    pty.expect("compacted: 2 messages → summary (6 chars)");
+    // 压缩期间终端是 canonical：等编辑器重新接管提示符（回显行之后）才能发第四句
+    wait_for_prompt_after(&pty, "compacted: 2 messages");
+
+    // 直读库（只读用例自己 TempDir 下的 home）：压缩只落一行记录，原始消息行一条不少、不被改写
+    let db_path = dir.join("home").join("ignis.db");
+    let sessions = read_sessions(&db_path, &dir.join("workspace"));
+    assert_eq!(sessions.len(), 1, "本工作区应只有一条会话：{sessions:#?}");
+    assert_eq!(
+        sessions[0].1, "第一句",
+        "标题应是首条用户消息（会话行确实来自这一段对话）：{sessions:#?}"
+    );
+    let session_id = &sessions[0].0;
+    let mut expected_rows: Vec<(i64, String, String)> = vec![
+        (1, "user".to_string(), "第一句".to_string()),
+        (2, "assistant".to_string(), "一".to_string()),
+        (3, "user".to_string(), "第二句".to_string()),
+        (4, "assistant".to_string(), "二".to_string()),
+        (5, "user".to_string(), "第三句".to_string()),
+        (6, "assistant".to_string(), "三".to_string()),
+    ];
+    assert_eq!(
+        read_session_messages(&db_path, session_id),
+        expected_rows,
+        "压缩后原始消息仍该是 6 行、逐字未被改写"
+    );
+    let compactions = read_session_compactions(&db_path, session_id);
+    assert_eq!(compactions.len(), 1, "压缩记录恰好一行：{compactions:#?}");
+    assert_eq!(
+        compactions[0].1, 2,
+        "upto_seq 应是第一轮 assistant 的 seq：{compactions:#?}"
+    );
+    assert_eq!(
+        compactions[0].2, "早前对话摘要",
+        "行里存的摘要正文应是模型给出的那一份：{compactions:#?}"
+    );
+
+    // 第四轮：模型看到的是「摘要消息（前缀 + 摘要正文）+ 保留的第二/第三轮四条 + 本轮输入」
+    pty.send("第四句\r");
+    let requests = wait_for_requests(&model, 5);
+    assert_eq!(requests.len(), 5, "三轮 + 摘要 + 第四轮：{requests:#?}");
+    assert_eq!(
+        messages_without_system(&requests[4]),
+        json!([
+            {"role": "user", "content": "[Earlier conversation summary]\n\n早前对话摘要"},
+            {"role": "user", "content": "第二句"},
+            {"role": "assistant", "content": "二"},
+            {"role": "user", "content": "第三句"},
+            {"role": "assistant", "content": "三"},
+            {"role": "user", "content": "第四句"},
+        ]),
+        "压缩后的请求应是摘要 + 保留的两轮 + 本轮输入：{:#?}",
+        requests[4]["messages"]
+    );
+
+    pty.expect("答复四");
+    wait_for_prompt_after(&pty, "答复四");
+    pty.send("\x04");
+    assert_eq!(pty.wait(), 0, "Ctrl-D 应以 0 退出：\n{}", pty.output());
+
+    // 第四轮也只往原始表追加（seq 7/8）：被压缩的前缀一条不少地留在库里
+    expected_rows.push((7, "user".to_string(), "第四句".to_string()));
+    expected_rows.push((8, "assistant".to_string(), "答复四".to_string()));
+    assert_eq!(
+        read_session_messages(&db_path, session_id),
+        expected_rows,
+        "第四轮之后原始消息只增不减、seq 续写"
+    );
 }

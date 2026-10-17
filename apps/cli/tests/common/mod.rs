@@ -152,6 +152,69 @@ pub fn read_job_runs(
     rows.map(|row| row.expect("运行行应可读取")).collect()
 }
 
+/// 某个工作区最近的会话行，按 `updated_at` 降序（同刻按 id 升序）：`(id, title)`。
+///
+/// 直读 `sessions`：`/compact` 的 pty 用例要在进程之外反查会话 id（终端那一侧只有短 id），
+/// 「本工作区只有一条会话」这条前提也由它钉住。工作区字符串按 [`Path::display`] 的口径给出，
+/// 与 CLI 落库时（`SessionStore::create_session`）的转换一致。
+pub fn read_sessions(db_path: &Path, workspace: &Path) -> Vec<(String, String)> {
+    let conn = rusqlite::Connection::open(db_path).expect("会话表应可直读");
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, title FROM sessions WHERE workspace = ?1
+             ORDER BY updated_at DESC, id ASC",
+        )
+        .expect("会话查询应可编译");
+    let rows = stmt
+        .query_map([workspace.display().to_string()], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .expect("会话查询应可执行");
+    rows.map(|row| row.expect("会话行应可读取")).collect()
+}
+
+/// 某个会话的全部 canonical 消息行，按 `seq` 升序：`(seq, role, content)`。
+///
+/// 直读 `session_messages`，**不**走有效历史（`SessionStore::effective_history`）：`/compact`
+/// 用例要断言的正是「原始行一条不少、内容不被改写」——有效历史是重建出来的视图，会把被压缩的
+/// 前缀藏起来，读路径的过滤正好挡住这条断言。
+pub fn read_session_messages(db_path: &Path, session_id: &str) -> Vec<(i64, String, String)> {
+    let conn = rusqlite::Connection::open(db_path).expect("会话消息表应可直读");
+    let mut stmt = conn
+        .prepare(
+            "SELECT seq, role, content FROM session_messages
+             WHERE session_id = ?1 ORDER BY seq ASC",
+        )
+        .expect("会话消息查询应可编译");
+    let rows = stmt
+        .query_map([session_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .expect("会话消息查询应可执行");
+    rows.map(|row| row.expect("会话消息行应可读取")).collect()
+}
+
+/// 某个会话的压缩记录，按 id 升序：`(id, upto_seq, summary)`。
+///
+/// 直读 `session_compactions`：`/compact` 用例断言「恰好落了一行、上界是第一轮 assistant 的
+/// `seq`、摘要正文就是模型给出的那一份」，而读路径只暴露最新一条（`latest_compaction`），
+/// 行数与落库现场都看不到。
+pub fn read_session_compactions(db_path: &Path, session_id: &str) -> Vec<(i64, i64, String)> {
+    let conn = rusqlite::Connection::open(db_path).expect("压缩表应可直读");
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, upto_seq, summary FROM session_compactions
+             WHERE session_id = ?1 ORDER BY id ASC",
+        )
+        .expect("压缩查询应可编译");
+    let rows = stmt
+        .query_map([session_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .expect("压缩查询应可执行");
+    rows.map(|row| row.expect("压缩行应可读取")).collect()
+}
+
 /// 在 `dir` 里跑 `npm test`，返回退出状态（输出丢弃，断言只看退出码）。
 pub fn run_npm_test(dir: &Path) -> ExitStatus {
     Command::new("npm")
