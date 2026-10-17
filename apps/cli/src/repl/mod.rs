@@ -1,17 +1,20 @@
 //! 无子命令时的交互式 REPL：banner、提示词、斜杠命令（[`crate::commands::slash`]）与逐行任务。
 //!
-//! 输入读取走 [`LineReader`] 这一层薄接口：[`StdinReader`] 只做「写提示词 + 读一行」，
-//! 将来换成 rustyline（历史与行编辑）只需要在这里加一个实现，REPL 主循环不用动。
+//! 输入读取走 [`LineReader`] 这一层薄接口：终端能承载转义重绘时用行编辑器
+//! （[`crate::editor::reader::EditorLineReader`]：多行、历史、Tab 补全），否则回退 [`StdinReader`]
+//! ——v0.1 的按行输入。REPL 主循环只依赖这一层，不关心背后是谁。
 //!
 //! 分类只走 `slash::parse` 一条路：空行跳过、`/…` 是本地命令（未知命令只在本地报错，**不送模型**）、
 //! 其余是任务。
 
+use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
+use ignis_core::config::ignis_home;
 use ignis_core::task::TaskKind;
 use ignis_runtime::ChatMessage;
 use tokio::sync::oneshot;
@@ -20,6 +23,8 @@ use tokio_util::sync::CancellationToken;
 use crate::cli::Cli;
 use crate::commands::slash::{self, Dispatch, Parsed};
 use crate::commands::{Session, kernel_note, spawn_ctrl_c_watcher};
+use crate::editor::raw::RawMode;
+use crate::editor::reader::EditorLineReader;
 
 /// 提示词（固定文案）。
 const PROMPT: &str = "❯ ";
@@ -78,6 +83,51 @@ pub fn banner_lines(
     lines
 }
 
+/// 回退按行输入时的一行说明（英文 chrome；`reason` 来自 [`choose_reader`] 的第三个返回值）。
+pub fn fallback_note(reason: &str) -> String {
+    format!("note: line editing unavailable ({reason}); using plain line input")
+}
+
+/// 选读取层：终端能承载转义重绘就用行编辑器，否则回退 v0.1 的按行输入。
+///
+/// 返回 `(读取层, raw mode 守卫, 回退理由)`：编辑器那条路给守卫、理由为空；回退那条路没有守卫、
+/// 理由非空（调用方用 [`fallback_note`] 打印它）。**守卫由调用方持有**，理由见 [`run`] 里的说明。
+pub fn choose_reader(
+    history_path: PathBuf,
+) -> (Arc<dyn LineReader>, Option<RawMode>, Option<String>) {
+    choose_reader_with(
+        history_path,
+        std::env::var_os("TERM").as_deref(),
+        RawMode::enable,
+    )
+}
+
+/// 带 `TERM` 与 termios 注入的变体（与 `raw::RawMode::supported` 同一手法）：用例因此不必改进程
+/// 环境、也不必真的 tty（测试可并行）。
+fn choose_reader_with(
+    history_path: PathBuf,
+    term: Option<&OsStr>,
+    enable: impl FnOnce() -> io::Result<RawMode>,
+) -> (Arc<dyn LineReader>, Option<RawMode>, Option<String>) {
+    // 哑终端（`TERM` 缺失、空串或 `dumb`）上转义重绘会把屏幕打花：宁可少功能，直接回退
+    if !RawMode::supported(term) {
+        return (
+            Arc::new(StdinReader),
+            None,
+            Some("TERM is dumb".to_string()),
+        );
+    }
+    match enable() {
+        Ok(guard) => (
+            Arc::new(EditorLineReader::new(history_path)),
+            Some(guard),
+            None,
+        ),
+        // termios 进不去（不是 tty、已关闭）：理由就是错误本身，整句由 `fallback_note` 拼
+        Err(error) => (Arc::new(StdinReader), None, Some(error.to_string())),
+    }
+}
+
 /// 启动 REPL；stdin 不是 tty 时拒绝启动（脚本/管道请用 `ignis run`）。
 pub async fn run(cli: &Cli) -> Result<ExitCode> {
     if !io::stdin().is_terminal() {
@@ -104,7 +154,18 @@ pub async fn run(cli: &Cli) -> Result<ExitCode> {
         println!("{note}");
     }
 
-    let reader: Arc<dyn LineReader> = Arc::new(StdinReader);
+    // 读取层：终端能承载转义重绘就用行编辑器（历史落在 `IGNIS_HOME`/history，目录已由 `Session::new`
+    // 里的 `ensure_home` 建好），否则回退 v0.1 的按行输入并说明一句。
+    //
+    // **guard 必须留在本函数里**：每次读取都在 `next_line` 起的脱离线程里跑，线程持有一份
+    // `Arc<dyn LineReader>` 克隆；把守卫放进读取层的话，它会跟着那份克隆卡在阻塞读里永不析构
+    // ——用户退出后回到 shell 会没有回显。放在这里则 `run` 的每一条退出路径（`?` 提前返回、
+    // 空闲 Ctrl-C、Ctrl-D、`/exit`）都会析构它、把 termios 原样还原。
+    let (reader, _raw_guard, fallback) = choose_reader(ignis_home().join("history"));
+    if let Some(reason) = fallback.as_deref() {
+        println!("{}", fallback_note(reason));
+    }
+
     // 跨轮上下文：每次任务结束后换成 `outcome.messages`，内核只带回了最终答复
     let mut history: Vec<ChatMessage> = Vec::new();
 
@@ -172,9 +233,53 @@ async fn next_line(reader: Arc<dyn LineReader>) -> Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+    use std::io;
     use std::path::Path;
 
     use super::*;
+
+    /// 回退时的一行说明逐字钉住（英文 chrome，理由来自选读取层的判定）。
+    #[test]
+    fn fallback_note_is_pinned() {
+        assert_eq!(
+            fallback_note("TERM is dumb"),
+            "note: line editing unavailable (TERM is dumb); using plain line input"
+        );
+    }
+
+    /// `TERM` 缺失 / `dumb` / 空：不碰 termios，回退 v0.1 的按行输入并给理由。
+    #[test]
+    fn choose_reader_falls_back_when_term_is_dumb() {
+        // 回退路径根本不碰历史，这里只是给一个不指向真实 `~/.ignis` 的占位路径
+        let history = std::env::temp_dir().join("ignis-cli-repl-fallback-history");
+
+        for term in [None, Some(OsStr::new("dumb")), Some(OsStr::new(""))] {
+            let (_reader, guard, reason) =
+                choose_reader_with(history.clone(), term, RawMode::enable);
+            assert!(guard.is_none(), "{term:?} 不该进 raw mode");
+            let reason = reason.expect("回退必须给理由");
+            assert_eq!(reason, "TERM is dumb");
+            assert_eq!(
+                fallback_note(&reason),
+                "note: line editing unavailable (TERM is dumb); using plain line input"
+            );
+        }
+    }
+
+    /// termios 进不去 raw mode（不是 tty、已关闭）：同样回退，理由取错误的文本。
+    #[test]
+    fn choose_reader_falls_back_when_termios_fails() {
+        let history = std::env::temp_dir().join("ignis-cli-repl-termios-history");
+        let (_reader, guard, reason) = choose_reader_with(
+            history,
+            Some(OsStr::new("xterm-256color")),
+            || -> io::Result<RawMode> { Err(io::Error::other("不是 tty")) },
+        );
+
+        assert!(guard.is_none(), "进不去 raw mode 就不能用编辑器");
+        assert_eq!(reason.as_deref(), Some("不是 tty"));
+    }
 
     #[test]
     fn banner_is_the_four_locked_lines() {
