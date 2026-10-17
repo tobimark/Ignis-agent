@@ -1086,7 +1086,7 @@ mod tests {
             "{lines:?}"
         );
 
-        // 三条新条目的「名 + 参数提示」与描述逐字；`/resume <id>` 的 11 列参与组内对齐
+        // 三条新条目的「名 + 参数提示」与描述逐字；`/resume <id>` 的 12 列参与组内对齐
         let session = lines
             .iter()
             .position(|line| line == "SESSION")

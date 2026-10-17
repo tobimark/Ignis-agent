@@ -198,8 +198,9 @@ impl SessionStore {
                     role: Role::User,
                     content: summary_message(&compaction.summary),
                 });
-                // 摘要覆盖到 `upto_seq`，有效历史从它的下一条原始消息继续
-                compaction.upto_seq + 1
+                // 摘要覆盖到 `upto_seq`，有效历史从它的下一条原始消息继续（饱和加：正常
+                // `upto_seq` 是 ≥1 的 seq，饱和只在异常数据上兜底，绝不 panic）
+                compaction.upto_seq.saturating_add(1)
             }
             // 没压缩过：`seq` 从 1 起连续，等价于「全部消息」
             None => 1,
@@ -429,7 +430,10 @@ fn role_of(role: &str) -> Option<Role> {
 }
 
 /// 摘要消息的正文：前缀 + 空行 + 摘要（与 `/compact` 重建内存历史时的逐字格式一致）。
-fn summary_message(summary: &str) -> String {
+///
+/// 导出给命令层：`/compact` 重建内存历史时用同一份拼法，有效历史（[`SessionStore::effective_history`]）
+/// 与内存视图因此逐字对得上。
+pub fn summary_message(summary: &str) -> String {
     format!("{EARLIER_SUMMARY_PREFIX}\n\n{summary}")
 }
 
@@ -442,8 +446,10 @@ mod tests {
 
     use ignis_runtime::native::NativeRuntime;
     use ignis_runtime::openai::OpenAiClient;
-    use ignis_runtime::test_support::{ScriptStep, ScriptedModel, ScriptedModelHandle};
-    use ignis_runtime::{ModelConfig, Role, Runtime};
+    use ignis_runtime::test_support::{
+        MockRuntime, ScriptStep, ScriptedModel, ScriptedModelHandle,
+    };
+    use ignis_runtime::{ModelConfig, Role, RunStatus, Runtime, RuntimeEvent};
     use ignis_storage::{Db, NewSession, NewSessionMessage, now_millis};
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
@@ -1205,6 +1211,70 @@ mod tests {
                 .to_string()
                 .starts_with("compact: summarization failed: "),
             "{error}"
+        );
+    }
+
+    /// 摘要正文全空白（模型只发了空白）→ `EmptySummary`：没有可落库的摘要，不落一段空白。
+    #[tokio::test]
+    async fn summarize_turns_rejects_a_whitespace_only_summary() {
+        let model = ScriptedModel::start(vec![ScriptStep::Text("   \n\t ".into())]);
+        let config = scripted_config(&model);
+
+        let error = summarize_turns(
+            native_runtime(&config),
+            &config,
+            "user: 你好",
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("全空白的正文不算摘要");
+        assert!(matches!(error, SessionError::EmptySummary), "{error:?}");
+        assert_eq!(error.to_string(), "compact: summarization returned no text");
+    }
+
+    /// 流结束却没有 `Done`（内核实现缺陷）→ 固定的人话错误，不静默落半截正文。
+    #[tokio::test]
+    async fn summarize_turns_reports_a_stream_that_ends_without_a_status() {
+        let runtime = MockRuntime::new(vec![RuntimeEvent::TextDelta {
+            text: "半截".into(),
+        }]);
+
+        let error = summarize_turns(
+            runtime,
+            &Config::default(),
+            "user: 你好",
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("没有终态的流必须报错");
+        assert!(matches!(error, SessionError::Summarize(_)), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "compact: summarization failed: model stream ended without a final status"
+        );
+    }
+
+    /// `Done{Failed}` 的内核原因原样透传进 `Summarize` 的展示文本（不吞、不改写）。
+    #[tokio::test]
+    async fn summarize_turns_passes_the_failure_reason_through() {
+        let runtime = MockRuntime::new(vec![RuntimeEvent::Done {
+            status: RunStatus::Failed,
+            summary: None,
+            error: Some("failure message".into()),
+        }]);
+
+        let error = summarize_turns(
+            runtime,
+            &Config::default(),
+            "user: 你好",
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("失败的模型不该给出摘要");
+        assert!(matches!(error, SessionError::Summarize(_)), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "compact: summarization failed: failure message"
         );
     }
 

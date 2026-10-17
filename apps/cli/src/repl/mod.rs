@@ -233,15 +233,24 @@ async fn repl_loop(session: &mut Session, reader: Arc<dyn LineReader>) -> Result
                     }
                 }
                 // `/compact` 是唯一需要模型往返的命令：分发只交回意图，这里 `await` 真正的执行
-                // （成功打 stdout；错误与命令自己的错误同形，打到 stderr）
-                Ok(Dispatch::Compact) => match session.compact().await {
-                    Ok(lines) => {
-                        for line in lines {
-                            println!("{line}");
+                // （成功打 stdout；错误与命令自己的错误同形，打到 stderr）。执行期间挂与任务轮次
+                // 同款的 Ctrl-C 监听：取消令牌传进摘要请求，Ctrl-C 能当场中止（内核收成
+                // `Done{Aborted}`，`Session::compact` 交回 `error: compact: summarization failed:
+                // aborted` 且不改状态）；执行结束（无论成败）立刻收掉监听任务。
+                Ok(Dispatch::Compact) => {
+                    let cancel = CancellationToken::new();
+                    let watcher = spawn_ctrl_c_watcher(cancel.clone());
+                    let compacted = session.compact(cancel).await;
+                    watcher.abort();
+                    match compacted {
+                        Ok(lines) => {
+                            for line in lines {
+                                println!("{line}");
+                            }
                         }
+                        Err(error) => eprintln!("error: {error}"),
                     }
-                    Err(error) => eprintln!("error: {error}"),
-                },
+                }
                 // 命令自己的错误（内核名非法、取值不对、尚未实现的命令）打到 stderr，
                 // 与 `main` 的错误行同形
                 Err(error) => eprintln!("error: {error}"),

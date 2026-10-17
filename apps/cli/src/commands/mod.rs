@@ -26,8 +26,8 @@ use ignis_core::config::{Config, OutputMode, ensure_home, ignis_home, load_confi
 use ignis_core::memory::MemoryStore;
 use ignis_core::security::{ApprovalMode, Policy, Redactor};
 use ignis_core::session::{
-    COMPACT_KEEP_TURNS, EARLIER_SUMMARY_PREFIX, HistoryMessage, SessionStore, render_transcript,
-    split_turns, summarize_turns,
+    COMPACT_KEEP_TURNS, HistoryMessage, SessionStore, render_transcript, split_turns,
+    summarize_turns, summary_message,
 };
 use ignis_core::skills::SkillCatalog;
 use ignis_core::task::{PromptStats, TaskKind, TaskOutcome, TaskRequest, TaskRunner};
@@ -442,12 +442,15 @@ impl Session {
     ///    清掉组装统计（下一次组装会重算；用量保持最近一轮的真实值），返回回显行。
     ///
     /// 切分读的是 `store().effective_history(id)`——库里的 canonical 视图：某一轮的 append 被
-    /// fail-soft 跳过时，内存历史可能比库里更富，压缩**有意**以这份持久化视图为准重建，否则切点算错
-    /// 会让恢复后读到的历史与压缩时的不一致（内存里的富余消息会被下一次成功落库补齐）。
+    /// fail-soft 跳过时，内存历史可能比库里更富，压缩**有意**以这份持久化视图为准重建——重建
+    /// 会把内存历史整体换成库里的 durable 视图（内存里未落库的富余消息随之消失，没有别处再
+    /// 补齐），否则切点算错会让恢复后读到的历史与压缩时的不一致。
     ///
-    /// 模型失败 → `Err`（REPL 打 `error: …`）且**不改任何状态**：不落 compaction、不动 `history`；
-    /// `session_messages` 的原始行**永不删除**——有效历史只是重建出来的视图。
-    pub async fn compact(&mut self) -> Result<Vec<String>, String> {
+    /// 摘要请求带调用方给的取消令牌（REPL 在 `Dispatch::Compact` 期间挂 Ctrl-C 监听）：内核因
+    /// 取消收成 `Done{Aborted}` 时按 `compact: summarization failed: aborted` 交回 `Err`。
+    /// 失败（含取消）→ `Err`（REPL 打 `error: …`）且**不改任何状态**：不落 compaction、不动
+    /// `history`；`session_messages` 的原始行**永不删除**——有效历史只是重建出来的视图。
+    pub async fn compact(&mut self, cancel: CancellationToken) -> Result<Vec<String>, String> {
         // 1. 摘要要用一次 native 请求：外置内核与没有 Ignis 凭据的会话都不具备
         if !self.is_native() || !self.has_credentials() {
             return Err(
@@ -477,20 +480,22 @@ impl Session {
         let config = self.effective_config();
         let transcript = self.redactor().redact(&render_transcript(&older));
         let runtime = mk_runtime(NATIVE_KERNEL, &config, &self.workspace)?;
-        let summary = summarize_turns(runtime, &config, &transcript, CancellationToken::new())
+        // 取消令牌直达摘要请求：Ctrl-C → 内核 `Done{Aborted}` → `Summarize("aborted")`，
+        // 由下面的 `map_err` 收成 `compact: summarization failed: aborted`，状态零变化。
+        let summary = summarize_turns(runtime, &config, &transcript, cancel)
             .await
             .map_err(|error| error.to_string())?;
         let summary = self.redactor().redact(&summary);
 
         // 成功才动状态：先落库（重建视图的起点），再把内存历史换成「摘要消息 + 保留段」。
-        // 摘要消息的正文用与 `effective_history` 同一份常量拼法（脱敏后的摘要文本）。
+        // 摘要消息的正文用与 `effective_history` 同一份拼法（脱敏后的摘要文本）。
         self.store()
             .record_compaction(&id, upto_seq, &summary)
             .map_err(|error| error.to_string())?;
         let mut history = Vec::with_capacity(retained.len() + 1);
         history.push(ChatMessage {
             role: Role::User,
-            content: format!("{EARLIER_SUMMARY_PREFIX}\n\n{summary}"),
+            content: summary_message(&summary),
             tool_call_id: None,
             tool_calls: Vec::new(),
         });
@@ -1314,6 +1319,62 @@ mod tests {
         assert_eq!(task.session_id, None);
     }
 
+    /// R2 fail-soft（终审补齐的 append 路径）：会话行已经建过，只有 `append_turn` 的落库失败
+    /// （这里把 `session_messages` 整表删掉）——这一轮照样成功、跨轮历史照常推进，只留一行
+    /// `warning: session write failed`；不 panic、不把对话丢掉。
+    #[tokio::test]
+    async fn run_task_survives_a_broken_session_messages_table() {
+        let model = ScriptedModel::start(vec![
+            ScriptStep::Text("答复一".into()),
+            ScriptStep::Text("答复二".into()),
+        ]);
+        let (_dir, mut session) = session_fixture_with_config(
+            "session-messages-broken",
+            "native",
+            scripted_config(&model),
+        );
+
+        // 第一轮正常：会话行与两条 canonical 消息都落库
+        session
+            .run_task("第一句".into(), TaskKind::Repl)
+            .await
+            .expect("第一轮应成功");
+        let session_id = session
+            .current_session()
+            .expect("首个 REPL 任务应建会话")
+            .to_string();
+        assert_eq!(
+            session
+                .db()
+                .session_messages_from(&session_id, 1)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // `session_messages` 表没了（库损坏 / 迁移中途失败）：此后只可能是 append 这一步失败
+        session
+            .db()
+            .with_conn(|conn| conn.execute_batch("DROP TABLE session_messages"))
+            .unwrap();
+        assert!(
+            session.db().session_messages_from(&session_id, 1).is_err(),
+            "表删掉后读消息必须失败（证明破坏生效）"
+        );
+
+        // 第二轮：append 落库失败照跑，历史照常推进（user + assistant 各加一条）
+        let outcome = session
+            .run_task("第二句".into(), TaskKind::Repl)
+            .await
+            .expect("写库坏了也不该把这一轮丢掉");
+        assert_eq!(outcome.status, RunStatus::Success);
+        assert_eq!(outcome.final_text.as_deref(), Some("答复二"));
+        assert_eq!(session.history().len(), 4, "跨轮上下文照常推进");
+        assert_eq!(session.history()[2].content, "第二句");
+        assert_eq!(session.history()[3].content, "答复二");
+        assert_eq!(session.current_session(), Some(session_id.as_str()));
+    }
+
     /// `-c` 的装载：命中本工作区最近会话 → 设当前会话、有效历史接进 `history`、清掉最近用量，
     /// 返回条数；空工作区什么都不改、给 `None`。
     #[tokio::test]
@@ -1464,7 +1525,7 @@ mod tests {
         // codex（外置内核）：凭据错误逐字
         let (_dir, mut codex) = session_fixture("compact-codex", "codex");
         assert_eq!(
-            codex.compact().await.unwrap_err(),
+            codex.compact(CancellationToken::new()).await.unwrap_err(),
             "compact requires native kernel credentials (current kernel does not provide them)"
         );
         assert_eq!(codex.current_session(), None, "失败的压缩不动会话指针");
@@ -1474,7 +1535,7 @@ mod tests {
         assert!(keyless.is_native());
         assert!(!keyless.has_credentials());
         assert_eq!(
-            keyless.compact().await.unwrap_err(),
+            keyless.compact(CancellationToken::new()).await.unwrap_err(),
             "compact requires native kernel credentials (current kernel does not provide them)"
         );
 
@@ -1482,7 +1543,7 @@ mod tests {
         let (_dir, mut fresh) = session_fixture("compact-no-session", "native");
         assert!(fresh.has_credentials());
         assert_eq!(
-            fresh.compact().await.unwrap_err(),
+            fresh.compact(CancellationToken::new()).await.unwrap_err(),
             "compact: no session yet"
         );
     }
@@ -1508,7 +1569,7 @@ mod tests {
         let before = session.history().to_vec();
 
         let lines = session
-            .compact()
+            .compact(CancellationToken::new())
             .await
             .expect("「没有可压的」是回显，不是错误");
         assert_eq!(lines, ["compact: nothing to compact"]);
@@ -1547,7 +1608,10 @@ mod tests {
         });
 
         let summary = "早前对话摘要";
-        let lines = session.compact().await.expect("脚本化模型应给出摘要");
+        let lines = session
+            .compact(CancellationToken::new())
+            .await
+            .expect("脚本化模型应给出摘要");
         let chars = summary.chars().count();
         assert_eq!(chars, 6, "按字符计（按字节是 18）");
         assert_eq!(
@@ -1630,7 +1694,10 @@ mod tests {
         let (_dir, mut session) = session_fixture_with_config("compact-redacted", "native", config);
         let id = session_with_three_turns(&mut session, "compact-redacted");
 
-        let lines = session.compact().await.expect("脚本化模型应给出摘要");
+        let lines = session
+            .compact(CancellationToken::new())
+            .await
+            .expect("脚本化模型应给出摘要");
 
         // 落库的摘要、重建后的历史与库里的有效历史视图三处都只有脱敏文本
         let latest = session
@@ -1675,7 +1742,7 @@ mod tests {
         let id = session_with_three_turns(&mut session, "compact-second");
 
         assert_eq!(
-            session.compact().await.unwrap(),
+            session.compact(CancellationToken::new()).await.unwrap(),
             [format!(
                 "compacted: 2 messages → summary ({} chars)",
                 "第一份摘要".chars().count()
@@ -1683,7 +1750,7 @@ mod tests {
         );
         // 二次压缩：有效历史 = [摘要(seq 2), 第二句, 答复二, 第三句, 答复三]，
         // 倒数第二条 user 是「第二句」——比它更早的只有上一份摘要
-        let lines = session.compact().await.unwrap();
+        let lines = session.compact(CancellationToken::new()).await.unwrap();
         assert_eq!(
             lines,
             [format!(
@@ -1743,7 +1810,7 @@ mod tests {
         let before = session.history().to_vec();
         session.last_prompt_stats = Some(PromptStats::default());
 
-        let error = session.compact().await.unwrap_err();
+        let error = session.compact(CancellationToken::new()).await.unwrap_err();
         assert!(error.contains("compact: summarization failed"), "{error}");
 
         assert!(
@@ -1761,5 +1828,37 @@ mod tests {
             "失败的压缩不清组装统计"
         );
         assert_eq!(model.requests().len(), 1, "请求真的发过：失败来自内核");
+    }
+
+    /// I2（终审）：`/compact` 可中断——预取消的令牌让摘要请求在首轮请求前就中止（native 每轮
+    /// 预检直接给 `Done{Aborted}`），错误逐字是 `compact: summarization failed: aborted`，
+    /// 状态零变化、也不消耗模型。
+    #[tokio::test]
+    async fn compact_with_a_cancelled_token_fails_without_touching_state() {
+        // 空脚本：预取消时内核根本不该发起 HTTP 请求（真发了只会拿到 500）
+        let model = ScriptedModel::start(Vec::new());
+        let (_dir, mut session) =
+            session_fixture_with_config("compact-cancelled", "native", scripted_config(&model));
+        let id = session_with_three_turns(&mut session, "compact-cancelled");
+        let before = session.history().to_vec();
+        session.last_prompt_stats = Some(PromptStats::default());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let error = session.compact(cancel).await.unwrap_err();
+        assert_eq!(error, "compact: summarization failed: aborted");
+
+        assert!(
+            session.db().latest_compaction(&id).unwrap().is_none(),
+            "中止的压缩不落库"
+        );
+        assert_eq!(session.history(), before.as_slice(), "中止不动历史");
+        assert_eq!(
+            session.db().session_messages_from(&id, 1).unwrap().len(),
+            6,
+            "原始行一条不删"
+        );
+        assert!(session.last_prompt_stats().is_some(), "中止不清组装统计");
+        assert!(model.requests().is_empty(), "预取消不该消耗模型");
     }
 }
