@@ -7,9 +7,10 @@
 //!   「还可能是已知序列前缀」的字节留在 `pending` 里，下次 `feed` 拼上再解；攒过 [`MAX_PENDING`]
 //!   字节还解不出来就认定是垃圾串（比如永远等不到终结字节的 CSI），整体丢弃并报一个 [`Key::Other`]，
 //!   免得无限缓存。
-//! - **粘贴区间**：`\x1b[200~` 之后不再解释转义序列，只在字节流里找 `\x1b[201~`；区间内的控制
-//!   字节（含裸 `ESC`）丢弃、非控制字节按字面插入、`\r` 与 `\n` 合成一个 `Newline`——长粘贴是一段
-//!   任务文本，绝不能逐行提交（设计 §6.4、Review Focus 2）。
+//! - **粘贴区间**：`\x1b[200~` 之后不再解释转义序列，只在字节流里找 `\x1b[201~`；区间内的 Tab 按
+//!   字面插入（`Char('\t')`，制表符缩进的代码粘进来不能丢缩进），其余控制字节（C0 含裸 `ESC`、以及
+//!   DEL 0x7F）丢弃、非控制字节按字面插入、`\r` 与 `\n` 合成一个 `Newline`——长粘贴是一段任务文本，
+//!   绝不能逐行提交（设计 §6.4、Review Focus 2）。
 //! - **宽松解码**：非法 UTF-8 用替换字符顶上并置位，读取层用 [`Decoder::take_invalid`] 取走告警
 //!   （取走即清零，所以一次读取最多打印一次）。
 //!
@@ -32,7 +33,7 @@ const REPLACEMENT: char = '\u{fffd}';
 /// 一个按键。`Copy + Eq + Debug` 让状态机与测试都好写。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Key {
-    /// 一个可打印字符（按 UTF-8 解出来的一个字符）。
+    /// 一个字符（按 UTF-8 解出来的一个字符；粘贴区间里的 Tab 也是字面字符 `\t`）。
     Char(char),
     /// 回车（0x0D）：提交当前输入。
     Enter,
@@ -60,7 +61,7 @@ pub enum Key {
     CtrlU,
     /// Ctrl+C（0x03）。
     CtrlC,
-    /// Tab（0x09）。
+    /// Tab（0x09；粘贴区间里不产生它，那里按字面出 `Char('\t')`）。
     Tab,
     /// bracketed paste 开始（`\x1b[200~`）。
     PasteStart,
@@ -168,8 +169,8 @@ impl Decoder {
 
     /// 粘贴区间：不解释任何转义，只在字节流里找结束标记，其余按字面内容解。
     ///
-    /// 区间内除了 `\r`/`\n`（合成一个 `Newline`）与非法 UTF-8（替换字符）之外，
-    /// 控制字节（含裸 `ESC`）全部丢弃。
+    /// 区间内 `\r`/`\n` 合成一个 `Newline`、Tab 按字面插入（`Char('\t')`），其余控制字节
+    /// （C0 含裸 `ESC`、以及 DEL 0x7F）丢弃，非法 UTF-8 用替换字符顶上。
     fn paste_step(&mut self, from: usize) -> Step {
         let rest = &self.pending[from..];
         let Some(&first) = rest.first() else {
@@ -195,7 +196,9 @@ impl Decoder {
                 None => Step::Stuck,
             },
             b'\n' => Step::Key(Key::Newline, 1),
-            // 其余控制字节（含裸 `ESC`）在粘贴内容里只是噪音。
+            // Tab 是唯一的例外：制表符缩进的代码粘进来必须保住缩进，所以按字面插入 `\t`。
+            b'\t' => Step::Key(Key::Char('\t'), 1),
+            // 其余控制字节（含裸 `ESC` 与 DEL 0x7F）在粘贴内容里只是噪音。
             byte if is_control(byte) => Step::Drop(1),
             _ => match utf8_step(rest) {
                 Utf8::Char { ch, len, lossy } => {
@@ -463,6 +466,18 @@ mod tests {
         assert!(decoder.feed(b"\x1b").is_empty(), "半条序列必须留在缓存里");
         assert_eq!(decoder.feed(b"[A"), vec![Key::Up], "拼上后解成 Up");
 
+        // 切在参数区之前（`\x1b[` + `A`）也一样。
+        assert!(decoder.feed(b"\x1b[").is_empty(), "只有引子的 CSI 也得留着");
+        assert_eq!(decoder.feed(b"A"), vec![Key::Up], "终结字节一到就是 Up");
+
+        // `Alt+Enter` 被切在两个读取之间：`\x1b` 先到，仍然是插入换行而不是「未绑定」。
+        assert!(decoder.feed(b"\x1b").is_empty(), "裸 ESC 先留着");
+        assert_eq!(
+            decoder.feed(b"\r"),
+            vec![Key::Newline],
+            "`\\r` 到齐后合成一个 Newline"
+        );
+
         // `\x1b[20` + `0~`：跨读取拼成 PasteStart。
         assert!(decoder.feed(b"\x1b[20").is_empty(), "CSI 只到一半也得留着");
         assert_eq!(
@@ -492,6 +507,27 @@ mod tests {
             decoder.feed("好".as_bytes()),
             vec![Key::Char('好')],
             "后面紧跟的字符照常解"
+        );
+
+        // 4 字节字符（U+1F600）也要能劈成 `[F0 9F]` + `[98 80]`：解码窗口只有 4 字节，
+        // 这种字符正好是窗口的上限。
+        let mut decoder = Decoder::new();
+        let emoji = "\u{1f600}".as_bytes();
+        assert_eq!(
+            emoji,
+            &[0xf0, 0x9f, 0x98, 0x80][..],
+            "夹具假设：U+1F600 是 4 字节 UTF-8"
+        );
+        assert!(decoder.feed(&emoji[..2]).is_empty(), "两个字节还不构成字符");
+        assert_eq!(
+            decoder.feed(&emoji[2..]),
+            vec![Key::Char('\u{1f600}')],
+            "后两个字节补齐 4 字节字符"
+        );
+        assert_eq!(
+            decoder.feed(b"a"),
+            vec![Key::Char('a')],
+            "4 字节字符之后的字节照常解"
         );
     }
 
@@ -536,15 +572,84 @@ mod tests {
             !decoder.take_invalid(),
             "粘贴区间内的字节都是合法 UTF-8，不该有告警"
         );
+
+        // 同一次读取里跨过结束标记：`内容 + \x1b[201~ + \x1b[A` 必须让 `pasting` 在 feed 中途翻转，
+        // 否则半条转义序列会被当成粘贴内容里的字面字符。
+        assert_eq!(
+            decoder.feed(b"\x1b[200~hi\x1b[201~\x1b[A"),
+            vec![
+                Key::PasteStart,
+                Key::Char('h'),
+                Key::Char('i'),
+                Key::PasteEnd,
+                Key::Up,
+            ],
+            "结束标记之后的 `\\x1b[A` 在同一个 feed 里就要按 Up 解"
+        );
+        assert!(!decoder.pasting(), "区间结束后回到正常解码");
+    }
+
+    /// F1（控制者裁定）：粘贴区间里 Tab 按字面插入（`Char('\t')`），其余 C0 控制字节与 DEL 仍然丢弃。
+    #[test]
+    fn paste_region_inserts_tab_literally_and_drops_other_controls() {
+        let mut decoder = Decoder::new();
+        // 制表符缩进的代码：Tab 必须活下来，否则粘进来的缩进会全部消失。
+        let keys = decoder.feed("\x1b[200~if x {\n\tlet y = 1;\n}\x1b[201~".as_bytes());
+        assert_eq!(
+            keys,
+            vec![
+                Key::PasteStart,
+                Key::Char('i'),
+                Key::Char('f'),
+                Key::Char(' '),
+                Key::Char('x'),
+                Key::Char(' '),
+                Key::Char('{'),
+                Key::Newline,
+                Key::Char('\t'),
+                Key::Char('l'),
+                Key::Char('e'),
+                Key::Char('t'),
+                Key::Char(' '),
+                Key::Char('y'),
+                Key::Char(' '),
+                Key::Char('='),
+                Key::Char(' '),
+                Key::Char('1'),
+                Key::Char(';'),
+                Key::Newline,
+                Key::Char('}'),
+                Key::PasteEnd,
+            ],
+            "粘贴里的 Tab 是字面制表符，不是被丢弃的控制字节"
+        );
+        assert!(!decoder.pasting(), "PasteEnd 之后回到正常解码");
+        assert!(!decoder.take_invalid(), "全是合法 UTF-8，不该有告警");
+
+        // Tab 是唯一的例外：裸 ESC 与 DEL 0x7F 照旧丢弃。
+        assert_eq!(
+            decoder.feed(b"\x1b[200~a\x1b\x7fb\tc\r\n\x1b[201~"),
+            vec![
+                Key::PasteStart,
+                Key::Char('a'),
+                Key::Char('b'),
+                Key::Char('\t'),
+                Key::Char('c'),
+                Key::Newline,
+                Key::PasteEnd,
+            ],
+            "裸 ESC 与 DEL 仍然丢弃，只有 Tab 按字面插入"
+        );
+        assert!(!decoder.pasting(), "第二段粘贴也正常结束");
     }
 
     #[test]
     fn paste_region_survives_split_feeds() {
         let mut decoder = Decoder::new();
-        // 开始标记可以只到一半。
-        assert!(decoder.feed(b"\x1b[20").is_empty());
+        // 开始标记可以切在参数中间：`\x1b[200` + `~`。
+        assert!(decoder.feed(b"\x1b[200").is_empty(), "参数只到一半，先留着");
         assert_eq!(
-            decoder.feed(b"0~x"),
+            decoder.feed(b"~x"),
             vec![Key::PasteStart, Key::Char('x')],
             "标记拼上后进入粘贴区间，后面的字节按字面插入"
         );
@@ -615,6 +720,34 @@ mod tests {
             decoder.feed(b"a"),
             vec![Key::Char('a')],
             "丢弃之后缓存干净，新字节照常解码"
+        );
+
+        // 上限的边界正好是 16：16 字节还留着，17 字节才丢弃。
+        let mut decoder = Decoder::new();
+        let sixteen = b"\x1b[!!!!!!!!!!!!!!";
+        assert_eq!(sixteen.len(), 16, "夹具假设：`\\x1b[` + 14 个中间字节");
+        assert!(
+            decoder.feed(sixteen).is_empty(),
+            "正好 16 字节还留着，不出按键"
+        );
+        assert_eq!(
+            decoder.feed(b"~"),
+            vec![Key::Other],
+            "留下的 16 字节仍在：补上终结字节后整条按 Other 消耗（若已被丢弃，这里会出 `Char('~')`）"
+        );
+
+        let mut decoder = Decoder::new();
+        let seventeen = b"\x1b[!!!!!!!!!!!!!!!";
+        assert_eq!(seventeen.len(), 17, "夹具假设：越界 1 个字节");
+        assert_eq!(
+            decoder.feed(seventeen),
+            vec![Key::Other],
+            "17 字节越界：整体丢弃并报一个 Other"
+        );
+        assert_eq!(
+            decoder.feed(b"a"),
+            vec![Key::Char('a')],
+            "越界丢弃之后缓存也干净"
         );
     }
 }
