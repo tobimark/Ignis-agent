@@ -25,6 +25,8 @@
 mod common;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use common::TempDir;
@@ -35,6 +37,16 @@ use serde_json::{Value, json};
 
 /// 位置敏感断言与请求计数的复查间隔（与夹具的 `expect` 同一条 20ms 轮询口径）。
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// `/learn` 三条用例共用的固定草稿（模型对草稿请求的回复）：合法 frontmatter + 一段正文。
+const DRAFT_MD: &str = "---\nname: demo-skill\ndescription: Demo draft.\n---\n# 步骤\n1. 做事\n";
+
+/// `/learn` 的确认提示词（逐字，与生产侧的 `commands::learn::LEARN_PROMPT` 同一份文案）。
+///
+/// 这一行读完之前终端是 canonical（与审批同一时机）：答案要在提示词**出现之后**再发——多次
+/// `/learn` 的提示词逐字相同，`Pty::expect` 会拿上一轮那一份假命中，所以按位置切窗口（见各
+/// 用例里的 `expect_after`）。
+const LEARN_PROMPT: &str = "save this skill draft? [s]ave [d]iscard> ";
 
 /// 起一个 REPL 会话：临时 home/workspace + 假模型脚本，返回 `(pty, 临时目录, 假模型)`。
 ///
@@ -85,6 +97,26 @@ fn spawn_repl_in_with_env(
         // 默认环境（模型地址、密钥、NO_COLOR、TERM）由夹具注入
         env,
     })
+}
+
+/// 技能文件的落点：`{IGNIS_HOME}/skills/{name}/SKILL.md`（`spawn_repl*` 建出来的 home 就是
+/// `dir.join("home")`）。
+fn skill_path(dir: &TempDir, name: &str) -> PathBuf {
+    dir.join("home").join("skills").join(name).join("SKILL.md")
+}
+
+/// 在 REPL 运行期间往 home 的技能目录里落一个合法技能（内容与内置技能同一形状：frontmatter +
+/// 一段正文），供 `/skills reload` 与直读断言使用。
+///
+/// 目录按需创建：`/learn` 用例里 home 已由 CLI 启动时建好，但这里不依赖那个时序。
+fn write_skill(dir: &TempDir, name: &str, description: &str) {
+    let path = skill_path(dir, name);
+    fs::create_dir_all(path.parent().expect("技能文件应有父目录")).expect("技能目录应可创建");
+    fs::write(
+        &path,
+        format!("---\nname: {name}\ndescription: {description}\n---\n# 步骤\n1. 做事\n"),
+    )
+    .expect("技能文件应可写入");
 }
 
 /// 请求体里最后一条 user 消息的正文（REPL 把整段输入行原样交给内核）。
@@ -727,5 +759,167 @@ fn pty_compact_summarizes_and_keeps_the_raw_rows() {
         read_session_messages(&db_path, session_id),
         expected_rows,
         "第四轮之后原始消息只增不减、seq 续写"
+    );
+}
+
+/// `/learn` 保存路径的端到端：一轮任务 → `/learn` 预览（头行逐字）→ 确认提示词 → `s` →
+/// 落盘回显 + reload 回显 → `/skills` 的表里看得见新技能；文件直读（内容前缀 + 0600）。
+///
+/// 确认读的是一行 **canonical** 模式的 stdin（与审批同一时机），所以 `s\r` 必须等提示词出现
+/// 之后再发；`demo-skill` 在草稿头行里早就出现过，表里那一行只认 reload 回显之后的窗口。
+#[test]
+fn pty_learn_saves_the_draft_after_confirmation() {
+    let (mut pty, dir, _model) = spawn_repl(
+        "pty-learn-save",
+        vec![
+            ScriptStep::Text("答复一".to_string()),
+            ScriptStep::Text(DRAFT_MD.to_string()),
+        ],
+    );
+
+    pty.expect("❯ ");
+    pty.send("你好\r");
+    pty.expect("● Done");
+    wait_for_prompt_after(&pty, "● Done");
+
+    pty.send("/learn\r");
+    pty.expect("draft skill demo-skill: untested, not deployed or executed automatically");
+    pty.expect(LEARN_PROMPT);
+    pty.send("s\r");
+    pty.expect("saved skill demo-skill");
+    pty.expect("reloaded skills (4)");
+
+    // 落盘之后编辑器重新接管提示符：这时发的回车才被当 Enter（canonical 下会被译成 Ctrl+J）
+    wait_for_prompt_after(&pty, "reloaded skills (4)");
+    pty.send("/skills\r");
+    // 草稿头行里已经有 `demo-skill` 了：这一行必须来自 reload 之后的表
+    expect_after(&pty, "reloaded skills (4)", "demo-skill");
+
+    wait_for_prompt_after(&pty, "demo-skill");
+    pty.send("\x04");
+    assert_eq!(pty.wait(), 0, "Ctrl-D 应以 0 退出：\n{}", pty.output());
+
+    // 直读落盘现场：frontmatter 逐字开头、文件 0600（与 `save_skill` 的契约一致）
+    let path = skill_path(&dir, "demo-skill");
+    let text = fs::read_to_string(&path).expect("确认后草稿应已落盘");
+    assert!(text.starts_with("---\nname: demo-skill\n"), "{text}");
+    let mode = fs::metadata(&path)
+        .expect("技能文件应可 stat")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "{}", path.display());
+}
+
+/// `/learn` 的拒绝面：`d` 放弃（磁盘零变化）→ 显式任务前缀再存一次落盘 → 同名再存被拒
+/// （`error: skill demo-skill already exists`）且文件字节一个不改。
+///
+/// 脚本 4 步：1 轮任务 + 3 次 `/learn`，每次都要一次模型往返（草稿在确认之前生成）。
+#[test]
+fn pty_learn_discard_and_refusal_leave_no_file() {
+    let (mut pty, dir, _model) = spawn_repl(
+        "pty-learn-refusal",
+        vec![
+            ScriptStep::Text("答复一".to_string()),
+            ScriptStep::Text(DRAFT_MD.to_string()),
+            ScriptStep::Text(DRAFT_MD.to_string()),
+            ScriptStep::Text(DRAFT_MD.to_string()),
+        ],
+    );
+
+    pty.expect("❯ ");
+    pty.send("你好\r");
+    pty.expect("● Done");
+    wait_for_prompt_after(&pty, "● Done");
+
+    // 第一次：`d` 放弃。提示词与头行都是流里第一次出现，`expect` 的从流头重扫不会假命中
+    pty.send("/learn\r");
+    pty.expect("draft skill demo-skill: untested, not deployed or executed automatically");
+    pty.expect(LEARN_PROMPT);
+    pty.send("d\r");
+    pty.expect("discarded");
+    assert!(
+        !skill_path(&dir, "demo-skill").exists(),
+        "放弃不该落盘：\n{}",
+        pty.output()
+    );
+
+    // 第二次：显式前缀（8 字符 = 前缀规则的下界）取回刚才那条成功任务
+    wait_for_prompt_after(&pty, "discarded");
+    let home = dir.join("home");
+    let (id, status, error) = common::latest_task(&home.join("ignis.db"));
+    assert_eq!(
+        status,
+        "success",
+        "默认目标与显式前缀都只认成功任务（error={error:?}）：\n{}",
+        pty.output()
+    );
+    let prefix = &id[..8];
+    pty.send(&format!("/learn {prefix}\r"));
+    // 提示词与上一轮逐字相同：只认本轮输入行回显之后的那一份
+    expect_after(&pty, &format!("❯ /learn {prefix}"), LEARN_PROMPT);
+    pty.send("s\r");
+    pty.expect("saved skill demo-skill");
+    pty.expect("reloaded skills (4)");
+
+    let path = skill_path(&dir, "demo-skill");
+    let saved = fs::read(&path).expect("第二次应已落盘");
+    assert!(saved.starts_with(b"---\nname: demo-skill\n"), "{saved:?}");
+
+    // 第三次：同一前缀、同一名字 → 拒绝；文件字节逐字不变。
+    //
+    // 这一轮的门禁不能再用输入行回显当标记：第三轮的回显与第二轮**逐字相同**，`expect_after` 的
+    // `rfind` 会先命中第二轮那一份（新回显还没画出来），于是 `s\r` 在本轮输入行提交之前就发出去了
+    // ——编辑器还在 raw mode 里读，这两个字节会被它收进「跨提交边界的按键」队列，确认面永远等不
+    // 到一行（实测超时）。改用只有第二轮才写过的那行落盘回显当标记：本轮提示词只可能在它之后。
+    wait_for_prompt_after(&pty, "reloaded skills (4)");
+    pty.send(&format!("/learn {prefix}\r"));
+    expect_after(&pty, "reloaded skills (4)", LEARN_PROMPT);
+    pty.send("s\r");
+    pty.expect("error: skill demo-skill already exists");
+    assert_eq!(
+        fs::read(&path).expect("被拒之后文件仍该在"),
+        saved,
+        "被拒时一个字节都不许改：\n{}",
+        pty.output()
+    );
+
+    wait_for_prompt_after(&pty, "already exists");
+    pty.send("\x04");
+    assert_eq!(pty.wait(), 0, "Ctrl-D 应以 0 退出：\n{}", pty.output());
+}
+
+/// `/skills reload` 的端到端：REPL 运行期间由测试直接往 home 里落一个新技能，reload 之后
+/// `/skills` 的表里就有它；起步时的 banner 计数（3）钉住「新技能确实是运行期间才出现的」。
+#[test]
+fn pty_skills_reload_picks_up_a_new_skill_file() {
+    // 本轮不提交任务：脚本那一步只是给夹具一个 `base_url`（reload 是纯本地命令，不该碰模型）
+    let (mut pty, dir, model) = spawn_repl(
+        "pty-skills-reload",
+        vec![ScriptStep::Text("答复一".to_string())],
+    );
+
+    pty.expect("Session: "); // banner 第 5 行：整屏已写完，此时目录里只有内置三技能
+    let banner = pty.output();
+    assert!(banner.contains("Skills: 3"), "{banner}");
+
+    pty.expect("❯ "); // raw mode 生效后再打字：canonical 下回车会被译成 Ctrl+J
+    write_skill(&dir, "fresh-skill", "Added while running.");
+
+    pty.send("/skills reload\r");
+    pty.expect("reloaded skills (4)");
+    wait_for_prompt_after(&pty, "reloaded skills (4)");
+
+    pty.send("/skills\r");
+    expect_after(&pty, "reloaded skills (4)", "fresh-skill");
+
+    wait_for_prompt_after(&pty, "fresh-skill");
+    pty.send("\x04");
+    assert_eq!(pty.wait(), 0, "Ctrl-D 应以 0 退出：\n{}", pty.output());
+
+    assert!(
+        model.requests().is_empty(),
+        "reload 与列表都是本地动作：{:#?}",
+        model.requests()
     );
 }
