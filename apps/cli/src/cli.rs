@@ -295,6 +295,7 @@ pub fn exit_code_for(status: RunStatus) -> ExitCode {
 mod tests {
     use std::process::ExitCode;
 
+    use clap::CommandFactory;
     use ignis_runtime::RunStatus;
 
     use super::*;
@@ -312,6 +313,24 @@ mod tests {
         for (status, want) in cases {
             assert_eq!(exit_code_for(status), ExitCode::from(want), "{status:?}");
         }
+    }
+
+    /// `--version` 的输出恒等于 `ignis <CARGO_PKG_VERSION>`（clap 的 `#[command(version)]`
+    /// 取的就是包版本，banner / TUI 顶部行同源）。这里钉的是**等式**而不是某个字面量版本号：
+    /// 改版本（如 0.1.0 → 0.2.0）时本用例不必跟着改，只有输出来源被换掉才会红。
+    #[test]
+    fn version_flag_reports_the_package_version() {
+        assert_eq!(
+            Cli::command().render_version().trim(),
+            format!("ignis {}", env!("CARGO_PKG_VERSION"))
+        );
+
+        let error = Cli::try_parse_from(["ignis", "--version"]).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::DisplayVersion,
+            "{error}"
+        );
     }
 
     /// `--kernel` 是**可选项**：不给就得是 `None`（由配置 `default_kernel` 兜底，spec §6.1 的

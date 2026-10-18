@@ -688,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "ignis-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -706,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "ignis-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -727,7 +727,7 @@ dependencies = [
 
 [[package]]
 name = "ignis-gateway"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "ignis-core",
@@ -741,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "ignis-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -757,7 +757,7 @@ dependencies = [
 
 [[package]]
 name = "ignis-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rusqlite",
  "serde_json",
