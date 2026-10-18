@@ -1026,15 +1026,26 @@ fn pty_skills_reload_picks_up_a_new_skill_file() {
 
     // 负向对照：reload **之前**先看一眼目录——新技能文件已经落盘，但会话里那一份快照还是启动时
     // 扫的（三个内置技能），表里不该有它。窗口按发送前的流长切（与 `expect_after_offset` 同一条
-    // 位置口径）：窗口里的命中只可能来自这一次列表输出。全流重扫在这里不能用作负向对照——reload
-    // 之后全流里必然有它，那样这条断言就永远「失败」而失去意义。
+    // 位置口径）：这个窗口只覆盖这一次列表的输出，命中与否都只关乎它——这正是全流重扫给不了的
+    // 归属（reload 之后那次列表也会把 `fresh-skill` 写进全流，那里再问「全流里有没有」就分不清
+    // 是哪一次列表带进来的了）。
     let before_reload = pty.output().len();
     pty.send("/skills\r");
     expect_after_offset(&pty, before_reload, "DESCRIPTION"); // 正信号：表画出来了
+    // 表头出现只说明表开始画了，表的后几行与紧随其后的提示符帧还在后面：等编辑器在这张表**之后**
+    // 重新画出提示符（[`wait_for_prompt_after`]，与 `:909` 同一条规则），才既保证整张表（3 行
+    // `builtin`）都落地、又保证 raw mode 已重新接管——canonical 下送的 `\r` 会被译成 `\n`
+    // （插换行而非提交），本用例会一路卡到 `PTY_TIMEOUT`。
+    wait_for_prompt_after(&pty, "DESCRIPTION");
     let listed = pty.output();
     let start = (before_reload..=listed.len())
         .find(|at| listed.is_char_boundary(*at))
-        .unwrap_or(listed.len());
+        .unwrap_or_else(|| {
+            panic!(
+                "窗口起点 {before_reload} 越过了当前流长 {}（发送前的快照不该比现流长）：\n{listed}",
+                listed.len()
+            )
+        });
     let pre_reload = &listed[start..];
     assert!(
         !pre_reload.contains("fresh-skill"),

@@ -94,13 +94,43 @@ fn pgrep(pattern: &str) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+/// 夹具脚本的休眠哨兵文件：`hang()` 的第一件事就是写它（相对脚本 cwd = 用例工作区，见
+/// `fake-claude.sh`）。
+const SLEEPERS_FILE: &str = ".fake-claude-sleepers";
+
+/// 等到夹具**真正**进了挂起态：休眠哨兵文件已落盘，且文件里两个哨兵进程都已起来（有界轮询，5s）。
+///
+/// `挂起前` 那一帧只是「夹具开始吐事件」的证据，它写在 `hang()` **之前**（见 `fake-claude.sh` 的
+/// `CANCEL_HANG` 分支）：帧一到手就取消，进程组里可能还没有休眠进程，`assert_no_sleepers` 会先
+/// 因为哨兵文件缺失而失败——旧的那条固定 `sleep(300ms)` 之所以一直绿，靠的正是「顺带把 `hang()`
+/// 等到位」，而不是那个时长本身有什么保证。这里改等「挂起态本身」，不再赌一个猜出来的时长；
+/// 文件落盘与 `sleep … &` 之间还有一次 fork/exec，所以两个哨兵都看见才算到位（否则「杀掉休眠
+/// 进程组」就没被真正验证过）。
+async fn wait_for_hang(workspace: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(tag) = std::fs::read_to_string(workspace.join(SLEEPERS_FILE)) {
+            let sentinels: Vec<&str> = tag.lines().filter(|line| !line.is_empty()).collect();
+            if !sentinels.is_empty() && sentinels.iter().all(|sentinel| !pgrep(sentinel).is_empty())
+            {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "夹具脚本应在 5s 内进入挂起态（写下 {SLEEPERS_FILE} 并起两个哨兵进程）"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// 夹具脚本留下的休眠哨兵（数字由工作区路径派生，见 `fake-claude.sh`）：逐个断言没有残留进程。
 ///
 /// 哨兵每次运行都不同，所以上一次被 SIGKILL 的运行留下的孤儿不会误伤本次断言（评审 Minor #5）；
 /// 重试窗口是给刚被 SIGKILL / 刚被释放的后代留一点退出与回收的时间。
 async fn assert_no_sleepers(workspace: &Path) {
-    let tag = std::fs::read_to_string(workspace.join(".fake-claude-sleepers"))
-        .expect("夹具脚本应写下休眠哨兵");
+    let tag =
+        std::fs::read_to_string(workspace.join(SLEEPERS_FILE)).expect("夹具脚本应写下休眠哨兵");
     for sentinel in tag.lines() {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !pgrep(sentinel).is_empty() {
@@ -613,10 +643,15 @@ async fn missing_claude_binary_reports_a_clear_failure() {
 
 /// 取消：杀整个进程组（后台 sleep 也逃不掉），收束成 `Done{Aborted}`，不能拖时间。
 ///
-/// 取消点等的是**事件流自己**（到 5s 为止的有界轮询）：夹具把 `挂起前` 那一帧写进管道之后才算进了
-/// 挂起态，读到它再取消——原来那个固定 `sleep(300ms)` 是在赌「300ms 内夹具一定已经起了进程并吐完
-/// 前导事件」；负载下这个赌注会输，取消会抢在前导帧之前命中内核的 `select!` 取消分支，那一帧被
-/// 丢掉（事件断言随机失败）。
+/// 取消点等的是**事件流自己**（到 5s 为止的有界轮询）：先读到夹具的 `挂起前` 前导帧（它证明
+/// 夹具已经把事件写进了管道），再等挂起态就位，最后才取消——原来那个固定 `sleep(300ms)` 是在赌
+/// 「300ms 内夹具一定已经起了进程并吐完前导事件」；负载下这个赌注会输，取消会抢在前导帧之前命中
+/// 内核的 `select!` 取消分支，那一帧被丢掉（事件断言随机失败）。
+///
+/// 但前导帧还不足够：`hang()` 在它**之后**（`fake-claude.sh` 先 `emit` 再 `hang`），所以还要按
+/// [`wait_for_hang`] 的有界轮询等到哨兵文件落盘、两个休眠进程都起来，才轮到取消。少了这一步，
+/// 取消会赢在「帧已到手、`hang()` 还没跑到」的窗口里，进程组被清空时根本没有休眠进程，
+/// `assert_no_sleepers` 先因为哨兵文件缺失而失败（评审 Critical：2/44 复现）。
 #[tokio::test]
 async fn cancel_kills_the_process_group_and_reports_aborted() {
     let workspace = TempWorkspace::new("cancel");
@@ -642,7 +677,9 @@ async fn cancel_kills_the_process_group_and_reports_aborted() {
             break;
         }
     }
-    // 挂起态已就位（前导帧已经在事件流里）：此刻取消才不会把还没读出来的那一帧连带丢掉
+    // 挂起态已就位（前导帧已经在事件流里，且 `hang()` 的哨兵与休眠进程都起来了）：此刻取消才
+    // 既不会把还没读出来的那一帧连带丢掉，也不会让进程组在「还没有休眠进程」时就被清空
+    wait_for_hang(&workspace.path()).await;
     cancel.cancel();
     while let Some(event) = stream.next().await {
         events.push(event);
