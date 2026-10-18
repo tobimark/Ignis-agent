@@ -33,7 +33,7 @@ use ignis_runtime::Usage;
 use ignis_storage::SessionSummary;
 
 use crate::commands::slash;
-use crate::render::width::{display_width, truncate_to_width};
+use crate::render::width::{char_width, display_width, truncate_to_width};
 use crate::render::{Palette, palette};
 
 use super::Size;
@@ -155,13 +155,41 @@ impl Scrollback {
         self.lines.is_empty()
     }
 
-    /// 一行落地：超过上限丢最旧（滚动区不做无界增长）。
+    /// 一行落地：`\t` 按 8 列制表位展开（见 [`expand_tabs`]；仅显示层），超过上限丢最旧
+    /// （滚动区不做无界增长）。
     fn push_line(&mut self, line: String) {
-        self.lines.push_back(line);
+        self.lines.push_back(expand_tabs(&line));
         while self.lines.len() > SCROLLBACK_LINES {
             self.lines.pop_front();
         }
     }
+}
+
+/// 每 8 列一个制表位（POSIX 的默认制表位）。
+const TAB_STOP: usize = 8;
+
+/// 把一行里的 `\t` 展开成到下一个制表位的空格（**仅显示层**：提交文本与渲染字节都不变）。
+///
+/// 列号按显示宽度累计（`你` 占 2 列），所以宽字符之后的制表位与终端上看到的一致；已经落在制表位
+/// 上时补满一整档（与终端一致：`\t` 至少前进 1 列）。宽度口径（[`char_width`]）把控制字符算 0 列，
+/// 不展开的话含 Tab 的行在截断与列对齐上都会算错（T3 裁定）。
+fn expand_tabs(line: &str) -> String {
+    if !line.contains('\t') {
+        return line.to_string();
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut column = 0usize;
+    for ch in line.chars() {
+        if ch == '\t' {
+            let spaces = TAB_STOP - (column % TAB_STOP);
+            out.extend(std::iter::repeat_n(' ', spaces));
+            column += spaces;
+        } else {
+            out.push(ch);
+            column += char_width(ch);
+        }
+    }
+    out
 }
 
 /// 组装一帧要用的会话事实快照（忙碌期不能借用会话，所以一切都先取成这里的值）。
@@ -387,7 +415,11 @@ fn paint(slot: Slot, text: &str, palette: &Palette, colored: bool) -> String {
                 let bold = palette.bold;
                 format!("{bold}{INPUT_MARK}{RESET}{rest}")
             }
-            None => text.to_string(),
+            // 忙碌期的首行不是输入标记（`working…`）：与提示行同档的说明性文案（dim）
+            None => {
+                let dim = palette.dim;
+                format!("{dim}{text}")
+            }
         },
         Slot::Input(HINT_ROW) | Slot::Top | Slot::Status => {
             let dim = palette.dim;
@@ -1016,6 +1048,56 @@ mod tests {
         // 空行也是行（正文里的空行要看得见）
         scrollback.push_text("\n\n");
         assert_eq!(scrollback.viewport(3), ["没有换行的尾巴", "", ""]);
+    }
+
+    /// T3 裁定：摄入时 `\t` 按 8 列制表位展开（**仅显示层**；提交文本与渲染字节不变）。
+    ///
+    /// 终端对制表符用的是它自己的制表位，宽度口径（[`display_width`]）却控制字符按 0 列算：
+    /// 不展开的话含 Tab 的行在截断与列对齐上都会算错。展开在「一行落地」时做，列号按显示宽度
+    /// 累计（宽字符占 2 列），所以半行跨 tick 也不影响结果。
+    #[test]
+    fn tabs_expand_to_the_next_eight_column_stop_on_ingest() {
+        let mut scrollback = Scrollback::new();
+        // `a` 在第 1 列 → 补 7 个空格到第 8 列
+        scrollback.push_text("a\tb\n");
+        assert_eq!(scrollback.viewport(1), [format!("a{}b", " ".repeat(7))]);
+        assert_eq!(
+            display_width(&scrollback.viewport(1)[0]),
+            9,
+            "展开之后宽度就是真实列数"
+        );
+
+        // 宽字符按显示列算：`你` 占 2 列 → 补 6 个空格
+        scrollback.push_text("你\tb\n");
+        assert_eq!(scrollback.viewport(2)[1], format!("你{}b", " ".repeat(6)));
+
+        // 行首的 Tab、正好落在制表位上的 Tab、连续两个 Tab
+        scrollback.push_text("\tb\n");
+        assert_eq!(scrollback.viewport(3)[2], format!("{}b", " ".repeat(8)));
+        scrollback.push_text("12345678\tb\n");
+        assert_eq!(
+            scrollback.viewport(4)[3],
+            format!("12345678{}b", " ".repeat(8))
+        );
+        scrollback.push_text("a\t\tb\n");
+        assert_eq!(
+            scrollback.viewport(5)[4],
+            format!("a{}b", " ".repeat(7 + 8))
+        );
+        assert!(
+            !scrollback
+                .viewport(5)
+                .iter()
+                .any(|line| line.contains('\t')),
+            "落地的行里不该再有制表符：{:?}",
+            scrollback.viewport(5)
+        );
+
+        // 半行（跨 tick 的两段拼起来）同样在落地时展开
+        scrollback.push_text("x\ty");
+        assert_eq!(scrollback.len(), 5, "还没换行：尾巴留在 pending 里");
+        scrollback.push_text("\n");
+        assert_eq!(scrollback.viewport(6)[5], format!("x{}y", " ".repeat(7)));
     }
 
     /// 翻页：`scroll_up` 的 offset 与视口底部；到底不越界；`scroll_to_bottom` 回 0。

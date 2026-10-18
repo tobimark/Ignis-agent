@@ -15,7 +15,7 @@ pub mod slash;
 pub mod task;
 
 use std::ffi::{OsStr, OsString};
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -703,7 +703,38 @@ impl Session {
         }
     }
 
+    /// 经典 REPL 的轮次（行为逐字不变）：渲染与结束行写 stdout，`error:`/`warning:` 行写 stderr。
+    pub async fn run_task(&mut self, prompt: String, kind: TaskKind) -> Result<TaskOutcome> {
+        self.run_task_with_sinks(
+            prompt,
+            kind,
+            Box::new(std::io::stdout()),
+            Box::new(std::io::stderr()),
+            // 经典路径的「问答」只发生在交互终端上：管道 / 脚本里只打提示行
+            std::io::stdin().is_terminal(),
+        )
+        .await
+    }
+
+    /// 同一轮次，输出面由调用方给（TUI 传 `CaptureSink`）：渲染器输出、结束行、`error:` 行与
+    /// `warning: session write failed` 行都写进这一个面；自拉起只打提示行（不问答——TUI 没有
+    /// 按行读的交互面）。
+    pub async fn run_task_with_out(
+        &mut self,
+        prompt: String,
+        kind: TaskKind,
+        out: Box<dyn Write + Send>,
+    ) -> Result<TaskOutcome> {
+        // 同一个面拆成两个共享它的句柄（写序不变）：渲染器输出与错误行落进同一个捕获缓冲
+        let (render_out, error_out) = shared_writer(out);
+        self.run_task_with_sinks(prompt, kind, render_out, error_out, false)
+            .await
+    }
+
     /// 跑一次任务：渲染与 `runner.run` 在**同一任务内交错消费**事件，Ctrl-C 监听任务负责中止本次运行。
+    ///
+    /// 上面两个入口的公共实现（本模块私有；`interactive` 决定自拉起是否提问、两个输出面由调用方给：
+    /// 经典是 stdout/stderr，TUI 是同一个捕获缓冲的两个句柄）。
     ///
     /// 每轮按当前内核装配运行器（native 建 HTTP 客户端，外部内核只做一次 PATH 检查），
     /// 因此 `/kernel` 的切换只影响后续任务。本轮配置由 [`Session::effective_config`] 给出
@@ -722,9 +753,20 @@ impl Session {
     /// 提示词在会话面先过一道脱敏器（C1 终审）：会话标题、轮次落库与送给运行器的请求取同一份
     /// 文本，与运行器写下 `tasks.prompt` 的那一份逐字相同。
     ///
+    /// 往注入面写失败一律忽略（EPIPE 等）：输出面坏了不该把一轮对话丢掉，也不该 panic。
+    ///
     /// 审批提示是审批层对 stdout 的直接写入（不经渲染器），异步管线下它与工具行的硬写序做不到
     /// ——记为已知限制，P2/P5 单一写者时收口。
-    pub async fn run_task(&mut self, prompt: String, kind: TaskKind) -> Result<TaskOutcome> {
+    async fn run_task_with_sinks(
+        &mut self,
+        prompt: String,
+        kind: TaskKind,
+        out: Box<dyn Write + Send>,
+        mut err: Box<dyn Write + Send>,
+        interactive: bool,
+    ) -> Result<TaskOutcome> {
+        // 输出面拆成两份共享它的句柄：渲染器拿一份，结束行与自拉起提示拿另一份（写序不变）
+        let (render_out, mut out) = shared_writer(out);
         // C1：提示词先过会话面的脱敏器再用——标题（`ensure_session`）、轮次落库（`append_turn`）
         // 与送给运行器的 `TaskRequest` 都取这一份（运行器入口另有一道同源脱敏，重复替换幂等），
         // 三面同源；提示词里的已知密钥因此既到不了模型，也写不进 `sessions.title` /
@@ -735,7 +777,7 @@ impl Session {
             TaskKind::Repl => match self.ensure_session(&prompt) {
                 Ok(id) => Some(id),
                 Err(error) => {
-                    eprintln!("warning: session write failed: {error}");
+                    let _ = writeln!(err, "warning: session write failed: {error}");
                     None
                 }
             },
@@ -772,11 +814,7 @@ impl Session {
             // 非 UTF-8 的取值照样算「已设置」：转换在 `no_color_value` 里做有损解码
             no_color_value(std::env::var_os("NO_COLOR")).as_deref(),
         );
-        let mut renderer = Renderer::new(
-            Box::new(std::io::stdout()),
-            options,
-            Arc::clone(&saw_schedule_create),
-        );
+        let mut renderer = Renderer::new(render_out, options, Arc::clone(&saw_schedule_create));
 
         let cancel = CancellationToken::new();
         let watcher = spawn_ctrl_c_watcher(cancel.clone());
@@ -830,9 +868,10 @@ impl Session {
                 self.store()
                     .append_turn(session_id, &prompt, outcome.final_text.as_deref())
         {
-            eprintln!("warning: session write failed: {error}");
+            let _ = writeln!(err, "warning: session write failed: {error}");
         }
-        println!(
+        let _ = writeln!(
+            out,
             "{}",
             format_task_end(
                 &outcome.id,
@@ -844,28 +883,70 @@ impl Session {
                 options.mode,
             )
         );
-        // 非成功终态不能只留一个状态词：原因（内核给出、已过 Redactor）打到 stderr，与
+        // 非成功终态不能只留一个状态词：原因（内核给出、已过 Redactor）打到错误面，与
         // `main` 的错误行同形。任务 id 已在结束行里，随后可直接 `ignis task show {id}`。
         if outcome.status != RunStatus::Success
             && let Some(error) = &outcome.error
         {
-            eprintln!("error: {error}");
+            let _ = writeln!(err, "error: {error}");
         }
-        // 本轮建过调度任务、守护进程又没在跑时提示一次自拉起（每会话至多一次）
-        daemon::autostart(
+        // 本轮建过调度任务、守护进程又没在跑时提示一次自拉起（每会话至多一次）：
+        // `interactive` 由入口给（经典路径 = stdin 是否 tty；TUI 传 `false` 只打提示行）
+        daemon::autostart_with(
             self.home(),
             saw_schedule_create.load(Ordering::Relaxed),
             &self.already_prompted,
+            interactive,
+            &mut *out,
+            &mut *err,
         )
         .await;
         Ok(outcome)
+    }
+
+    /// TUI 的颜色/主题来源（`ui` 段是 `Copy`）。
+    pub(crate) fn ui_config(&self) -> ignis_core::config::UiConfig {
+        self.config.ui
+    }
+}
+
+/// 把一个写入面拆成两个共享它的句柄：TUI 的单一捕获缓冲因此既收渲染输出，也收 `error:`/`warning:` 行。
+///
+/// 两个句柄持同一把锁，写序就是调用顺序。锁中毒（持锁的写线程 panic 过）取回内部值——生产路径
+/// 只许做减法，不许 panic。
+fn shared_writer(out: Box<dyn Write + Send>) -> (Box<dyn Write + Send>, Box<dyn Write + Send>) {
+    let shared = Arc::new(Mutex::new(out));
+    (
+        Box::new(SharedSink(Arc::clone(&shared))),
+        Box::new(SharedSink(shared)),
+    )
+}
+
+/// [`shared_writer`] 的句柄：每次写都先取锁，转发给共享的那个面。
+struct SharedSink(Arc<Mutex<Box<dyn Write + Send>>>);
+
+impl Write for SharedSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .flush()
     }
 }
 
 /// 渲染选项：模式来自**会话状态**（`/details` 只改会话，不写回配置），主题来自 `config.ui`，
 /// `ColorChoice` + stdout 的 tty 状态 + `NO_COLOR` 定颜色，宽度按 stdout 类型给
 /// （tty → 探测终端列数，非 tty → 不折行）。
-fn renderer_options(
+///
+/// `pub(crate)`：TUI 的帧合成器按同一份口径取宽度（TUI 下 stdout 是 tty，宽度就是面板列数）。
+pub(crate) fn renderer_options(
     config: &Config,
     mode: OutputMode,
     is_tty: bool,
@@ -882,7 +963,9 @@ fn renderer_options(
 /// `NO_COLOR` 环境变量的取值转换：存在即算「已设置」——值本身不解码，非 UTF-8 按
 /// `to_string_lossy` 有损处理（no-color.org 的约定只看「存在且非空」，不看内容；空串由
 /// [`resolve_color`] 按未设置处理）。
-fn no_color_value(raw: Option<OsString>) -> Option<String> {
+///
+/// `pub(crate)`：`NO_COLOR` 的约定只有这一处，TUI 的 `refresh_facts` 也从这里读。
+pub(crate) fn no_color_value(raw: Option<OsString>) -> Option<String> {
     raw.map(|value| value.to_string_lossy().into_owned())
 }
 
@@ -2380,5 +2463,91 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.starts_with("learn: generation failed: "), "{error}");
+    }
+
+    /// 记录写出的字节（注入面的用例夹具）：两个句柄写进同一块 `Vec<u8>`，按写序落账。
+    #[derive(Clone, Default)]
+    struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedBuffer {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("记录锁不该中毒").clone())
+                .expect("渲染输出、结束行与 error: 行都是合法 UTF-8")
+        }
+    }
+
+    impl std::io::Write for SharedBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("记录锁不该中毒")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// TUI 的单一捕获面：`shared_writer` 把一个面拆成两个共享它的句柄，写序不变。
+    #[test]
+    fn shared_writer_writes_both_ends_into_one_buffer() {
+        let buffer = SharedBuffer::default();
+        let (mut out, mut err) = shared_writer(Box::new(buffer.clone()));
+
+        out.write_all(b"render").unwrap();
+        err.write_all("error: 坏了\n".as_bytes()).unwrap();
+        out.write_all(b"more").unwrap();
+        err.flush().unwrap();
+
+        assert_eq!(
+            buffer.text(),
+            "rendererror: 坏了\nmore",
+            "两个句柄写进同一块缓冲，顺序即写序"
+        );
+    }
+
+    /// 注入输出面的轮次：渲染输出、结束行、非成功终态的原因行都进同一个面（经典路径分 stdout/stderr，
+    /// 由既有 e2e 覆盖；这里用同一个实现钉死两个入口）。
+    #[tokio::test]
+    async fn run_task_writes_the_end_line_and_the_error_line_into_the_injected_sink() {
+        let model = ScriptedModel::start(vec![ScriptStep::Text("答复一".into())]);
+        let (_dir, mut session) =
+            session_fixture_with_config("tui-sink", "native", scripted_config(&model));
+        let buffer = SharedBuffer::default();
+
+        let outcome = session
+            .run_task_with_out("你好".into(), TaskKind::Repl, Box::new(buffer.clone()))
+            .await
+            .expect("脚本化模型应答应成功");
+        assert_eq!(outcome.final_text.as_deref(), Some("答复一"));
+
+        let text = buffer.text();
+        assert!(
+            text.contains("答复一"),
+            "渲染器的正文输出必须进同一个面：{text:?}"
+        );
+        assert!(text.contains("● Done · "), "结束行进同一个面：{text:?}");
+
+        // 非成功终态：内核给出的原因行也进同一个面（经典路径它走 stderr）
+        let model = ScriptedModel::start(vec![ScriptStep::Error {
+            status: 401,
+            body: r#"{"error":"bad key"}"#.into(),
+        }]);
+        let (_dir, mut session) =
+            session_fixture_with_config("tui-sink-error", "native", scripted_config(&model));
+        let buffer = SharedBuffer::default();
+        let outcome = session
+            .run_task_with_out("你好".into(), TaskKind::Repl, Box::new(buffer.clone()))
+            .await
+            .expect("401 不重试：轮次本身不返回 Err");
+
+        assert_ne!(outcome.status, RunStatus::Success);
+        let text = buffer.text();
+        assert!(
+            text.lines().any(|line| line.starts_with("error: ")),
+            "非成功终态的原因行必须进同一个面：{text:?}"
+        );
     }
 }

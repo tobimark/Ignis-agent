@@ -1,16 +1,23 @@
-//! TUI（Beta）的终端层与捕获基础件：备用屏守卫、尺寸探测、输出净化、宽度截断。
+//! TUI（Beta）：终端层、捕获、帧合成、输入路由与主循环。
 //!
-//! 本模块只做「进得去、退得干净、模型输出只能显示不能驱动终端」这三件事，不合成帧、不跑主循环
-//! （那是后续任务的 `view`/`app`）。分层：
+//! 分层（自下而上）：
 //! - [`term`]：备用屏/光标/尺寸/panic 兜底（raw mode 复用 [`crate::editor::raw::RawMode`]，
 //!   `ISIG` 保持开着）；
-//! - [`capture`]：渲染器的输出落点（[`capture::CaptureSink`]）与净化（[`capture::sanitize`]）；
-//! - 本文件：可用性判定（[`tui_unavailable_reason`]）与降级 note（[`fallback_note`]）。
+//! - [`capture`]：渲染器的输出落点（[`capture::CaptureSink`]）与净化（[`capture::sanitize`]）
+//!   ——「模型输出只能显示、不能驱动终端」这条防线只有一个入口；
+//! - [`view`]：帧合成器（[`view::compose`]）与有界滚动区（[`view::Scrollback`]，上限 2000 行）；
+//! - [`input`]：编辑器输入态（复用 P2 的状态机与解码器，只多一条瞬时提示行）；
+//! - [`app`]：应用状态与两个循环的公共机件（[`app::TuiApp::on_bytes`] 出动作、
+//!   [`app::TuiApp::drive`] 在忙碌期驱动借用会话的 future）；
+//! - 本文件：可用性判定（[`tui_unavailable_reason`]）、降级 note（[`fallback_note`]）、帧用的
+//!   会话事实快照（[`refresh_facts`]）、提交分类（[`classify`]）与主循环（[`run`]）。
 //!
 //! 可用性判定是**纯函数**：tty / `TERM` / 尺寸三件事都由调用方探好后传进来，用例不必造终端也不
 //! 必改环境变量（`repl::run` 与 `tui::start` 各自把现场探好）。
 
+pub mod app;
 pub mod capture;
+pub mod input;
 pub mod term;
 pub mod view;
 
@@ -65,11 +72,336 @@ pub fn fallback_note(reason: &str) -> String {
     format!("note: TUI unavailable ({reason}); falling back to the classic REPL")
 }
 
+// ---- 主循环接线（Task 3）：事实快照、提交分类、空闲/忙碌两个循环 ----
+
+use std::process::ExitCode;
+
+use anyhow::Result;
+use ignis_core::task::TaskKind;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+use crate::commands::slash::{self, Dispatch, Parsed, Slash};
+use crate::commands::{Session, no_color_value};
+use crate::editor::draw::CONTINUATION;
+use crate::editor::history::History;
+use crate::render::resolve_color;
+use crate::tui::app::{Action, Busy, InputChunk, TuiApp, Wake};
+use crate::tui::capture::CaptureSink;
+use crate::tui::term::TerminalGuard;
+use crate::tui::view::{Scrollback, ViewFacts, compose};
+
+/// 提交回显的首行标记（与输入区、编辑器同一对标记）。
+const ECHO_MARK: &str = "❯ ";
+
+/// `/learn` 在 TUI 里的临时错误行（T3 的过渡支线：确认面要等 T5 的接缝，**T5 删掉这一行与它的
+/// 用例**）。
+const LEARN_TEMP_LINE: &str =
+    "error: /learn is not wired in the TUI yet (needs the inline confirmation)";
+
+/// 会用到的会话事实快照（只用既有/本任务新增的 `pub` 访问器）。
+pub fn refresh_facts(session: &Session) -> ViewFacts {
+    // 非 UTF-8 的取值照样算「已设置」：转换与经典路径共用 `no_color_value`
+    refresh_facts_with(
+        session,
+        no_color_value(std::env::var_os("NO_COLOR")).as_deref(),
+    )
+}
+
+/// 带 `NO_COLOR` 注入的变体（用例不必改进程环境）。
+pub fn refresh_facts_with(session: &Session, no_color: Option<&str>) -> ViewFacts {
+    let ui = session.ui_config();
+    ViewFacts {
+        version: env!("CARGO_PKG_VERSION"),
+        workspace: session.workspace().display().to_string(),
+        kernel: session.kernel().to_string(),
+        session: slash::session_label(session.current_session()),
+        mode: session.output_mode(),
+        theme: ui.theme,
+        // TUI 只在终端上跑：stdout 恒是 tty，颜色只看 `ui.color` 与 `NO_COLOR`
+        color: resolve_color(ui.color, true, no_color),
+        budget: session.context_budget(),
+        history_messages: session.history().len(),
+        stats: session.last_prompt_stats().copied(),
+        usage: session.last_usage().copied(),
+        native: session.is_native(),
+    }
+}
+
+/// 一条已提交输入的本地分类（复用 [`slash::parse`]，只把四个需要会话/模型的形状分出来）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Submitted {
+    /// 空行/纯空白：跳过。
+    Empty,
+    /// 未知命令的错误行（本地报错，**绝不**送模型）。
+    Unknown(String),
+    /// `/exit`。
+    Exit,
+    /// `/sessions`（T3 过渡：先落经典表格，T6 换成选择器叠层）。
+    Sessions,
+    /// `/compact`：需要模型往返，在忙碌子循环里执行。
+    Compact,
+    /// `/learn [task-id]`：需要模型往返与确认面（确认面在 T5）。
+    Learn(Option<String>),
+    /// 其余同步命令：外层借用会话走一遍 `slash::dispatch`。
+    Command(slash::Slash, Vec<String>),
+    /// 任务文本。
+    Task(String),
+}
+
+/// 分类一行已提交的输入：只按 TUI 的执行方式把四个形状挑出来，其余照 `slash` 那一份口径走。
+pub fn classify(line: &str) -> Submitted {
+    match slash::parse(line) {
+        Parsed::Empty => Submitted::Empty,
+        Parsed::Unknown(name) => Submitted::Unknown(name),
+        Parsed::Command(Slash::Exit, _) => Submitted::Exit,
+        Parsed::Command(Slash::Sessions, _) => Submitted::Sessions,
+        Parsed::Command(Slash::Compact, _) => Submitted::Compact,
+        Parsed::Command(Slash::Learn, args) => Submitted::Learn(args.first().cloned()),
+        Parsed::Command(command, args) => Submitted::Command(command, args),
+        Parsed::Task(text) => Submitted::Task(text),
+    }
+}
+
+/// 提交回显：首行 `❯ `、续行 `… `（与编辑器同一对标记）；空行（含纯空白）不回显。
+///
+/// 输入区在提交后立刻进入忙碌态（第 1 行换成 `working…`），回显是用户确认「我提交了什么」的唯一
+/// 落点；多行输入按行落地，内部换行原样保留。
+fn echo_lines(line: &str) -> Vec<String> {
+    if line.trim().is_empty() {
+        return Vec::new();
+    }
+    line.split('\n')
+        .enumerate()
+        .map(|(index, text)| {
+            let marker = if index == 0 { ECHO_MARK } else { CONTINUATION };
+            format!("{marker}{text}")
+        })
+        .collect()
+}
+
+/// 画一帧（空闲循环的重绘点；写失败忽略，画不出帧不该带走一场会话）。
+fn draw_frame(term: &mut TerminalGuard, app: &TuiApp, facts: &ViewFacts) {
+    let _ = term.write(compose(&app.view(facts)).as_bytes());
+}
+
+/// TUI 主循环：空闲期读输入并执行动作，忙碌期驱动 future。返回进程退出码。
+///
+/// 空闲循环 = 「等输入块/SIGINT/SIGWINCH/100ms tick → 处理动作 → 刷新事实 → 重绘」；忙碌循环在
+/// [`TuiApp::drive`] 里（future 借用会话期间这里只读事实快照）。每一条退出路径（`/exit`、空缓冲
+/// `Ctrl+D`、空闲 SIGINT、stdin 关闭）都靠调用方持有守卫的 `Drop` 还原终端。
+pub async fn run(
+    session: &mut Session,
+    term: &mut TerminalGuard,
+    chunks: mpsc::UnboundedReceiver<InputChunk>,
+) -> Result<ExitCode> {
+    // 捕获缓冲：渲染器与滚动区共持（每轮任务的 `CaptureSink` 由 `TuiApp::capture_sink` 现取）
+    let (_, buffer) = CaptureSink::pair();
+    // 输入历史与经典编辑器同一份（`~/.ignis/history`）：TUI 里按过的 ↑ 在经典路径里也认
+    let mut app = TuiApp::new(
+        Scrollback::new(),
+        History::load(session.home().join("history")),
+        buffer,
+    );
+    app.attach_chunks(chunks);
+    app.set_size(term.size());
+    let mut facts = refresh_facts(session);
+    draw_frame(term, &app, &facts);
+
+    loop {
+        match app.wait_idle().await {
+            Wake::Chunk(InputChunk::Bytes(bytes)) => {
+                let actions = app.on_bytes(&bytes);
+                let dirty = actions.iter().any(|action| *action != Action::None);
+                if let Some(code) =
+                    handle_actions(session, &mut app, &mut facts, Some(&mut *term), actions).await?
+                {
+                    return Ok(code);
+                }
+                if dirty {
+                    draw_frame(term, &app, &facts);
+                }
+            }
+            // stdin 关闭（对端走了）：与 EOF 同一条路，干净退出
+            Wake::Chunk(InputChunk::Eof) => return Ok(ExitCode::SUCCESS),
+            // 空闲期 Ctrl-C：还原终端并以 0 退出
+            Wake::Sigint => return Ok(ExitCode::SUCCESS),
+            Wake::Sigwinch => {
+                app.set_size(term.refresh_size());
+                draw_frame(term, &app, &facts);
+            }
+            Wake::Tick => {
+                if app.on_tick() {
+                    draw_frame(term, &app, &facts);
+                }
+            }
+        }
+    }
+}
+
+/// 执行一批输入动作（`term` 为空 = 用例的无终端路径）。返回 `Some(code)` = 主循环该退出。
+async fn handle_actions(
+    session: &mut Session,
+    app: &mut TuiApp,
+    facts: &mut ViewFacts,
+    mut term: Option<&mut TerminalGuard>,
+    actions: Vec<Action>,
+) -> Result<Option<ExitCode>> {
+    for action in actions {
+        match action {
+            // 空操作与重绘都在批末统一处理（一批至多一帧）
+            Action::None | Action::Redraw => {}
+            Action::Exit => return Ok(Some(ExitCode::SUCCESS)),
+            Action::Submit(line) => {
+                if let Some(code) =
+                    submit_line(session, app, facts, term.as_deref_mut(), &line).await?
+                {
+                    return Ok(Some(code));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// 执行一条已提交的输入：回显 → 分类 → 各自落地；返回 `Some(code)` = 主循环该退出。
+///
+/// 每条分支结束时都刷新一次事实快照（`/details` 切了模式、跑完一轮任务都会改它）。
+async fn submit_line(
+    session: &mut Session,
+    app: &mut TuiApp,
+    facts: &mut ViewFacts,
+    term: Option<&mut TerminalGuard>,
+    line: &str,
+) -> Result<Option<ExitCode>> {
+    // 回显：用户提交的内容留在滚动区（空行不留）
+    let echo = echo_lines(line);
+    if !echo.is_empty() {
+        app.push_lines(echo);
+    }
+
+    let mut exit = false;
+    match classify(line) {
+        // 空行：什么都不做（编辑器可能提交空串）
+        Submitted::Empty => {}
+        // 未知命令：本地报错行，绝不送模型
+        Submitted::Unknown(name) => app.push_lines([slash::unknown_command_line(&name)]),
+        Submitted::Exit => exit = true,
+        // T3 过渡：`/sessions` 先走经典的同步命令（T6 换成选择器叠层）
+        Submitted::Sessions => exit = sync_command(session, app, Slash::Sessions, &[]),
+        // `/compact` 需要模型往返：忙碌子循环里驱动（成功逐行进滚动区、错误进 `error: {…}` 行）
+        Submitted::Compact => compact_turn(session, app, facts, term).await,
+        // T3 过渡：确认面要等 T5 的接缝（这一支与它的用例在 T5 被替换/删除）
+        Submitted::Learn(_) => app.push_lines([LEARN_TEMP_LINE.to_string()]),
+        Submitted::Command(command, args) => {
+            exit = sync_command(session, app, command, &args);
+        }
+        Submitted::Task(prompt) => task_turn(session, app, facts, term, prompt).await,
+    }
+    *facts = refresh_facts(session);
+    Ok(exit.then_some(ExitCode::SUCCESS))
+}
+
+/// 走一遍 `slash::dispatch`：输出行进滚动区、命令自己的错误进 `error: {…}` 行。
+/// 返回真表示 `/exit`（外层据此收摊）。
+fn sync_command(session: &mut Session, app: &mut TuiApp, command: Slash, args: &[String]) -> bool {
+    match slash::dispatch(session, command, args) {
+        Ok(Dispatch::Lines(lines)) => {
+            app.push_lines(lines);
+            false
+        }
+        Ok(Dispatch::Exit) => true,
+        // 两个模型往返的形状在 [`classify`] 就被分走了；真到了这里也只是不动作（绝不 panic）
+        Ok(Dispatch::Compact) | Ok(Dispatch::Learn(_)) => false,
+        Err(error) => {
+            app.push_lines([format!("error: {error}")]);
+            false
+        }
+    }
+}
+
+/// `/compact`：忙碌子循环里驱动一次压缩（`Session::compact` 本来就收取消令牌，不需要新接缝）。
+async fn compact_turn(
+    session: &mut Session,
+    app: &mut TuiApp,
+    facts: &ViewFacts,
+    term: Option<&mut TerminalGuard>,
+) {
+    app.begin_busy(Busy::Compact);
+    let cancel = CancellationToken::new();
+    let result = match term {
+        Some(term) => {
+            app.drive(term, facts, session.compact(cancel.clone()), Some(cancel))
+                .await
+        }
+        None => {
+            app.drive_headless(facts, session.compact(cancel.clone()), Some(cancel))
+                .await
+        }
+    };
+    app.end_busy();
+    match result {
+        Ok(lines) => app.push_lines(lines),
+        Err(error) => app.push_lines([format!("error: {error}")]),
+    }
+}
+
+/// 一轮任务：忙碌子循环里驱动 `run_task_with_out`（渲染输出、结束行与错误行都落进同一个捕获面）。
+///
+/// 取消令牌给 `None`：任务轮次的 Ctrl-C 由 `run_task_with_out` 自己的 watcher 收，经典语义不变。
+async fn task_turn(
+    session: &mut Session,
+    app: &mut TuiApp,
+    facts: &ViewFacts,
+    term: Option<&mut TerminalGuard>,
+    prompt: String,
+) {
+    app.begin_busy(Busy::Task);
+    let out: Box<dyn std::io::Write + Send> = Box::new(app.capture_sink());
+    let result = match term {
+        Some(term) => {
+            app.drive(
+                term,
+                facts,
+                session.run_task_with_out(prompt, TaskKind::Repl, out),
+                None,
+            )
+            .await
+        }
+        None => {
+            app.drive_headless(
+                facts,
+                session.run_task_with_out(prompt, TaskKind::Repl, out),
+                None,
+            )
+            .await
+        }
+    };
+    app.end_busy();
+    if let Err(error) = result {
+        app.push_lines([format!("error: {error}")]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
+    use std::process::ExitCode;
 
-    use super::{MIN_COLS, MIN_ROWS, Size, fallback_note, tui_unavailable_reason};
+    use ignis_core::config::{ColorChoice, Config, UiConfig};
+
+    use crate::commands::Session;
+    use crate::commands::fixtures::{session_fixture, session_fixture_with_config};
+    use crate::commands::slash::{self, Slash};
+    use crate::editor::history::History;
+    use crate::tui::app::TuiApp;
+    use crate::tui::capture::CaptureSink;
+    use crate::tui::view::{Scrollback, ViewFacts};
+
+    use super::{
+        MIN_COLS, MIN_ROWS, Size, Submitted, classify, fallback_note, refresh_facts,
+        refresh_facts_with, tui_unavailable_reason,
+    };
 
     /// 「够大」的常规终端：表驱动用例的可用基线。
     fn ok_size() -> Size {
@@ -168,6 +500,231 @@ mod tests {
             Size { cols: 80, rows: 24 },
             Size { cols: 80, rows: 25 },
             "行数参与相等判定"
+        );
+    }
+
+    // ---- 循环级用例（headless） ----
+
+    /// 无终端的应用夹具：空滚动区 + 内存历史 + 独立捕获缓冲。
+    fn headless_app() -> TuiApp {
+        let (_, buffer) = CaptureSink::pair();
+        TuiApp::new(Scrollback::new(), History::in_memory(), buffer)
+    }
+
+    /// 滚动区里看得见的行（视口就是「最近 `rows` 行」）。
+    fn viewport(app: &TuiApp, facts: &ViewFacts) -> Vec<String> {
+        app.view(facts).viewport
+    }
+
+    /// 用例助手：把「提交一行 + 处理动作」跑成一次调用（不碰终端；动作处理与主循环同一份）。
+    async fn submit(
+        session: &mut Session,
+        app: &mut TuiApp,
+        facts: &mut ViewFacts,
+        line: &str,
+    ) -> anyhow::Result<Option<ExitCode>> {
+        let mut bytes = line.as_bytes().to_vec();
+        bytes.push(b'\r');
+        let actions = app.on_bytes(&bytes);
+        super::handle_actions(session, app, facts, None, actions).await
+    }
+
+    /// 一条已提交输入的本地分类：四个需要会话/模型的形状分出来，其余原样走 `slash` 那条路。
+    #[test]
+    fn classify_routes_commands_tasks_and_unknown() {
+        let cases = [
+            ("", Submitted::Empty),
+            ("  ", Submitted::Empty),
+            ("/nope", Submitted::Unknown("nope".to_string())),
+            ("/exit", Submitted::Exit),
+            ("/sessions", Submitted::Sessions),
+            ("/compact", Submitted::Compact),
+            ("/learn", Submitted::Learn(None)),
+            (
+                "/learn 019a1b2c-3d4e-7f00-8000-000000000001",
+                Submitted::Learn(Some("019a1b2c-3d4e-7f00-8000-000000000001".to_string())),
+            ),
+            (
+                "/kernel codex",
+                Submitted::Command(Slash::Kernel, vec!["codex".to_string()]),
+            ),
+            ("你好", Submitted::Task("你好".to_string())),
+            (
+                "第一行\n第二行",
+                Submitted::Task("第一行\n第二行".to_string()),
+                // 多行文本原样进任务（内部换行保留、只裁首尾空白）
+            ),
+        ];
+        for (line, want) in cases {
+            assert_eq!(classify(line), want, "{line:?}");
+        }
+    }
+
+    /// 事实快照：版本号跟包版本联动、会话标签与 `/status` 同源，颜色只看 `NO_COLOR` 那一处约定。
+    #[test]
+    fn refresh_facts_reads_the_session_and_the_no_color_convention() {
+        let (_dir, session) = session_fixture("tui-facts", "native");
+        let facts = refresh_facts_with(&session, Some("1"));
+
+        assert_eq!(facts.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(facts.workspace, session.workspace().display().to_string());
+        assert_eq!(facts.kernel, "native");
+        assert_eq!(
+            facts.session,
+            slash::session_label(session.current_session())
+        );
+        assert_eq!(facts.mode, session.output_mode());
+        assert_eq!(facts.budget, session.context_budget());
+        assert_eq!(facts.history_messages, session.history().len());
+        assert_eq!(facts.stats, session.last_prompt_stats().copied());
+        assert_eq!(facts.usage, session.last_usage().copied());
+        assert!(facts.native, "native 内核");
+        assert!(!facts.color, "`NO_COLOR=1`（非空）恒无色");
+        assert!(
+            refresh_facts_with(&session, None).color,
+            "tty + auto → 上色"
+        );
+
+        // `ui.color = Always`：没有 `NO_COLOR` 时上色；`NO_COLOR` 非空时照样无色
+        let (_dir, always) = session_fixture_with_config(
+            "tui-facts-always",
+            "native",
+            Config {
+                ui: UiConfig {
+                    color: ColorChoice::Always,
+                    ..UiConfig::default()
+                },
+                ..Config::default()
+            },
+        );
+        assert!(refresh_facts_with(&always, None).color);
+        assert!(!refresh_facts_with(&always, Some("1")).color);
+        // 不带注入的入口读进程环境（这里只钉它不 panic、且与注入变体同形）
+        assert_eq!(refresh_facts(&session).version, env!("CARGO_PKG_VERSION"));
+    }
+
+    /// 同步命令：回显与命令的输出行都进滚动区，动作之后会话事实跟着刷新；`/exit` 交回退出码 0。
+    #[tokio::test]
+    async fn sync_commands_write_their_lines_into_the_scrollback() {
+        let (_dir, mut session) = session_fixture("tui-sync", "native");
+        let mut app = headless_app();
+        let mut facts = refresh_facts(&session);
+
+        let code = submit(&mut session, &mut app, &mut facts, "/kernel")
+            .await
+            .unwrap();
+        assert_eq!(code, None);
+        let lines = viewport(&app, &facts);
+        assert!(lines.contains(&"❯ /kernel".to_string()), "回显：{lines:?}");
+        assert!(lines.contains(&"kernel: native".to_string()), "{lines:?}");
+
+        submit(&mut session, &mut app, &mut facts, "/details minimal")
+            .await
+            .unwrap();
+        let lines = viewport(&app, &facts);
+        assert!(
+            lines.contains(&"output mode: minimal".to_string()),
+            "{lines:?}"
+        );
+        assert_eq!(facts.mode, session.output_mode(), "动作之后刷新会话事实");
+
+        // `/status` 的每一行都落地（与经典同一份文案）
+        let expected = slash::status_lines(
+            session.kernel(),
+            session.model(),
+            session.workspace(),
+            session.current_session(),
+            session.unread_alerts(),
+            session.last_usage(),
+        );
+        submit(&mut session, &mut app, &mut facts, "/status")
+            .await
+            .unwrap();
+        let lines = viewport(&app, &facts);
+        for line in &expected {
+            assert!(lines.contains(line), "{line:?} 没落地：{lines:?}");
+        }
+
+        // 未知命令：本地报错行，绝不送模型（这里只钉它落在滚动区）
+        submit(&mut session, &mut app, &mut facts, "/nope")
+            .await
+            .unwrap();
+        let lines = viewport(&app, &facts);
+        assert!(
+            lines.contains(&"Unknown command: /nope — /help lists commands".to_string()),
+            "{lines:?}"
+        );
+
+        let code = submit(&mut session, &mut app, &mut facts, "/exit")
+            .await
+            .unwrap();
+        assert_eq!(code, Some(ExitCode::SUCCESS));
+    }
+
+    /// T3 过渡：`/sessions` 先落经典表格（T6 换成选择器叠层，这条用例随之改写）。
+    #[tokio::test]
+    async fn sessions_command_still_lands_the_classic_table_in_this_task() {
+        let (_dir, mut session) = session_fixture("tui-sessions", "native");
+        // 先造一条会话行：表格才有表头之外的内容
+        session
+            .store()
+            .create_session(session.workspace(), "native", None, "第一句")
+            .unwrap();
+        let mut app = headless_app();
+        let mut facts = refresh_facts(&session);
+
+        submit(&mut session, &mut app, &mut facts, "/sessions")
+            .await
+            .unwrap();
+
+        let lines = viewport(&app, &facts);
+        let table = slash::sessions_lines(&session.sessions().unwrap(), session.current_session());
+        let header = lines
+            .iter()
+            .find(|line| line.contains("ID") && line.contains("MESSAGES"))
+            .unwrap_or_else(|| panic!("表格表头那一行必须落地：{lines:?}"));
+        assert_eq!(header, &table[0], "与经典的同一份文案");
+    }
+
+    /// `/compact` 在忙碌子循环里被驱动（T3 就完整支持）：空会话给一行 `error: …`，回到空闲态。
+    #[tokio::test]
+    async fn compact_is_driven_in_the_busy_loop() {
+        let (_dir, mut session) = session_fixture("tui-compact", "native");
+        let mut app = headless_app();
+        let mut facts = refresh_facts(&session);
+
+        let code = submit(&mut session, &mut app, &mut facts, "/compact")
+            .await
+            .unwrap();
+        assert_eq!(code, None);
+        assert_eq!(app.busy(), None, "轮次结束必须回到空闲态");
+
+        let lines = viewport(&app, &facts);
+        assert!(
+            lines.contains(&"error: compact: no session yet".to_string()),
+            "{lines:?}"
+        );
+    }
+
+    /// T3 过渡：`/learn` 只落一行临时错误（确认面等 T5 的接缝；**T5 删掉这条用例**）。
+    #[tokio::test]
+    async fn learn_command_reports_the_temp_line_until_the_confirm_lands() {
+        let (_dir, mut session) = session_fixture("tui-learn", "native");
+        let mut app = headless_app();
+        let mut facts = refresh_facts(&session);
+
+        let code = submit(&mut session, &mut app, &mut facts, "/learn")
+            .await
+            .unwrap();
+        assert_eq!(code, None);
+
+        let lines = viewport(&app, &facts);
+        assert!(
+            lines.contains(
+                &"error: /learn is not wired in the TUI yet (needs the inline confirmation)"
+                    .to_string()
+            ),
+            "{lines:?}"
         );
     }
 }

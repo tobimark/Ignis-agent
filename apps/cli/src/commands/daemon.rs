@@ -139,13 +139,37 @@ pub fn autostart_action(
 
 /// 任务结束后的自拉起：判定 → 提示/提问 → 需要时拉起守护进程。
 ///
-/// 动作一旦发生就把会话标记成「已提示」（每会话至多一次）。状态探测是只读的、不阻塞；拉起失败
-/// 只打 `error:` 一行——任务本身已经跑完了，自拉起失败不改变 `ignis run` 的退出码。
+/// 签名与行为不变：内部 = [`autostart_with`]（stdin 是否 tty、stdout、stderr）。
 pub async fn autostart(home: &Path, saw_schedule_create: bool, already_prompted: &AtomicBool) {
+    autostart_with(
+        home,
+        saw_schedule_create,
+        already_prompted,
+        std::io::stdin().is_terminal(),
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+    )
+    .await;
+}
+
+/// 自拉起的可注入变体：`interactive` 由调用方给（经典路径传 stdin 是否 tty；TUI 传 `false`
+/// ——TUI 没有按行读的交互面，只往 `out` 打一行提示），两个输出面也是调用方给的。
+///
+/// 动作一旦发生就把会话标记成「已提示」（每会话至多一次）。状态探测是只读的、不阻塞；拉起失败
+/// 只往 `err` 打 `error:` 一行——任务本身已经跑完了，自拉起失败不改变退出码。往注入面写失败
+/// 一律忽略（EPIPE 等），不 panic。
+pub async fn autostart_with(
+    home: &Path,
+    saw_schedule_create: bool,
+    already_prompted: &AtomicBool,
+    interactive: bool,
+    out: &mut (impl Write + ?Sized),
+    err: &mut (impl Write + ?Sized),
+) {
     let action = autostart_action(
         saw_schedule_create,
         matches!(daemon::status(home), DaemonStatus::Running { .. }),
-        std::io::stdin().is_terminal(),
+        interactive,
         already_prompted.load(Ordering::Relaxed),
     );
     // 动作发生过就记下来（REPL 跨轮次共享同一个会话）
@@ -155,27 +179,34 @@ pub async fn autostart(home: &Path, saw_schedule_create: bool, already_prompted:
 
     match action {
         Autostart::None => {}
-        Autostart::Hint => println!("{START_HINT}"),
+        // 提示行与提问词都落到调用方给的面上（TUI 的捕获面也收这一行）
+        Autostart::Hint => {
+            let _ = writeln!(out, "{START_HINT}");
+        }
         Autostart::Prompt => {
+            let _ = write!(out, "{START_PROMPT}");
+            let _ = out.flush();
             if !ask_yes_no().await {
                 return;
             }
             match start_daemon(home).await {
-                Ok(StartOutcome::Started { pid }) => println!("daemon started (pid {pid})"),
-                Err(error) => eprintln!("error: {error}"),
+                Ok(StartOutcome::Started { pid }) => {
+                    let _ = writeln!(out, "daemon started (pid {pid})");
+                }
+                Err(error) => {
+                    let _ = writeln!(err, "error: {error}");
+                }
             }
         }
     }
 }
 
-/// 打印提问并读一行；答案裁掉首尾空白后只认 `y`（大小写不敏感）。
+/// 从 stdin 读一行；答案裁掉首尾空白后只认 `y`（大小写不敏感）。
 ///
-/// 读走一条脱离的 std 线程（与 REPL 的输入读取同一条路）：用户在提示符上按 Ctrl-C 退出时，
-/// 进程收尾不会被这个可能永不返回的终端读卡住（`spawn_blocking` 会被运行时收尾等待）。
+/// 提问词由调用方打到它自己的面上，这里只负责读。读走一条脱离的 std 线程（与 REPL 的输入读取
+/// 同一条路）：用户在提示符上按 Ctrl-C 退出时，进程收尾不会被这个可能永不返回的终端读卡住
+/// （`spawn_blocking` 会被运行时收尾等待）。
 async fn ask_yes_no() -> bool {
-    print!("{START_PROMPT}");
-    let _ = std::io::stdout().flush();
-
     let (tx, rx) = oneshot::channel();
     std::thread::spawn(move || {
         let mut line = String::new();
@@ -297,5 +328,37 @@ mod tests {
         let error = ensure_foreground(false).unwrap_err().to_string();
         assert!(error.contains("--foreground"), "{error}");
         assert!(error.contains("daemon start"), "{error}");
+    }
+
+    /// 自拉起的注入变体：非交互只往注入面打提示行（不问答、不碰 stdin）；判定与经典同一份。
+    #[tokio::test]
+    async fn autostart_with_writes_the_hint_into_the_injected_sink() {
+        use crate::commands::kernel::fixtures::TempDir;
+
+        // 临时 home：没有 pidfile → `Stopped`（守护进程没在跑）
+        let home = TempDir::new("autostart-with");
+        let prompted = AtomicBool::new(false);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+
+        autostart_with(home.path(), true, &prompted, false, &mut out, &mut err).await;
+
+        assert_eq!(
+            String::from_utf8(out).expect("提示行是合法 UTF-8"),
+            format!("{START_HINT}\n"),
+            "非交互模式只打提示行（TUI 传 `interactive = false`）"
+        );
+        assert!(err.is_empty(), "自拉起成功不该有错误行");
+        assert!(
+            prompted.load(Ordering::Relaxed),
+            "动作发生过就记下来（每会话至多一次）"
+        );
+
+        // 本轮没建过调度任务：什么都不写（判定表与经典共用 `autostart_action`）
+        let prompted = AtomicBool::new(false);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        autostart_with(home.path(), false, &prompted, false, &mut out, &mut err).await;
+        assert!(out.is_empty(), "{out:?}");
+        assert!(err.is_empty(), "{err:?}");
+        assert!(!prompted.load(Ordering::Relaxed), "没动作就不标记");
     }
 }
