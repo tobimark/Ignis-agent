@@ -1114,6 +1114,29 @@ mod tests {
         assert!(!out.contains("memory:"), "{out}");
     }
 
+    /// 失败路径（`ok = false`）：一行确认都不打，只走既有的 `  ✗ {summary} · {耗时}` 失败行
+    /// （首行预览跟在它后面）。
+    #[test]
+    fn remember_failure_prints_no_confirmation_line() {
+        let out = render(
+            OutputMode::Normal,
+            false,
+            NO_WRAP,
+            &[
+                remember_exec(
+                    json!({"scope": "project", "key": "pkg_manager", "text": "这个项目用 uv"}),
+                    "call_5",
+                ),
+                tool_result("remember", false, Some("记忆的 text 不能为空"), "call_5"),
+            ],
+        );
+        assert!(!out.contains("memory:"), "{out}");
+        assert!(!out.contains('✓'), "{out}");
+        // 失败行照旧（摘要 + 实测耗时 + 首行预览），没有被吞掉
+        assert!(out.contains("  ✗ Remembering project fact · "), "{out}");
+        assert!(out.contains("    记忆的 text 不能为空"), "{out}");
+    }
+
     // ---- 写序：列 0 纪律与 finish ----
 
     #[test]

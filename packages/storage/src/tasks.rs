@@ -181,6 +181,25 @@ impl Db {
         })
     }
 
+    /// 本工作区最近一条**成功**任务（`/learn` 的默认目标）：
+    /// `WHERE workspace = ?1 AND status = 'success' ORDER BY started_at DESC, id DESC LIMIT 1`。
+    ///
+    /// 只读：没有成功任务（含空库）给 `None`，由命令层给「没有可学的任务」的人话错误。用
+    /// 「拉 N 条再过滤」会在别的任务更密的工作区漏掉目标，故这里单独一条 SQL。
+    pub fn latest_successful_task_for_workspace(
+        &self,
+        workspace: &str,
+    ) -> Result<Option<TaskRecord>> {
+        let sql = format!(
+            "SELECT {TASK_COLUMNS} FROM tasks WHERE workspace = ?1 AND status = 'success'
+             ORDER BY started_at DESC, id DESC LIMIT 1"
+        );
+        self.with_conn(|c| {
+            let mut stmt = c.prepare_cached(&sql)?;
+            stmt.query_row(params![workspace], row_to_task).optional()
+        })
+    }
+
     /// 按前缀查任务 id（`task show <前缀>` 的解析用）：以 `prefix` 开头的 id，按 `started_at`
     /// 倒序（与 [`Db::list_tasks`] 同一口径）最多 `limit` 条。
     ///
@@ -340,6 +359,55 @@ mod tests {
         assert_eq!(db.task_ids_with_prefix("01_", 10).unwrap(), ["01_"]);
         assert_eq!(db.task_ids_with_prefix("01x", 10).unwrap(), ["01x"]);
         assert!(db.task_ids_with_prefix("%", 10).unwrap().is_empty());
+    }
+
+    /// `/learn` 的默认目标：只认本工作区的成功任务，跨工作区与非成功状态都不选；一条成功都不剩时
+    /// 给 `None`（每条终态都用 `finish_task` 写）。
+    #[test]
+    fn latest_successful_task_for_workspace_is_scoped_and_skips_non_success() {
+        let db = Db::open_in_memory().unwrap();
+        // 本工作区：running、成功、以及更晚的中止任务
+        db.insert_task(&new_task("01", 10)).unwrap();
+        db.insert_task(&new_task("02", 20)).unwrap();
+        db.finish_task("02", "success", Some("done"), None, 1, 2, false, 30)
+            .unwrap();
+        db.insert_task(&new_task("03", 40)).unwrap();
+        db.finish_task("03", "aborted", None, None, 0, 0, false, 50)
+            .unwrap();
+        // 另一个工作区里更晚的一条成功：不影响本工作区
+        let mut other = new_task("04", 60);
+        other.workspace = "/other".into();
+        db.insert_task(&other).unwrap();
+        db.finish_task("04", "success", None, None, 0, 0, false, 70)
+            .unwrap();
+
+        let found = db
+            .latest_successful_task_for_workspace("/w")
+            .unwrap()
+            .expect("本工作区有一条成功任务");
+        assert_eq!(found.id, "02");
+        assert_eq!(found.status, "success");
+        assert_eq!(found.workspace, "/w");
+        // 落库面与 `get_task` 同一份列：字段逐个还原
+        assert_eq!(found, db.get_task("02").unwrap().unwrap());
+
+        // 唯一那条成功改成中止：本工作区没有可学的任务
+        db.finish_task("02", "aborted", None, None, 0, 0, false, 80)
+            .unwrap();
+        assert!(
+            db.latest_successful_task_for_workspace("/w")
+                .unwrap()
+                .is_none(),
+            "非成功状态一条都不选"
+        );
+        // 查询确实按工作区隔离：另一个工作区照旧查到它自己的成功任务
+        assert_eq!(
+            db.latest_successful_task_for_workspace("/other")
+                .unwrap()
+                .unwrap()
+                .id,
+            "04"
+        );
     }
 
     #[test]

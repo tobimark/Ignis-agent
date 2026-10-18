@@ -74,7 +74,10 @@ fn show_at(home: &Path, id: &str) -> Result<String> {
 /// 前缀要求 ≥8 字符且只含 uuid 的字符集（`[0-9a-f-]`）：这条闸门让拼错的任务名与过短的参数
 /// 直接报「没找到」，而不是去库里撞出一堆无关行。命中 1 条就用它，0 条报没找到，多条把候选
 /// （短 id，与 `task list` 同一口径）交给用户自己挑。
-fn find_task(db: &Db, arg: &str) -> Result<TaskRecord> {
+///
+/// `/learn <id>` 复用同一套规则（可见性提到 `pub(crate)`）：`/learn` 与 `task show` 对「哪条
+/// 任务、为什么找不到」给出逐字相同的三种结果，不各写一份前缀解析。
+pub(crate) fn find_task(db: &Db, arg: &str) -> Result<TaskRecord> {
     if let Some(task) = db.get_task(arg)? {
         return Ok(task);
     }

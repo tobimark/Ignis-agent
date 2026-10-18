@@ -6,6 +6,7 @@ pub mod config;
 pub mod daemon;
 pub mod doctor;
 pub mod kernel;
+pub mod learn;
 pub mod memory;
 pub mod run;
 pub mod schedule;
@@ -24,6 +25,8 @@ use std::time::Instant;
 use anyhow::{Result, bail};
 use ignis_core::alerts::{MultiNotifier, Notifier};
 use ignis_core::config::{Config, OutputMode, ensure_home, ignis_home, load_config};
+use ignis_core::learn as core_learn;
+use ignis_core::learn::{LearnError, SkillDraft};
 use ignis_core::memory::MemoryStore;
 use ignis_core::security::{ApprovalMode, Policy, Redactor};
 use ignis_core::session::{
@@ -51,6 +54,10 @@ pub use self::kernel::kernel_note;
 
 /// `/sessions` 列出的条数上限（本工作区最近 N 条；只影响展示，不删数据）。
 const SESSIONS_LIMIT: usize = 10;
+
+/// `/learn` 选不到可学任务时的错误：默认目标没有成功任务、显式 id 命中但不是成功状态共用这一句
+/// （逐字钉住；与 `task not found` 分家是刻意的——任务在不在与任务能不能学是两回事）。
+const NO_COMPLETED_TASK: &str = "learn: no completed task to learn from";
 
 /// 一次 CLI 会话的共享依赖：`run` 与 REPL 都从这里取当前内核与工作区。
 pub struct Session {
@@ -513,6 +520,101 @@ impl Session {
         Ok(slash::compact_lines(older.len(), summary.chars().count()))
     }
 
+    /// `/learn [task-id]`：生成草稿 → 预览 + 确认（真 stdin）→ 落盘 + reload / `discarded`。
+    ///
+    /// 确认面在 [`self::learn::confirm_save`]：头行 + 预览（截断按 120 行 / 8 KiB）+ 提示词**先**
+    /// 打到 stdout，再从 stdin 读一行；只有 `s`（trim + 大小写归一）才落盘，EOF、`d`、其它输入与
+    /// 读取失败一律交回 `["discarded"]`（磁盘零变化）。成功时刷新会话里的技能目录快照，下一轮任务
+    /// 的系统提示立即带上新技能；运行中的轮次仍持自己那一份旧快照。命令本身不新建任务行、不动会话。
+    pub async fn learn(
+        &mut self,
+        arg: Option<&str>,
+        cancel: CancellationToken,
+    ) -> Result<Vec<String>, String> {
+        let draft = self.draft_for_learn(arg, cancel).await?;
+        if !self::learn::confirm_save(&draft.name, &draft.to_skill_md()).await {
+            return Ok(vec!["discarded".to_string()]);
+        }
+        self.commit_draft(&draft)
+    }
+
+    /// 生成草稿（不落盘、不打预览）：检查顺序 = 凭据 → 目标任务 → 转录 → 一次无工具请求 → 校验；
+    /// 返回前用会话脱敏器过一遍 `description` / `body`（预览与落盘因此是同一份文本）。
+    ///
+    /// 目标：`arg == None` 取本工作区最近一条**成功**任务
+    /// （[`Db::latest_successful_task_for_workspace`]）；显式 id 走 [`task::find_task`] 的既有前缀
+    /// 规则（≥8 字符、`[0-9a-f-]`、0/1/多命中的三种人话结果），命中但状态不是 `success` 与「没有
+    /// 任务」共用同一句。全程只读任务行与任务 JSONL，不新建任务行、不动会话状态。
+    async fn draft_for_learn(
+        &mut self,
+        arg: Option<&str>,
+        cancel: CancellationToken,
+    ) -> Result<SkillDraft, String> {
+        // 1. 草稿要用一次 native 请求：外置内核与没有 Ignis 凭据的会话都不具备
+        if !self.is_native() || !self.has_credentials() {
+            return Err(
+                "learn requires native kernel credentials (current kernel does not provide them)"
+                    .to_string(),
+            );
+        }
+        // 2. 目标：显式 id 的错误（not found / ambiguous）原样交回；默认只认本工作区的成功任务
+        let task = match arg {
+            Some(id) => task::find_task(self.db(), id).map_err(|error| error.to_string())?,
+            None => self
+                .db()
+                .latest_successful_task_for_workspace(&self.workspace.display().to_string())
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| NO_COMPLETED_TASK.to_string())?,
+        };
+        if task.status != RunStatus::Success.as_str() {
+            return Err(NO_COMPLETED_TASK.to_string());
+        }
+        // 3. 任务日志 + 转录：读失败带出问题的路径；坏 JSONL 行在转录里跳过，不 panic
+        let log =
+            core_learn::read_task_log(self.home(), &task.id).map_err(|error| error.to_string())?;
+        let transcript = core_learn::render_transcript(&task, &log);
+        // 4. 一次无工具的 native 请求（会话级模型覆盖经 `effective_config` 同样生效）
+        let config = self.effective_config();
+        let runtime = mk_runtime(NATIVE_KERNEL, &config, &self.workspace)?;
+        let draft = core_learn::draft_skill(runtime, &config, &transcript, cancel)
+            .await
+            .map_err(|error| error.to_string())?;
+        // 5. C1 口径：预览与落盘取同一份文本——模型从转录里复述出的已知密钥在这里被抹掉
+        let redactor = self.redactor();
+        let SkillDraft {
+            name,
+            description,
+            body,
+        } = draft;
+        Ok(SkillDraft {
+            name,
+            description: redactor.redact(&description),
+            body: redactor.redact(&body),
+        })
+    }
+
+    /// 落盘（`s` 那一支）：查重 → `save_skill` → `reload_skills` →
+    /// `["saved skill {name}", "reloaded skills ({n})"]`。
+    ///
+    /// 同名（目标文件已存在，或目录里已有同名技能，含内置）一律拒绝、一个字节都不写：`Exists`
+    /// 的展示文案逐字是 `skill {name} already exists`；其它写失败带 `learn: ` 前缀原样交回。
+    /// 落盘成功后重扫 `~/.ignis/skills`，返回的第二行与 `/skills reload` 同一份文案。
+    fn commit_draft(&mut self, draft: &SkillDraft) -> Result<Vec<String>, String> {
+        let skills_dir = self.home.join("skills");
+        match core_learn::save_skill(&skills_dir, draft, &self.skills()) {
+            Ok(_path) => {}
+            Err(LearnError::Exists(name)) => {
+                return Err(format!("skill {name} already exists"));
+            }
+            Err(other) => return Err(other.to_string()),
+        }
+        let count = self.reload_skills();
+        Ok(vec![
+            format!("saved skill {}", draft.name),
+            self::skills::reloaded_line(count),
+        ])
+    }
+
     /// 当前内核是不是主路径的 native（`/model` 的能力分档与 `/status` 的模型行看它）。
     pub fn is_native(&self) -> bool {
         self.kernel == NATIVE_KERNEL
@@ -887,6 +989,7 @@ mod tests {
     use ignis_core::session::{COMPACT_SYSTEM_PROMPT, EARLIER_SUMMARY_PREFIX};
     use ignis_runtime::Role;
     use ignis_runtime::test_support::{ScriptStep, ScriptedModel, ScriptedModelHandle};
+    use ignis_storage::NewTask;
 
     use super::fixtures::{
         keyless_session_fixture, session_at_home, session_fixture, session_fixture_with_config,
@@ -1890,5 +1993,392 @@ mod tests {
         );
         assert!(session.last_prompt_stats().is_some(), "中止不清组装统计");
         assert!(model.requests().is_empty(), "预取消不该消耗模型");
+    }
+
+    /// `/learn` 的草稿文本（两步脚本的第二步）：合法的 SKILL.md。
+    fn draft_text() -> String {
+        "---\nname: demo-skill\ndescription: Demo draft.\n---\n# 步骤\n1. 做事\n".to_string()
+    }
+
+    /// 检查顺序第一档：非 native 或没有 Ignis 凭据都报同一句，一次模型请求都不发（`learn` 与
+    /// `draft_for_learn` 同一条门槛）。
+    #[tokio::test]
+    async fn learn_requires_native_credentials() {
+        // 外置内核（有 Ignis 凭据也不具备草稿所需的 native 请求）
+        let model = ScriptedModel::start(Vec::new());
+        let (_dir, mut codex) =
+            session_fixture_with_config("learn-codex", "codex", scripted_config(&model));
+        assert!(!codex.is_native());
+        assert_eq!(
+            codex
+                .draft_for_learn(None, CancellationToken::new())
+                .await
+                .unwrap_err(),
+            "learn requires native kernel credentials (current kernel does not provide them)"
+        );
+        // `learn` 整条路径同一句：门槛在生成草稿之前，根本走不到预览与确认
+        assert_eq!(
+            codex
+                .learn(None, CancellationToken::new())
+                .await
+                .unwrap_err(),
+            "learn requires native kernel credentials (current kernel does not provide them)"
+        );
+
+        // native 但没有 Ignis 凭据（环境变量名取不存在的，断言与运行者环境无关）
+        let (_dir, mut keyless) = keyless_session_fixture("learn-keyless", "native");
+        assert!(keyless.is_native());
+        assert!(!keyless.has_credentials());
+        assert_eq!(
+            keyless
+                .learn(None, CancellationToken::new())
+                .await
+                .unwrap_err(),
+            "learn requires native kernel credentials (current kernel does not provide them)"
+        );
+
+        assert!(
+            model.requests().is_empty(),
+            "凭据门槛先于模型：{:?}",
+            model.requests()
+        );
+    }
+
+    /// 默认目标 = 本工作区最近一条**成功**任务：转录里带上它的 id 与提示词；其后往库里插一条更旧
+    /// 的成功与一条更新的失败，仍取「最近的成功」。
+    #[tokio::test]
+    async fn learn_defaults_to_the_latest_successful_task_of_the_workspace() {
+        let model = ScriptedModel::start(vec![
+            ScriptStep::Text("答复一".into()),
+            ScriptStep::Text(draft_text()),
+            ScriptStep::Text(draft_text()),
+        ]);
+        let (_dir, mut session) =
+            session_fixture_with_config("learn-default", "native", scripted_config(&model));
+
+        // 先跑出一轮成功任务（消耗脚本第 1 步）
+        let outcome = session
+            .run_task("你好".into(), TaskKind::Repl)
+            .await
+            .expect("脚本化模型应答应成功");
+        let task_id = outcome.id.clone();
+
+        let draft = session
+            .draft_for_learn(None, CancellationToken::new())
+            .await
+            .expect("第二步是合法草稿");
+        assert_eq!(draft.name, "demo-skill");
+        assert_eq!(draft.description, "Demo draft.");
+
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2, "一轮任务 + 一次草稿请求：{requests:#?}");
+        let sent = requests[1]["messages"][1]["content"]
+            .as_str()
+            .expect("草稿请求的 user 正文");
+        assert!(sent.starts_with("Task: "), "{sent}");
+        assert!(sent.contains(&format!("Task: {task_id}")), "{sent}");
+        assert!(sent.contains("Prompt: 你好"), "{sent}");
+        assert!(sent.contains("Answer: 答复一"), "{sent}");
+        assert!(requests[1].get("tools").is_none(), "{:#?}", requests[1]);
+
+        // 更旧的成功 + 更新的失败：默认目标仍是「最近的成功」
+        let workspace = session.workspace().display().to_string();
+        for (id, started_at) in [
+            ("019a1b2c-3d4e-7f00-8000-000000000002", 1),
+            ("019a1b2c-3d4e-7f00-8000-000000000003", i64::MAX),
+        ] {
+            session
+                .db()
+                .insert_task(&NewTask {
+                    id: id.into(),
+                    kind: "run".into(),
+                    prompt: format!("prompt {id}"),
+                    kernel: "native".into(),
+                    workspace: workspace.clone(),
+                    started_at,
+                    session_id: None,
+                })
+                .unwrap();
+        }
+        session
+            .db()
+            .finish_task(
+                "019a1b2c-3d4e-7f00-8000-000000000002",
+                "success",
+                Some("旧答复"),
+                None,
+                0,
+                0,
+                false,
+                2,
+            )
+            .unwrap();
+        session
+            .db()
+            .finish_task(
+                "019a1b2c-3d4e-7f00-8000-000000000003",
+                "failed",
+                None,
+                Some("boom"),
+                0,
+                0,
+                false,
+                i64::MAX,
+            )
+            .unwrap();
+
+        let again = session
+            .draft_for_learn(None, CancellationToken::new())
+            .await
+            .expect("第三步是合法草稿");
+        assert_eq!(again.name, "demo-skill");
+        let requests = model.requests();
+        assert_eq!(requests.len(), 3);
+        let sent = requests[2]["messages"][1]["content"]
+            .as_str()
+            .expect("草稿请求的 user 正文");
+        assert!(
+            sent.contains(&format!("Task: {task_id}")),
+            "仍取最近的成功：{sent}"
+        );
+        assert!(
+            !sent.contains("prompt 019a1b2c-3d4e-7f00-8000-000000000003"),
+            "{sent}"
+        );
+    }
+
+    /// 显式 id 走 `task show` 的前缀规则：≥8 字符命中同一条、拼错原样报 not found；命中但不是
+    /// 成功状态与空库都给「没有可学的任务」；全程不消耗模型之外的会话状态、不落任务行。
+    #[tokio::test]
+    async fn learn_resolves_an_explicit_task_prefix_and_rejects_other_states() {
+        let model = ScriptedModel::start(vec![
+            ScriptStep::Text("答复一".into()),
+            ScriptStep::Text(draft_text()),
+        ]);
+        let (_dir, mut session) =
+            session_fixture_with_config("learn-prefix", "native", scripted_config(&model));
+        let outcome = session
+            .run_task("你好".into(), TaskKind::Repl)
+            .await
+            .unwrap();
+        let id = outcome.id.clone();
+        // `/learn` 不动会话：先记下五个面，跑完再逐个比
+        let history = session.history().to_vec();
+        let session_id = session.current_session().map(str::to_string);
+        let usage = session.last_usage().copied();
+        let stats = session.last_prompt_stats().copied();
+        let tasks_before = session.db().list_tasks(10).unwrap().len();
+
+        // 前缀（8 字符）命中同一条：转录里是完整 id
+        let draft = session
+            .draft_for_learn(Some(&id[..8]), CancellationToken::new())
+            .await
+            .expect("前缀应命中那条成功任务");
+        assert_eq!(draft.name, "demo-skill");
+        let sent = model.requests()[1]["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(sent.contains(&format!("Task: {id}")), "{sent}");
+
+        // 过短 / 拼错：原样交回 `task show` 的报错，不碰模型
+        for bad in ["short", "zzzzzzzz"] {
+            assert_eq!(
+                session
+                    .draft_for_learn(Some(bad), CancellationToken::new())
+                    .await
+                    .unwrap_err(),
+                format!("task not found: {bad}")
+            );
+        }
+        assert_eq!(model.requests().len(), 2, "not found 不消耗模型");
+
+        // `/learn` 不新建任务行、不动会话（history / 指针 / 用量 / 组装统计一个都不变）
+        assert_eq!(session.db().list_tasks(10).unwrap().len(), tasks_before);
+        assert_eq!(session.history(), history.as_slice());
+        assert_eq!(session.current_session().map(str::to_string), session_id);
+        assert_eq!(session.last_usage().copied(), usage);
+        assert_eq!(session.last_prompt_stats().copied(), stats);
+
+        // 命中的任务不是成功状态（改成 aborted）→ 同一句「没有可学的任务」；默认目标也一样
+        let model = ScriptedModel::start(vec![ScriptStep::Text("答复一".into())]);
+        let (_dir, mut aborted) =
+            session_fixture_with_config("learn-aborted", "native", scripted_config(&model));
+        let outcome = aborted
+            .run_task("你好".into(), TaskKind::Repl)
+            .await
+            .unwrap();
+        aborted
+            .db()
+            .finish_task(&outcome.id, "aborted", None, None, 0, 0, false, 99)
+            .unwrap();
+        for arg in [Some(outcome.id.as_str()), None] {
+            assert_eq!(
+                aborted
+                    .draft_for_learn(arg, CancellationToken::new())
+                    .await
+                    .unwrap_err(),
+                "learn: no completed task to learn from"
+            );
+        }
+        assert_eq!(model.requests().len(), 1, "目标解析失败不消耗模型");
+
+        // 空 home：没有任务行 → 同一句
+        let model = ScriptedModel::start(Vec::new());
+        let (_dir, mut empty) =
+            session_fixture_with_config("learn-empty", "native", scripted_config(&model));
+        assert_eq!(
+            empty
+                .draft_for_learn(None, CancellationToken::new())
+                .await
+                .unwrap_err(),
+            "learn: no completed task to learn from"
+        );
+        assert!(model.requests().is_empty());
+    }
+
+    /// 落盘那一支：`saved skill …` + `reloaded skills (4)`、文件 0600 且内容等于草稿文本、reload
+    /// 后会话目录里看得见；再存一次被拒（文件存在）且字节不变。夹具技能目录里只有内置三技能。
+    #[tokio::test]
+    async fn learn_saves_the_draft_and_reloads_the_catalog() {
+        let model = ScriptedModel::start(vec![
+            ScriptStep::Text("答复一".into()),
+            ScriptStep::Text(draft_text()),
+        ]);
+        let (dir, mut session) =
+            session_fixture_with_config("learn-save", "native", scripted_config(&model));
+        session
+            .run_task("你好".into(), TaskKind::Repl)
+            .await
+            .unwrap();
+        assert_eq!(session.skills().metas().len(), 3, "夹具目录只有内置三技能");
+
+        let draft = session
+            .draft_for_learn(None, CancellationToken::new())
+            .await
+            .unwrap();
+        let lines = session.commit_draft(&draft).expect("空目录应当能落盘");
+        assert_eq!(lines, ["saved skill demo-skill", "reloaded skills (4)"]);
+
+        let path = dir
+            .path()
+            .join("skills")
+            .join("demo-skill")
+            .join("SKILL.md");
+        assert!(path.is_file(), "{}", path.display());
+        assert_eq!(fs::read_to_string(&path).unwrap(), draft.to_skill_md());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", path.display());
+        }
+        assert!(
+            session
+                .skills()
+                .metas()
+                .iter()
+                .any(|meta| meta.name == "demo-skill"),
+            "reload 后会话目录里应看得见新技能"
+        );
+
+        // 再存一次同一草稿：拒绝（文件存在）且一个字节都不改
+        let before = fs::read(&path).unwrap();
+        assert_eq!(
+            session.commit_draft(&draft).unwrap_err(),
+            "skill demo-skill already exists"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    /// C1 口径：草稿的 `description` / `body` 在预览与落盘之前先过一遍会话脱敏器——两处是同一份
+    /// 文本，模型复述的密钥既不会进预览，也不会进 SKILL.md。
+    #[tokio::test]
+    async fn learn_redacts_the_draft_before_preview_and_save() {
+        let secret = "sk-learn-secret";
+        let text = format!(
+            "---\nname: demo-skill\ndescription: 提到 {secret}\n---\n# 步骤\n用 {secret} 做事\n"
+        );
+        let model = ScriptedModel::start(vec![
+            ScriptStep::Text("答复一".into()),
+            ScriptStep::Text(text),
+        ]);
+        let config = Config {
+            api_key: Some(secret.into()),
+            ..scripted_config(&model)
+        };
+        let (dir, mut session) = session_fixture_with_config("learn-redacted", "native", config);
+        session
+            .run_task("你好".into(), TaskKind::Repl)
+            .await
+            .unwrap();
+
+        let draft = session
+            .draft_for_learn(None, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            draft.description.contains("***") && !draft.description.contains(secret),
+            "{draft:?}"
+        );
+        assert!(
+            draft.body.contains("***") && !draft.body.contains(secret),
+            "{draft:?}"
+        );
+
+        let lines = session.commit_draft(&draft).unwrap();
+        assert_eq!(lines, ["saved skill demo-skill", "reloaded skills (4)"]);
+        let saved = fs::read_to_string(dir.path().join("skills/demo-skill/SKILL.md")).unwrap();
+        assert_eq!(saved, draft.to_skill_md(), "预览与落盘是同一份文本");
+        assert!(!saved.contains(secret), "{saved}");
+    }
+
+    /// 非法草稿与模型失败都在落盘之前收口：技能目录一个子项都不多；错误前缀逐字。
+    #[tokio::test]
+    async fn learn_reports_an_invalid_draft_without_writing() {
+        let model = ScriptedModel::start(vec![
+            ScriptStep::Text("答复一".into()),
+            ScriptStep::Text("不是草稿".into()),
+        ]);
+        let (dir, mut session) =
+            session_fixture_with_config("learn-invalid", "native", scripted_config(&model));
+        session
+            .run_task("你好".into(), TaskKind::Repl)
+            .await
+            .unwrap();
+
+        let error = session
+            .draft_for_learn(None, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "learn: invalid draft (missing or invalid frontmatter)"
+        );
+        // 技能目录没有被碰过（不存在，或还是空的）
+        let entries = fs::read_dir(dir.path().join("skills"))
+            .map(Iterator::count)
+            .unwrap_or(0);
+        assert_eq!(entries, 0, "非法草稿一个目录都不该建");
+
+        // 模型失败：`learn: generation failed: ` 前缀（401 不重试）
+        let model = ScriptedModel::start(vec![
+            ScriptStep::Text("答复一".into()),
+            ScriptStep::Error {
+                status: 401,
+                body: r#"{"error":"bad key"}"#.into(),
+            },
+        ]);
+        let (_dir, mut session) =
+            session_fixture_with_config("learn-generate", "native", scripted_config(&model));
+        session
+            .run_task("你好".into(), TaskKind::Repl)
+            .await
+            .unwrap();
+        let error = session
+            .draft_for_learn(None, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(error.starts_with("learn: generation failed: "), "{error}");
     }
 }
