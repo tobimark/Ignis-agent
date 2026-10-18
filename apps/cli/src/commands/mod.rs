@@ -1033,6 +1033,9 @@ pub(crate) fn no_color_value(raw: Option<OsString>) -> Option<String> {
 /// 实现口径：`tokio::signal::unix::signal(SignalKind::interrupt())` **调用即注册**（不是首次
 /// 轮询），把返回的流移进后台任务持续 `recv()` 即完成安装；非 unix 返回 `None`（REPL 本身
 /// 也是 unix 门控，行为退化为今日）。安装失败（不支持的平台）同样 `None`，不 panic。
+///
+/// 前提：必须在 tokio 运行时内调用——这里的常驻排空任务用 `tokio::spawn` 挂（运行时外调用
+/// 会 panic）；平台不支持时 `signal()` 先交出 `Err`（随即 `None`），走不到 `spawn`。
 #[cfg(unix)]
 pub fn install_ctrl_c_handler() -> Option<JoinHandle<()>> {
     use tokio::signal::unix::{SignalKind, signal};
@@ -1167,31 +1170,82 @@ mod tests {
     use super::*;
     use crate::commands::kernel::fixtures::{TempDir, set_executable};
 
+    /// 父子两个用例共享的环境变量名：父用例只在拉起子进程时设它，子探针只在它存在时才真的
+    /// `raise`——`cargo test -- --ignored`（或 `--include-ignored`）之类的全量扫描即使扫到
+    /// 子探针，它也只是一次空转，不会朝任何进程打信号。
+    #[cfg(unix)]
+    const SIGINT_HELPER_ENV: &str = "IGNIS_CLI_SIGINT_HELPER";
+
+    /// 子进程里的 `raise` 探针（父用例拉起同一个测试二进制、只跑这一条）：装上处理器 →
+    /// `raise(SIGINT)` → 打标记后正常返回。
+    ///
+    /// 与父用例分进程是刻意的：信号投递是**进程级**的，而同一个 bin 测试目标里还有几十条跑
+    /// `Session::run_task` 的用例——它们的 watcher 共享同一份投递，同进程 `raise` 会把手气
+    /// 变成「并发用例被顺带取消」的偶发抖动。子进程里只有本探针，信号只可能命中它。
+    ///
+    /// 判据由父用例在进程边界上观察：处理器没装上时本进程按默认处置**死于 SIGINT**（`status`
+    /// 里没有退出码），父用例因此拿不到「成功 + 标记」这一对断言。
+    #[cfg(unix)]
+    #[ignore = "由 install_ctrl_c_handler_arms_the_handler_before_the_first_reader 在子进程里拉起"]
+    #[tokio::test]
+    async fn sigint_install_helper_child() {
+        // 没有父用例设的环境变量就什么都不做（防 `--ignored` 全量扫描把信号打进测试进程）
+        if std::env::var_os(SIGINT_HELPER_ENV).is_none() {
+            return;
+        }
+        // 安装先于 raise：返回 `Some` 表示进程级处理器此刻已经就位。句柄活到本用例结束（排空
+        // 任务常驻，安装到进程退出都在）；没装上时下面那一句 `raise` 会按默认处置杀掉本进程
+        // ——失败方式本身就是这条用例要钉住的东西
+        let installed = install_ctrl_c_handler();
+        assert!(installed.is_some(), "unix 上必须装得上 SIGINT 处理器");
+        // SAFETY: `raise` 只把信号递给本进程自己，不碰内存、也不需要初始化。
+        unsafe { libc::raise(libc::SIGINT) };
+        // 常驻排空任务把这次信号消费掉（安装已生效，`raise` 不再是默认处置）：给它的这一小段
+        // 时间只是把标记的时机定在「信号已被接住」之后
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        println!("SIGINT-CAUGHT");
+    }
+
     /// 安装时机（P5 台账里的偶发信号退出）：[`install_ctrl_c_handler`] **调用即注册**，此后
     /// 每段 `spawn_ctrl_c_watcher` 都建立在已装好的处理器之上——第一段 watcher 被首次轮询之前
     /// 到达的 SIGINT 不再走默认处置把进程带走，而是由各段监听者各自收成取消。
     ///
-    /// 断言顺序即判据：先断言「装上了」再 `raise`。没装上时 `raise(SIGINT)` 会按默认处置
-    /// **杀掉测试进程**——失败方式本身就是这条用例要钉住的东西。
+    /// `raise` 那半条判据跑在子进程里（[`sigint_install_helper_child`]）：本用例只看「子进程活着
+    /// 走完 + 打过标记」，信号因此不会把同二进制里几十条 `run_task` 用例的 watcher 顺带取消。
     #[cfg(unix)]
     #[tokio::test]
     async fn install_ctrl_c_handler_arms_the_handler_before_the_first_reader() {
-        // 安装先于任何监听者：返回 `Some` 表示进程级处理器此刻已经就位
+        // 安装先于任何监听者：返回 `Some` 表示进程级处理器此刻已经就位（句柄不显式 drop——
+        // 排空任务常驻，安装到进程退出都在）
         let installed = install_ctrl_c_handler();
         assert!(installed.is_some(), "unix 上必须装得上 SIGINT 处理器");
 
-        let token = CancellationToken::new();
-        let watcher = spawn_ctrl_c_watcher(token.clone());
-        // 让 watcher 先完成首次轮询（注册自己那条流）：本用例考的是「安装已经生效」，不是
-        // 「spawn 之后多久被轮询」——后者由生产侧「安装先于第一段等待」的时序负责。
-        tokio::task::yield_now().await;
-        // SAFETY: `raise` 只把信号递给本进程自己，不碰内存、也不需要初始化。
-        unsafe { libc::raise(libc::SIGINT) };
-        tokio::time::timeout(Duration::from_secs(2), token.cancelled())
-            .await
-            .expect("装好的处理器必须把 SIGINT 转成取消");
-        watcher.abort();
-        drop(installed);
+        // 同一个测试二进制的子进程里只跑探针那一条：`--exact` 钉名字、`--ignored` 让被
+        // `#[ignore]` 的它照跑、`--nocapture` 让它的 `println!` 落到我们读的这根管道上
+        let exe = std::env::current_exe().expect("测试二进制路径");
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "commands::tests::sigint_install_helper_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            // 守卫：探针只在父用例设了它时才真的 raise
+            .env(SIGINT_HELPER_ENV, "1")
+            .output()
+            .expect("拉起子进程探针");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // 处理器没装上时子进程死于 SIGINT：没有退出码，`success()` 为假
+        assert!(
+            output.status.success(),
+            "子进程必须活着走完（没装处理器会死于 SIGINT）：{:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            output.status
+        );
+        assert!(
+            stdout.contains("SIGINT-CAUGHT"),
+            "探针必须打到标记：\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
 
         // 重复调用：不 panic、不改变行为（第二次照样是「已装好」的形状）
         assert!(
