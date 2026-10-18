@@ -9,6 +9,100 @@
 - 任务清单：`harness/tasks.md`（20 例常见任务，逐条含机器可判定的预期）
 - 结果文件：`harness/results-<时间戳>.md`（自动生成，已 gitignore；不含任何密钥）
 
+> **v0.2 的验收记录在下一段「v0.2 验收」**（发布门，2026-10-19）。它是 v0.2 验收的**唯一事实来源**；
+> 本文件其余部分仍是 v0.1 三条门槛的执行器说明与历史真机记录（v0.2 沿用同一套门槛，口径未变）。
+
+## v0.2 验收（发布门记录 · 唯一事实来源）
+
+> 口径（与 README 终端矩阵、本计划 R5 同一条）：**逐项写明命令与实际观察；跑不了的记 SKIP + 原因，
+> 绝不写成 PASS**；任何一条 SKIP 都让整体结论变成「**验收不完整**」。所有自动化项都是离线、hermetic
+> 的（临时 `IGNIS_HOME` + 脚本化假模型），随 `cargo test` 跑；手动项在 tmux（3.6）真 pty 上跑，
+> 端点用本机 `python3` stdlib 写的**脚本化 SSE 假端点**（只服务终端矩阵观察，不构成任何门槛证据）。
+> 原始证据（tmux pane 文本截图、pane 原始字节流、驱动脚本）留在
+> `.superpowers/sdd/2026-10-16-ignis-v0.2-p6-release/matrix-evidence/`（gitignore 目录，随本机留存）。
+
+**结论：验收不完整。** 三条真机门槛（`demos 3` / `tasks 20` / `restarts 10`）**本机没有真实模型凭据、
+未执行**；终端矩阵的「Ubuntu 默认终端（gnome-terminal/konsole）」「SSH」两行**本机没有可用的终端环境**；
+「浅色主题」的**主观可读性**没有可用的显示环境——三处 SKIP 各有原因（见下）。其余项（§8 九条里的
+自动化面、两条新指标、终端矩阵其余四行、全量回归）都已实际执行并逐条记录在案。
+
+### 1. 两条新指标（v0.2 新增）
+
+| 指标（设计 §8 / §9） | 落点 | 本次结果 |
+|---|---|---|
+| 会话启停 ≥10 次、恢复后 canonical 历史逐条相等 | `apps/cli/tests/sessions.rs::session_restore_keeps_the_canonical_history_across_ten_cycles` | **PASS**（新用例，断言清单见下） |
+| 流式 100 次不丢不重（随机分片） | `apps/cli/src/render/markdown.rs::random_split_feeding_matches_whole_feeding_byte_for_byte`（100 轮随机切分 + 逐字符 + 跨 UTF-8）、`packages/runtime/src/think.rs::random_fragmentation_keeps_channel_semantics`（100 轮随机分片） | PASS（随 `cargo test --workspace` 全绿） |
+
+会话用例逐条锁住的行为（同一个临时 `IGNIS_HOME` + 同一份工作区 + **同一个假模型句柄**贯穿十轮）：
+
+1. **第 1 轮不带 `-c`**：banner 的 `Session:` 行是 `new`，请求体（去掉 system）只有本轮输入；
+2. **第 2–10 轮都以 `ignis -c` 起**：banner 是 13 字符短 id、十轮同一个（且是库里会话 id 的前缀），
+   恢复未命中才会打的 note 一次都没出现；
+3. **每轮的请求体 vs 库行双向核对**：第 i 轮送进内核的非 system 消息**逐条等于**「前 i−1 轮的
+   `session_messages` 行 + 本轮输入」（角色、内容、顺序），每轮 `/exit` 退出后直读库，
+   `session_messages` 又**逐条等于**十轮的全量 canonical 序列（含 `seq` 连续性）——没有近似；
+4. **第 10 轮结束**：`session_messages` 条数 == `2 × 10`；`tasks` 恰好 10 行且 `session_id` **全部**
+   指向同一条会话；模型句柄累计恰好 10 份请求（一个句柄贯穿，多发的请求会让后续轮次答复错位而当场失败）。
+
+本次运行证据：`cargo test -p ignis-cli --test sessions` → `1 passed`（连续 5 次全绿，单次 0.83–0.93s）；
+`cargo test --workspace` 里同一目标一次通过。
+
+### 2. 设计 §8 九条 → 证据映射
+
+| # | 设计 §8 条目 | 证据（路径 / 用例名） | 本次结论 |
+|---|---|---|---|
+| 1 | CLI 渲染：连续流式 100 次（随机分片 + e2e）无重复、丢字、布局错乱；无未处理的推理标记 | 属性测试 `apps/cli/src/render/markdown.rs::random_split_feeding_matches_whole_feeding_byte_for_byte`、`packages/runtime/src/think.rs::random_fragmentation_keeps_channel_semantics`；模式矩阵单测（`apps/cli/src/render/mod.rs`，含 `minimal_mode_hides_tool_lines_and_summarizes_thinking`）；e2e `apps/cli/tests/pty.rs::pty_submits_a_chinese_prompt_and_renders_the_answer`、`apps/cli/tests/render.rs::inline_reasoning_is_split_out_of_the_answer_channel` | PASS（`cargo test` 全绿）+ 矩阵 tmux / 80 列两行的实机观察 |
+| 2 | 输入编辑：多行、中文、长文本粘贴、历史导航、命令补全 | `apps/cli/tests/pty.rs`：`pty_ctrl_j_edits_a_multi_line_prompt_and_submits_once`、`pty_long_paste_does_not_submit_until_enter`、`pty_long_input_line_wraps_with_the_continuation_marker`、`pty_pasted_text_with_tabs_renders_expanded_and_submits_verbatim`、`pty_up_arrow_recalls_history_and_restores_the_draft`、`pty_tab_completes_a_unique_prefix_and_lists_candidates`；手动抽查：矩阵 tmux 行（`↑` 召回）与 80 列行（输入行折行） | PASS |
+| 3 | 会话恢复：≥10 次关闭/重启（`-c`），canonical 历史逐条完整 | `apps/cli/tests/sessions.rs::session_restore_keeps_the_canonical_history_across_ten_cycles`（本次新增）；旁证 `apps/cli/tests/pty.rs::pty_continue_restores_the_previous_turn_for_the_model` | **PASS**（见上「两条新指标」） |
+| 4 | Context 管理：`/context` 区分真实用量与无数据；`/compact` 后关键决策仍在 | `apps/cli/src/commands/slash.rs::context_lines_matrix`、`dispatch_context_reads_the_session_state`、`help_lines_carry_the_context_row`；`apps/cli/tests/pty.rs::pty_compact_summarizes_and_keeps_the_raw_rows` | PASS（离线面）；「用一个真实任务验证复述」需要真实模型 → 该子项不在本机执行 |
+| 5 | 长期记忆：保存 / 跨会话读取 / 编辑 / 删除全部通过；`remember` 确认行可见 | `apps/cli/tests/remember.rs::remember_success_prints_the_confirmation_line`、`remember_failure_prints_no_confirmation_line`；跨进程复用 `apps/cli/tests/demo_b.rs::demo_b_remembers_reuses_and_corrects_across_processes`；记忆 CRUD 单测在 `apps/cli/src/commands/memory.rs`；真机 harness Demo B → **SKIP**（无凭据；且本机无 `uv`） | PASS（离线面）；真机面 SKIP |
+| 6 | Skills：3 个内置技能可展示、加载、记录实际使用；`reload` 生效 | `apps/cli/tests/pty.rs::pty_skills_reload_picks_up_a_new_skill_file`、`pty_learn_saves_the_draft_after_confirmation`、`pty_learn_discard_and_refusal_leave_no_file`；`skills_used` 落库断言见 `apps/cli/tests/kernel.rs` 与 core 单测；真机 harness「技能目录」记录 → **SKIP**（无凭据） | PASS（离线面）；真机面 SKIP |
+| 7 | 工具观察与取消：进度 / 异常 / 取消状态一致；中断绝不报成成功 | 工具行配对与异常展示：`apps/cli/src/render/mod.rs::normal_mode_prints_the_exec_and_result_lines_of_a_paired_tool_call`、`tool_result_pairs_by_call_id_not_first_in_first_out`、`failed_tool_result_prints_the_first_line_of_its_output_on_a_second_line`、`apps/cli/tests/render.rs::tool_completion_line_pairs_with_the_exec_line_and_carries_the_elapsed`；取消：`packages/runtime/src/native/mod.rs::cancel_token_aborts_mid_stream`、`cancel_before_first_request_aborts`、`apps/cli/tests/tui.rs::pty_tui_ctrl_c_cancels_a_running_task_without_leaving`（`● Aborted`）；触限三处一致：`apps/cli/tests/limits.rs::max_steps_reaches_limit_and_stays_visible` | PASS |
+| 8 | 终端兼容：Ubuntu 终端、SSH、tmux、80 列、无色通过基础测试 | 本文件「3. 终端矩阵」段（tmux / 80 列 / 无色 = PASS；Ubuntu 默认终端、SSH、浅色主观项 = SKIP + 原因）；自动化：`apps/cli/src/render/width.rs` 折行单测、`apps/cli/src/tui/view.rs::compose_without_color_emits_no_sgr`、`apps/cli/tests/render.rs::no_color_env_overrides_always_color_in_config`、`apps/cli/tests/tui.rs` 两条降级用例、`apps/cli/tests/pty.rs::pty_long_input_line_wraps_with_the_continuation_marker` | **部分 PASS / 部分 SKIP**（3 项 SKIP 各带原因）→ 该项按「验收不完整」记 |
+| 9 | 功能回归：v0.1 全部 e2e 通过 | `cargo test --workspace`：29 个测试目标、**926 passed / 0 failed / 2 ignored**（v0.1 套件 `demo_a`、`demo_b`、`demo_c`、`approval_modes`、`limits`、`redaction`、`kernel`、`daemon_lifecycle`、`autostart` 全绿）；`cargo clippy --workspace --all-targets -- -D warnings` 零警告；`cargo fmt --all --check` 干净 | PASS |
+
+**§8 的「端到端演示（可重复）」**：三次启动的演示脚本在 README（Task 5 落地，需要真实端点）；
+本机执行不了真机演示（无凭据）→ **SKIP + 原因**。其中 `--tui` 那一次的等价观察在矩阵 tmux 行：
+`ignis --tui` 进备用屏、跑一轮、`/exit` 还原备用屏与 termios。
+
+### 3. 终端矩阵（手动，逐项记录）
+
+本机环境事实（记录时刻）：Ubuntu x86_64、`tmux 3.6`（`/usr/bin/tmux`，pane `TERM=tmux-256color`）、
+**无图形终端**（`gnome-terminal` / `konsole` 未安装，只装了需要 X 的 `xfce4-terminal`；`xdpyinfo` 对
+`DISPLAY=localhost:10.0` 与 `:0` 都失败）、**无可用的 SSH 目标**（回环探测 255：`Permission denied`）、
+无 `uv`、`python3` 可用（假端点与证据核对都用它）。
+
+| 终端 | 结论 | 记录（命令 + 实际观察） |
+|---|---|---|
+| Ubuntu 终端（默认，gnome-terminal/konsole） | **SKIP + 原因** | 本机没有可用的图形终端：`command -v gnome-terminal konsole` 皆空（只有 `xfce4-terminal`），`xdpyinfo` 对 `DISPLAY=localhost:10.0` / `:0` 都失败。**不记 PASS**。「编辑器重绘/历史/Ctrl+C/退出复原」的等价观察在 tmux 行完成（tmux pane 是真 pty）。 |
+| tmux | **PASS** | `tmux -f /dev/null new-session -d -s matrix-a -x 200 -y 50 bash --noprofile --norc`，在其中 `cd <ws> && env IGNIS_HOME=… IGNIS_WORKSPACE=… IGNIS_BASE_URL=http://127.0.0.1:8899/v1 IGNIS_MODEL=fake-matrix-model IGNIS_API_KEY=test-key target/release/ignis`。观察：banner 5 行（`IGNIS v0.2.0` / `● Ready` / `Workspace:` / `Runtime: native · Skills: 3 · Memory: 0 facts` / `Session: new`）；一轮任务流式渲染 + 结束行 `● Done · 0.0s · 0 tools · task 01a14ff2-aa6b`；`↑` 召回上一条输入（屏幕上同一句出现两次）；`/help` 15 条命令；**空闲 Ctrl+C** 干净退出、`echo $?` = `0`（P6-T1 的 SIGINT 提前安装修复在真 pty 上复验）；退出后 `stty -a` 里 `echo,echoe,icanon,isig` 全部复原；pane 原始字节流 3085 B、SGR 6 条（默认 `ui.color auto` + tty = 有色，颜色正对照）。另一局 `-x 80 -y 24`：经典 REPL 一轮 + 空闲 Ctrl+C 退出 + `stty` 复原；`ignis --tui` 进备用屏（原始流 `\x1b[?1049h` ×1 / `\x1b[?1049l` ×1）、首帧状态行 `ctx 0/200000 chars · last - · mode normal · PgUp/PgDn scroll`、跑一轮、`/exit` → `echo $?` = `0`、`stty` 复原。 |
+| SSH | **SKIP + 原因** | 探测：`ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 localhost true` → 退出 255（`Permission denied (publickey,password)`）；本机没有可用的「SSH 到目标终端」环境（设计 §3 环境事实）。**不记 PASS**。 |
+| 80 列 | **PASS（含 1 条版式注意）** | 路径 a（`stty cols 80`）：pane 200×50 里先 `stty cols 80; stty size` → `50 80` 再起 ignis。观察：超长输入行（94 字符 / 约 158 列）由编辑器按显示宽度折成 **80 / 80 / 34** 三行、续行带 `… ` 标记，提交与落库的文本逐字不变（库里 `session_messages.content` 与输入逐字相等）；列表项由渲染层折行、续行对齐（续行 62 列 ≤ 80）；`/help` 15 行、最宽 92 列；`/exit` 退出码 0；`stty` 复原。路径 b（真实 80×24 pane）：banner 的 `Workspace:` 长行由终端软折行；`/help` 的 3 行在终端边缘软折行。**版式注意**：`/help` 的 `/context`（88 列）、`/compact`（85 列）、`/kernel`（92 列）三行超过 80 列——命令层输出不经渲染层折行，在真实 80 列终端上由终端软折行（续行是 `rn usage` / `ssage` / `odex\|claude)`），**文字完整、无错乱**；`/help` 是 P6 明确冻结的面（「只做收口，不动 `/help`」），故记为版式注意而不是本任务的修复项。 |
+| 无色（`NO_COLOR=1`） | **PASS** | 80×24 pane 里 `NO_COLOR=1` 跑一轮 + `/help` + `/exit`：pane 原始字节流里 **SGR 序列 0 条**（CSI 37 条，全是清行/光标类重绘，不是颜色），文字与布局与有色一致。另一例 `ignis config set ui.color never`（`config.json` = `{"ui":{"color":"never"}}`）同样一轮：**SGR 0 条**（CSI 23 条）。正对照：默认那一轮 SGR 6 条（`\x1b[2m` 代码围栏 dim、`\x1b[1m` 标题、`\x1b[0m` 复位）——有无色的差别确实来自应用自己。 |
+| 浅色主题（`ui.theme=light`） | **SKIP + 原因（主观项）** | `ignis config set ui.theme light`（`config.json` = `{"ui":{"theme":"light"}}`）在 80×24 pane 里跑一轮 + `/exit`：不崩、答复正常、`stty` 复原；原始流 SGR 集合 `\x1b[0m` / `\x1b[1m` / `\x1b[90m`，与 dark 的 `\x1b[0m` / `\x1b[1m` / `\x1b[2m` **只差 dim 槽**（light 用亮黑 90）——主题切换确实生效（客观部分，只作附注，不构成该项 PASS）。**主观可读性（浅色背景上的对比度）本机没有可用显示环境，无法目视判断 → SKIP**。 |
+
+### 4. harness 记录（三条真机门槛）
+
+| 命令 | 本次结果 |
+|---|---|
+| `harness/acceptance.sh demos 3` | **退出码 2**：前置检查未通过——`IGNIS_BASE_URL` / `IGNIS_MODEL` / `IGNIS_API_KEY` 都未设置（本机没有真实模型凭据）。**没有写结果文件**（脚本不给「没跑过」的产物）。三条门槛 → **SKIP + 原因** |
+| `harness/acceptance.sh tasks 20` / `restarts 10` | 同上未执行（`preflight` 在缺凭据时先拒；`tasks` / `restarts` 与 `demos` 共用同一前置检查） |
+| `harness/acceptance.sh --dry-run demos 3` | **退出码 0**、`DRY=9`（A×3、B×1、C×3、技能目录、doctor）；证明头注释更新后脚本结构与判定子句原样在位（脚本行为未改） |
+
+> 另：本机无 `uv`，真实 Demo B 在 v0.1 起就记 SKIP——本次口径未变（门槛级 SKIP ⇒「验收不完整」，退出码 1）。
+> 三条门槛本机结论一律是 **SKIP（原因：无真实模型凭据）**，不得写成 PASS。
+
+### 5. 发布门（本次收口的命令与结果）
+
+```sh
+cargo fmt --all -- --check                 # 干净
+cargo clippy --workspace --all-targets -- -D warnings   # 零警告
+cargo test --workspace                     # 29 个测试目标：926 passed / 0 failed / 2 ignored
+cargo build --release --locked             # 成功
+target/release/ignis --version             # 逐字：ignis 0.2.0
+```
+
+
 ## 1. 三条门槛
 
 | # | 门槛（demo.md §七） | 命令 | 判定口径 |

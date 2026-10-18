@@ -395,7 +395,7 @@ cargo test --workspace          # 离线：不依赖网络与真实模型
 ```
 
 - 单元测试随各 crate；外置内核适配器的假 CLI 集成测试在 `packages/runtime/tests/`。
-- 端到端测试在 `apps/cli/tests/`（`demo_a.rs` / `demo_b.rs` / `demo_c.rs` / `approval_modes.rs` / `kernel.rs` / `daemon_lifecycle.rs` / `autostart.rs` / `limits.rs` / `redaction.rs` / `remember.rs` / `render.rs` / `tui.rs` / `pty.rs`）：用真构建的 `ignis` 二进制 + `ignis-runtime` 的脚本化假模型（`test-support`），断言落在真文件、真数据库行与真进程上。
+- 端到端测试在 `apps/cli/tests/`（`demo_a.rs` / `demo_b.rs` / `demo_c.rs` / `approval_modes.rs` / `kernel.rs` / `daemon_lifecycle.rs` / `autostart.rs` / `limits.rs` / `redaction.rs` / `remember.rs` / `render.rs` / `tui.rs` / `pty.rs` / `sessions.rs`）：用真构建的 `ignis` 二进制 + `ignis-runtime` 的脚本化假模型（`test-support`），断言落在真文件、真数据库行与真进程上。
 - 真实模型的量化验收（三场景各连续 3 次、20 例常见任务 ≥80%、10 次重启）是**手动、可选**执行（控制额度消耗），不进 CI：三条门槛见 [`harness/acceptance.sh`](harness/acceptance.sh)（`demos 3` / `tasks 20` / `restarts 10`），门槛定义、运行方法与最近结果记录见 [`docs/acceptance.md`](docs/acceptance.md)。
 - 提交信息用 Conventional Commits（英文 type/scope，中文正文）。
 - Docker / systemd 部署见上文与 [`deploy/README.md`](deploy/README.md)。
