@@ -2,6 +2,8 @@
 
 **Ignis 是一个用 Rust 从零实现执行循环的本地个人 AI Agent**：单二进制 CLI，可切换执行内核（`native` / `codex` / `claude`），具备长期记忆、技能与后台定时任务，能把真实任务做完（读写文件、跑 Shell、抓网页），而不是只聊天。
 
+**v0.2（版本号 `0.2.0`，主题 *Interactive & Persistent*）** 在 v0.1 的「能跑、能记、能调度」之上补齐终端交互与持久化：流式渲染 + 推理/正文分道、多行行编辑器、15 个本地斜杠命令、可恢复的持久会话、上下文可视化与压缩，以及全屏 TUI Beta（`ignis --tui`）。
+
 - **Rust**（edition 2024，MSRV 1.98；`rust-toolchain.toml` 固定 `stable`）
 - **单二进制** `ignis`（glibc 基线，无运行时依赖；内置技能编译进二进制）
 - **Linux / macOS**（内核发现目前只在 Unix 实测，见[限制](#限制)）
@@ -9,11 +11,21 @@
 
 ---
 
+## v0.2 新增
+
+- **渲染**：模型输出的 Markdown 子集（围栏代码块、`#`–`####` 标题、`- `/`* ` 无序列表、`> ` 引用、`---` 分隔线、行内 `` `code` `` 与 `**粗体**`；表格 / 链接 / 图片 / 斜体原样通过）；推理（`think`）与正文**分道渲染**——normal 以 `· ` 起行、debug 加 `[reasoning] ` 前缀、minimal 只给收尾摘要行；输出模式 `minimal` / `normal` / `debug`（`/details` 或 `ui.output_mode` 切换）；主题 dark / light + 无色（`ui.theme`、`ui.color`、`NO_COLOR`）。
+- **输入**：多行编辑（`Alt+Enter` / `Ctrl+J` 换行）、历史（`~/.ignis/history`）、Tab 补全（命令名与 `/kernel` 取值）、bracketed paste（整段粘贴不被当成逐行提交）、按显示宽度折行与 CJK 全角宽度（`\t` 只按 8 列制表位展开到屏幕）；raw mode 不可用（`TERM` 缺失 / `dumb`、stdout 不是终端）时回退按行输入，并打一行 `note: line editing unavailable (<原因>); using plain line input`。
+- **命令**：15 个本地斜杠命令（分组、顺序与文案见[命令参考](#命令参考)，以 `/help` 为准）；除 `/compact`、`/learn` 各要一次模型往返外，其余 13 条全在本地完成、不消耗模型；未知命令只在本地报错（`Unknown command: /<名字> — /help lists commands`，绝不送给模型）。
+- **会话**：`-c` / `--continue` 恢复本工作区最近一次会话；REPL 里 `/new` 开新会话、`/sessions` 列最近会话、`/resume <id>`（≥8 字符唯一前缀）切换；canonical 历史（用户提示词 + assistant 最终答复）按轮落库、`tasks.session_id` 记下每轮任务归属。
+- **上下文**：`/context` 只读展示历史条数与字符、字符预算、最近一轮用量与组装统计（facts / skills / system chars）；`/compact` 把较早轮次摘要化（保留最近两轮，原始消息不删）。
+- **记忆·技能**：`/memory <list|search|add|edit|delete>`（与 `ignis memory …` 同一份口径）；`remember` 元工具成功后固定打一行确认 `  ✓ memory: <key> (<scope>) <文本 ≤60 字符>`；`/skills [reload]` 列技能目录或重扫；实验性 `/learn [task-id]` 从一条已完成任务生成 `SKILL.md` 草稿，**确认后**才落盘（不自动部署、不自动执行）。
+- **TUI Beta**：`ignis --tui` 全屏界面（备用屏 + 帧合成，复用同一套 markdown / 宽度 / 调色板与命令分发）；不满足条件时只打一行 note 并降级到经典 REPL。
+
 ## 设计理念：remember, act, improve
 
 - **Remember（记得住）**：事实跨会话持久化（SQLite + FTS5 trigram + 可读 Markdown 镜像）；任务前把相关记忆注入系统提示，纠正同一 `key` 的旧值会被取代、不再注入。
 - **Act（做得到）**：文件、Shell、HTTP 三类真实工具 + `remember` / `load_skill` / `notify_user` / `schedule_create` 四个元工具；工具调用逐条经审批策略并写审计。
-- **Improve（会改进）**：成功经验与常见错误沉淀为记忆，下次任务复用；v0.1 只做「保存并复用」，自动生成技能留给后续版本。
+- **Improve（会改进）**：成功经验与常见错误沉淀为记忆，下次任务复用；技能不自动演进——`/learn` 只把一条已完成任务草拟成技能（未经测试、需用户确认才落盘）。
 
 ## 安装（干净的 Ubuntu）
 
@@ -34,7 +46,7 @@ cargo install --path apps/cli
 ignis doctor
 ```
 
-想要完全静态的二进制可以自行加 musl target 构建；v0.1 仓库不提供 musl 构建。
+想要完全静态的二进制可以自行加 musl target 构建；本仓库不提供 musl 构建。
 
 ### Docker（可选）
 
@@ -72,6 +84,8 @@ ignis --workspace /path/to/your/project run "用 fs_list 列一下当前目录" 
 
 # 4. 交互式 REPL（需要 TTY；不带子命令即进入）
 ignis --workspace /path/to/your/project
+ignis -c                              # 恢复本工作区最近一次会话
+ignis --tui                           # 全屏 TUI（Beta）；要恢复会话就 ignis --tui -c
 ```
 
 环境变量覆盖（只影响生效值，不写回文件）：`IGNIS_HOME`（数据目录）、`IGNIS_WORKSPACE`（工作区）、`IGNIS_BASE_URL`、`IGNIS_MODEL`、`IGNIS_API_KEY`。密钥来源：`IGNIS_API_KEY`（覆盖一切）→ `config.json` 的 `api_key` → 配置 `model.api_key_env` 指定的环境变量（默认 `OPENAI_API_KEY`）。只有 `native` 内核需要 Ignis 的密钥；两个外置内核用各自 CLI 的凭据（详见下表）。
@@ -115,15 +129,127 @@ ignis schedule list | pause <id> | resume <id> | remove <id> | history [<id>] [-
 ignis alerts [--all] [--read]          # 告警收件箱（默认只看未读；--read 展示后标记已读）
 ```
 
-全局参数：`--kernel native|codex|claude`、`--workspace <DIR>`、`--yes`、`--unsafe`（上述子命令通用）。
+全局参数（子命令与 REPL 通用）：`--kernel native|codex|claude`、`--workspace <DIR>`、`--yes`、`--unsafe`。
 
-`config set` 可写的点路径：`workspace_root`、`default_kernel`、`api_key`、`model.base_url`、`model.model`、`model.api_key_env`、`limits.max_steps`、`limits.task_timeout_secs`、`limits.token_budget`、`limits.max_retries`、`limits.shell_timeout_secs`、`limits.tool_output_limit`、`limits.http_max_bytes`、`limits.context_char_budget`。
+REPL 专属开关（与任何子命令同用是用法错误，退出码 1）：
+
+| 开关 | 作用 |
+|---|---|
+| `-c` / `--continue` | 恢复**本工作区**最近一次会话并装载 canonical 历史；没有旧会话时打 `note: no previous session in this workspace; starting a new one` 后照常起步 |
+| `--tui` | 用全屏 TUI（Beta）进入 REPL；不满足条件时打一行 `note: TUI unavailable (<原因>); falling back to the classic REPL` 并降级到经典 REPL |
+
+`-c` 只是恢复会话，不删数据；`--tui` **不**默认恢复会话——要恢复就 `ignis --tui -c`。
+
+### 斜杠命令（15 个，`/help` 为准）
+
+分组、顺序、参数提示与一行描述都取自命令表 `COMMANDS`（`apps/cli/src/commands/slash.rs`），与 `/help` 的输出同源；命令名逐字匹配（`/Help` 是未知命令），未知命令打到 stderr、**不送模型**。
+
+| 分组 | 命令 | `/help` 里的描述（逐字） |
+|---|---|---|
+| SESSION | `/new` | Start a new session |
+| SESSION | `/sessions` | List recent sessions in this workspace |
+| SESSION | `/resume <id>` | Resume a session from this workspace |
+| AGENT | `/model [name]` | Show or set the model of this session |
+| AGENT | `/status` | Show kernel, model, workspace, alerts and last usage |
+| AGENT | `/tasks [N]` | List the most recent tasks (default 10) |
+| AGENT | `/skills [reload]` | List the skill catalog, or reload it |
+| INTELLIGENCE | `/memory <list\|search\|add\|edit\|delete>` | Read or edit long-term memory |
+| INTELLIGENCE | `/context` | Show the context budget and the last turn usage |
+| INTELLIGENCE | `/compact` | Summarize older turns into a summary message |
+| INTELLIGENCE | `/learn [task-id]` | Draft a skill from a completed task |
+| INTERFACE | `/details [minimal\|normal\|debug]` | Show or switch the output mode |
+| INTERFACE | `/exit` | Leave the REPL |
+| INTERFACE | `/help` | Show this list |
+| INTERFACE | `/kernel [name]` | Show or switch the execution kernel (native\|codex\|claude) |
+
+`/compact` 与 `/learn` 各要一次**无工具的 native 请求**（`config.model` + Ignis 凭据）：外置内核或没有 Ignis 凭据时报 `error: compact requires native kernel credentials (current kernel does not provide them)` / `error: learn requires native kernel credentials (current kernel does not provide them)`，且不改状态。其余 13 条命令全在本地完成（`/context` 只读、不消耗模型）。
+
+## 配置
+
+`ignis config show` 打印生效配置（环境变量覆盖已应用；`api_key` 恒为 `***`）。`ignis config set <key> <value>` 以**文件原文**为底稿只改写被点名的那一项写回 `config.json`（0600；不会把默认值物化进文件，也不会持久化环境派生值），白名单之外一律报「未知配置项」。可写的点路径共 **17** 项：
+
+| 点路径 | 取值 |
+|---|---|
+| `workspace_root` | 文本（路径） |
+| `default_kernel` | 文本，`native` / `codex` / `claude`（写错名字是启动期硬错，不静默回落） |
+| `api_key` | 文本（密钥；回显恒为 `***`） |
+| `model.base_url` | 文本（URL） |
+| `model.model` | 文本（模型名，只作用于 `native`） |
+| `model.api_key_env` | 文本（环境变量名，默认 `OPENAI_API_KEY`） |
+| `limits.max_steps` | 0-4294967295 的整数 |
+| `limits.task_timeout_secs` | 非负整数 |
+| `limits.token_budget` | 非负整数 |
+| `limits.max_retries` | 0-4294967295 的整数 |
+| `limits.shell_timeout_secs` | 非负整数 |
+| `limits.tool_output_limit` | 非负整数 |
+| `limits.http_max_bytes` | 非负整数 |
+| `limits.context_char_budget` | 非负整数（`/context` 的 budget 位读它） |
+| `ui.output_mode` | `minimal` / `normal` / `debug` |
+| `ui.color` | `auto` / `always` / `never` |
+| `ui.theme` | `dark` / `light` |
+
+`ui.*` 三段：`output_mode` 是渲染档位（与 `/details [minimal|normal|debug]` 同一套取值，会话内切换即时生效）；`color` 是颜色策略；`theme` 是调色板（dark / light 只差 dim 槽）。颜色优先级：**`NO_COLOR` 非空恒无色**（含 `ui.color always`；空串按 NO_COLOR 的约定视为未设置）→ 否则看 `ui.color`：`auto` 跟 stdout 是否 TTY、`never` 恒无色、`always` 恒有色。
+
+## 终端兼容
+
+v0.2 的目标是「Ubuntu 默认终端、`tmux`、SSH、80 列、无色、浅色主题下都不崩、不折行错乱」。下面这张矩阵是手动检查表（每行都跑同一组检查项）：
+
+| 终端 | 检查项 | 结论 | 记录 |
+|---|---|---|---|
+| Ubuntu 终端（默认） | 启动 banner、提交一次任务、编辑器重绘/历史/Ctrl+C、`/help` 在 80 列不折行错乱、TUI 可用或降级、退出后 `stty` 复原 | 待 Task 6 记录 | `docs/acceptance.md` 的终端矩阵（Task 6 填真机结果）；本机自动化覆盖见下 |
+| tmux | 启动 banner、提交一次任务、编辑器重绘/历史/Ctrl+C、`/help` 在 80 列不折行错乱、TUI 可用或降级、退出后 `stty` 复原 | 待 Task 6 记录 | 同上；`apps/cli/tests/pty.rs` 的 pty 用例是接近 tmux 的自动化面 |
+| SSH | 启动 banner、提交一次任务、编辑器重绘/历史/Ctrl+C、`/help` 在 80 列不折行错乱、TUI 可用或降级、退出后 `stty` 复原 | 待 Task 6 记录 | 同上；本机没有可用的目标终端时该项记 SKIP + 原因（**不记 PASS**） |
+| 80 列 | 启动 banner、提交一次任务、编辑器重绘/历史/Ctrl+C、`/help` 在 80 列不折行错乱、TUI 可用或降级、退出后 `stty` 复原 | 待 Task 6 记录 | 同上；折行/制表位的本地自动化在 `apps/cli/src/render/width.rs` 与 `tests/render.rs` |
+| 无色（`NO_COLOR=1`） | 启动 banner、提交一次任务、编辑器重绘/历史/Ctrl+C、`/help` 在 80 列不折行错乱、TUI 可用或降级、退出后 `stty` 复原 | 待 Task 6 记录 | 同上；无色帧的本地自动化在 `apps/cli/src/tui/view.rs` 与 `tests/render.rs` |
+| 浅色主题（`ui.theme=light`） | 启动 banner、提交一次任务、编辑器重绘/历史/Ctrl+C、`/help` 在 80 列不折行错乱、TUI 可用或降级、退出后 `stty` 复原 | 待 Task 6 记录 | 同上；调色板的本地自动化在 `apps/cli/src/render/mod.rs` 的 palette 用例 |
+
+> **结论列的口径**：这一列只放 Task 6 真机跑完后**实际写进** [`docs/acceptance.md`](docs/acceptance.md) 的结果（逐项 PASS，或在跑不了时记 SKIP 并写明原因）；本文档提交时该列统一记为「待 Task 6 记录」——不预写任何 PASS/SKIP。矩阵行与 `docs/acceptance.md` 的终端矩阵同源，README 只写结论列。
 
 ## 三个演示
 
-> 以下命令在仓库根目录执行；`examples/` 是夹具，复制到临时目录以免污染仓库。真实演示需要一个可用的 OpenAI 兼容端点（`IGNIS_BASE_URL` / `IGNIS_MODEL` / `IGNIS_API_KEY`，见[快速开始](#快速开始)）。
+> 三启动演示在仓库根目录执行；Demo A/B/C（v0.1 三场景）在临时目录执行 `examples/` 夹具。真实演示都需要一个可用的 OpenAI 兼容端点（`IGNIS_BASE_URL` / `IGNIS_MODEL` / `IGNIS_API_KEY`，见[快速开始](#快速开始)）。
 
-### Demo A · AI 真正完成工作
+### v0.2 三启动演示（可重复，主演示）
+
+同一条记忆、同一个会话跨三次启动被复用：第一次记下项目约定，第二次用 `-c` 恢复同一会话并在任务里复用记忆，第三次在 TUI 里恢复同一会话。
+
+```sh
+# 第一次：起 REPL（工作区 = 当前仓库根）
+ignis --workspace .
+# 在提示符下输入：
+#   这个项目使用 uv 管理 Python 环境，请记住
+# 期望：工具日志里出现 remember 的确认行   ✓ memory: pkg_manager (project) …
+# 退出：
+#   /exit
+
+# 第二次：恢复本工作区最近一次会话
+ignis -c
+# 输入 /memory —— 应看到 pkg_manager（scope=project，值就是上一轮记下的话）
+# 输入：
+#   帮我检查这个项目的依赖并运行测试
+# 期望：工具日志里出现 uv sync / uv run（复用记忆，模型选择了 uv 工作流）
+# 退出：
+#   /exit
+
+# 第三次：在 TUI 里恢复同一会话
+ignis --tui -c
+# 顶部状态行：IGNIS v0.2.0 · <工作区> · kernel native · session <13 字符短 id>
+# 输入 /status —— session: 行与上面同值（与第二次同一个会话 id）
+# 退出：
+#   /exit
+```
+
+- 第一次的确认行形状固定为 `  ✓ memory: <key> (<scope>) <文本 ≤60 字符>`（key 与文本由模型按你的话定，示例里是 `pkg_manager`）；`/memory` 的第二列能看到同一事实。记忆是 `scope=project`，因此只在本工作区注入。
+- 第二次的 `uv sync` / `uv run` 是**模型的选择**：机器上没装 uv 时按本仓库既有口径只断言「模型选择了 uv 工作流」（工具日志里出现这两个命令），不断言依赖真的装上。
+- 第三次的短 id 取会话 id 前 13 字符（与 `/sessions`、`/status` 同一口径，`/resume` 与 `ignis task show` 接受 ≥8 字符的唯一前缀）。TUI 不打印经典 banner，会话身份看顶部状态行与 `/status` 的 `session:` 行。
+- 任务与会话的绑定落在 `tasks.session_id`（每轮任务都写）：`ignis task list` 显示最近任务（第 5 列 `PROMPT` 即上面第二/第三次那条），**表里不含会话列**；要核对绑定就直接查库，例如
+  `sqlite3 ~/.ignis/ignis.db "select id, session_id from tasks order by started_at desc limit 5"`（或再起一次 `ignis -c`，看到的是同一个会话）。
+
+### v0.1 三场景（回归）
+
+以下 Demo A/B/C 是 v0.1 交付的三场景，命令与期望**原样保留**——它们仍是本仓库的回归面（自动化用例在 `apps/cli/tests/demo_a.rs` / `demo_b.rs` / `demo_c.rs`）。`examples/` 是夹具，复制到临时目录以免污染仓库。
+
+#### Demo A · AI 真正完成工作
 
 ```sh
 demo_a=$(mktemp -d)
@@ -137,7 +263,7 @@ npm test          # 预期通过
 
 Ignis 会读 `src/config.js`、跑 `npm test`、定位错误、经审批层修改文件（这里用 `--yes` 预授权，审批记录照样写入）、重跑并汇报；修复后的 `npm test` 退出 0。夹具的测试用 `npm` 跑 `node --test`（Node ≥ 18）。
 
-### Demo B · AI 记住过去的经验
+#### Demo B · AI 记住过去的经验
 
 ```sh
 demo_b=$(mktemp -d)
@@ -158,7 +284,7 @@ ignis memory list            # 旧值 superseded
 
 真实跑 `uv sync` / `uv run pytest` 需要安装 uv（`curl -LsSf https://astral.sh/uv/install.sh | sh`）。本机未装 uv：夹具的自动化用例不断言真实依赖安装，只断言「模型选择了 uv 工作流」；真实演示前请先安装 uv。
 
-### Demo C · AI 在后台主动工作
+#### Demo C · AI 在后台主动工作
 
 ```sh
 # 夹具：examples/test-server/check-health.sh --simulate 92 → {"disk_pct":92,...}
@@ -193,7 +319,7 @@ ignis daemon stop            # 幂等：没在跑也算成功
 ```
                   ┌───────────────────────────────────────────────┐
   用户 ──────▶    │ apps/cli（bin: ignis）                        │
-                  │  REPL · 子命令 · 审批 UI · daemon 模式入口     │
+                  │  REPL · TUI(Beta) · 子命令 · 审批 UI · daemon │
                   └───────────────┬───────────────────────────────┘
                                   │ Session / Task
                   ┌───────────────▼───────────────────────────────┐
@@ -214,8 +340,9 @@ ignis daemon stop            # 幂等：没在跑也算成功
 ```
 
 - **核心模块**（`packages/core`）：`task`（任务执行、事件流与会话历史）、`memory`、`skills`、`scheduler`、`security`（审批 / 策略 / 脱敏）、`tools`；另有 `alerts`、`config`、`doctor`。
+- **CLI 分层**（`apps/cli`）：`render/`（流式渲染：markdown 子集、宽度与折行、调色板）、`editor/`（raw mode + 行编辑器）、`commands/`（子命令与斜杠命令）、`tui/`（Beta 全屏界面：备用屏、捕获、帧合成、输入路由），用同一个 `Session` 装配内核与存储。
 - **依赖方向**：`runtime` 定义 `Runtime` / `ToolExecutor` 等 trait（含内核能力声明），`core` 实现工具执行与审批并注入；native 执行循环在 `runtime` 侧——所以是 `core → runtime`，无循环依赖。`runtime` 的 `RuntimeEvent` 序列化形状就是任务 JSONL 的格式，属跨模块契约。
-- **数据流**：CLI 或调度器发起 Task → core 组装上下文（记忆、技能目录、工作区）→ 内核执行（native 的工具调用经 security 层审批）→ 事件流回写 JSONL 与 UI → 结束写用量、记忆与告警。
+- **数据流**：CLI 或调度器发起 Task → core 组装上下文（记忆、技能目录、工作区）→ 内核执行（native 的工具调用经 security 层审批）→ 事件流回写 JSONL 与 UI → 结束写用量、记忆、会话行与告警。
 
 ## 安全模型
 
@@ -248,9 +375,14 @@ ignis daemon stop            # 幂等：没在跑也算成功
 
 ## 已知偏差
 
-- **banner 形状与 `demo.md` 概念图不同**（`demo.md` 原文标注「CLI 概念展示，并非已经实现的 Ignis 界面」）：实际启动屏为 `IGNIS v0.1` / `● Ready` / `Workspace: <dir>` / `Runtime: <kernel> · Skills: <n> · Memory: <n facts|off>`，有未读告警时追加一行 `⚠ N unread alerts — run \`ignis alerts\``。
-- **设计文档措辞与 `demo.md` 不完全一致**：`docs/superpowers/specs/2026-10-15-ignis-v0.1-design.md` 按对话中的新决定固化了工程取舍（Rust 取代 TS/Node、Telegram 推迟为 CLI 收件箱 / 桌面通知、内核数量等），冲突时以设计文档为准。
-- **设计文档的 DDL 措辞与实现的库表不同**：设计文档 §6.7「任务模型」只给字段级草案（§9 把「数据库 schema 字段级细化」留给构建者），与实现有三处出入——实现多了 `jobs.workspace` / `jobs.last_run_at` / `job_runs.task_id`，用量是 `job_runs.input_tokens` + `output_tokens` 两列（没有单列 `usage`），`alerts` 表在设计文档里只有文字描述；一律以 [`packages/storage/src/migrations.rs`](packages/storage/src/migrations.rs) 的 001–003 DDL 为准。
+- **TUI 是 Beta（`ignis --tui`）**：刻意不做鼠标（没有鼠标事件解码与命中测试，终端自身的选区 / 滚动照旧可用）；滚动区有界（只留最近 2000 行，超出的丢最旧）；任务运行中不接受输入（忙碌期按键一律丢弃，输入区首行是 `working…`、提示行是 `Ctrl+C cancels`）；Esc 的消歧窗口是一个 100ms tick（`Alt+Enter` 被切在两个 tick 之间时可能被当成 Enter）；`\t` 只按 8 列制表位展开到屏幕（提交 / 落盘 / 送模型的文本一个字节不动）；**SIGTERM / SIGTSTP / SIGHUP 没有处理器**——被 `kill`、`Ctrl+Z` 挂起或终端断开时进程直接走掉，备用屏与 raw mode 由终端自己收尾（回到 shell 可能看起来坏掉），敲 `stty sane` 或 `reset` 复原；正常退出（`/exit`、空缓冲 `Ctrl+D`、空闲 `Ctrl+C`、stdin 关闭）与 panic 都由终端守卫的 `Drop` 还原。
+- **`--tui` 不默认恢复会话**：只有 `-c` / `--continue` 才装载本工作区最近一次会话（要恢复就 `ignis --tui -c`）；TUI 不满足条件（stdin / stdout 不是终端、`TERM` 是哑终端、尺寸小于 20×8）时只多打一行 `note: TUI unavailable (<原因>); falling back to the classic REPL`，其余一切照旧。
+- **经典 REPL 在「读一行」期间不响应 Ctrl-C**：审批提示与 `/learn` 的保存确认（`save this skill draft? [s]ave [d]iscard> `）在读一行期间不响应 Ctrl-C——进程级 SIGINT 只被接住、不取消那次同步读；模型往返本身（任务轮次、`/compact`、`/learn` 的草稿生成）可以被 Ctrl-C 取消。TUI 里 Ctrl-C 会取消本轮（任务 / 压缩 / 学习），不转发给工具、也不改审批决定。
+- **`/compact` 与 `/learn` 需要 native 凭据**：两者各发一次无工具的 native 请求，外置内核或没有 Ignis 凭据时明确报错（不静默降级、不改状态）；外置内核的用量 / 上限退化（token 记 0、只剩墙钟超时与取消）与「不经 Ignis 审批、无 `approvals` 行」见[限制](#限制) #2、#7。
+- **脱敏是字面替换**：已知密钥按字面替换为 `***`（先 JSON 转义形式、后原文），不做正则或相似度匹配——密钥的截断 / 重组 / 编码变体不在覆盖内；**修复前已落库的明文行不回写**（没有 scrub / migration，新代码不再产生新的明文行）。
+- **banner 形状与 `demo.md` 概念图不同**（`demo.md` 原文标注「CLI 概念展示，并非已经实现的 Ignis 界面」）：实际启动屏为 `IGNIS v0.2` / `● Ready` / `Workspace: <dir>` / `Runtime: <kernel> · Skills: <n> · Memory: <n> facts` / `Session: <new|13 字符短 id>`，有未读告警时追加一行 `⚠ N unread alerts — run \`ignis alerts\``（版本号取包版本，当前 `0.2.0`）。
+- **设计文档措辞与 `demo.md` 不完全一致**：`docs/superpowers/specs/2026-10-15-ignis-v0.1-design.md` 与 `docs/superpowers/specs/2026-10-16-ignis-v0.2-design.md` 按对话中的新决定固化了工程取舍（Rust 取代 TS/Node、Telegram 推迟为 CLI 收件箱 / 桌面通知、内核数量、v0.2 的交付口径等），冲突时以设计文档为准。
+- **设计文档的 DDL 措辞与实现的库表不同**：v0.1 设计文档 §6.7「任务模型」只给字段级草案（§9 把「数据库 schema 字段级细化」留给构建者），与实现有三处出入——实现多了 `jobs.workspace` / `jobs.last_run_at` / `job_runs.task_id`，用量是 `job_runs.input_tokens` + `output_tokens` 两列（没有单列 `usage`），`alerts` 表在设计文档里只有文字描述；v0.2 设计 §6.6 的会话 DDL 与实现的 004 一致。一律以 [`packages/storage/src/migrations.rs`](packages/storage/src/migrations.rs) 的 001–004 DDL 为准。
 - **`demo.md` 按作者要求保持原文未修改**；上述偏差只记录在这里，不回改历史文档。
 - **e2e 测试位于 `apps/cli/tests/`**：`CARGO_BIN_EXE_ignis`（真构建二进制路径）只对拥有 bin 的包可用，`packages/*` 里的 crate 没有 bin，因此这类用例不能下沉到 `packages/`。
 
@@ -263,11 +395,11 @@ cargo test --workspace          # 离线：不依赖网络与真实模型
 ```
 
 - 单元测试随各 crate；外置内核适配器的假 CLI 集成测试在 `packages/runtime/tests/`。
-- 端到端测试在 `apps/cli/tests/`（`demo_a.rs` / `demo_b.rs` / `demo_c.rs` / `approval_modes.rs` / `kernel.rs` / `daemon_lifecycle.rs` / `autostart.rs` / `limits.rs` / `redaction.rs`）：用真构建的 `ignis` 二进制 + `ignis-runtime` 的脚本化假模型（`test-support`），断言落在真文件、真数据库行与真进程上。
+- 端到端测试在 `apps/cli/tests/`（`demo_a.rs` / `demo_b.rs` / `demo_c.rs` / `approval_modes.rs` / `kernel.rs` / `daemon_lifecycle.rs` / `autostart.rs` / `limits.rs` / `redaction.rs` / `remember.rs` / `render.rs` / `tui.rs` / `pty.rs`）：用真构建的 `ignis` 二进制 + `ignis-runtime` 的脚本化假模型（`test-support`），断言落在真文件、真数据库行与真进程上。
 - 真实模型的量化验收（三场景各连续 3 次、20 例常见任务 ≥80%、10 次重启）是**手动、可选**执行（控制额度消耗），不进 CI：三条门槛见 [`harness/acceptance.sh`](harness/acceptance.sh)（`demos 3` / `tasks 20` / `restarts 10`），门槛定义、运行方法与最近结果记录见 [`docs/acceptance.md`](docs/acceptance.md)。
 - 提交信息用 Conventional Commits（英文 type/scope，中文正文）。
 - Docker / systemd 部署见上文与 [`deploy/README.md`](deploy/README.md)。
 
 ## English summary
 
-Ignis v0.1 is a self-hosted, single-binary personal AI agent written in Rust. It implements its own agent loop (the `native` kernel, talking to any OpenAI-compatible endpoint with streaming tool calls) and can also delegate a task to an installed `codex` or `claude` CLI (`--kernel`). It keeps long-term memory, discovers `SKILL.md` skills, and runs scheduled jobs from a background daemon — designed around one idea: *Ignis should remember, act, and improve*. Tools run inside the workspace and every non-safe call is approval-gated and audited; external kernels run tools in their own sandbox and do not participate in Ignis approvals or usage accounting. Build it with `cargo build --release`, verify with `ignis doctor`, and start with `ignis run "<task>" --yes`.
+Ignis v0.2 is a self-hosted, single-binary personal AI agent written in Rust. It implements its own agent loop (the `native` kernel, talking to any OpenAI-compatible endpoint with streaming tool calls, markdown rendering and a separate reasoning channel) and can also delegate a task to an installed `codex` or `claude` CLI (`--kernel`). It keeps long-term memory, discovers `SKILL.md` skills, and runs scheduled jobs from a background daemon — designed around one idea: *Ignis should remember, act, and improve*. On top of that, v0.2 makes the terminal interactive and persistent: a multiline editor with history, tab completion and bracketed paste; sessions that survive restarts (`-c`, `/sessions`, `/resume`, `/context`, `/compact`); fifteen local slash commands listed by `/help`; `ui.output_mode` / `ui.color` / `ui.theme` configuration; a full-screen TUI Beta (`--tui`); and SIGINT-safe terminal restoration. Tools run inside the workspace and every non-safe call is approval-gated and audited; external kernels run tools in their own sandbox and do not participate in Ignis approvals or usage accounting. Build it with `cargo build --release`, verify with `ignis doctor`, and start with `ignis run "<task>" --yes`.
