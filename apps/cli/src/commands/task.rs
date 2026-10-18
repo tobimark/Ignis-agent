@@ -114,7 +114,9 @@ pub(crate) fn is_id_prefix(arg: &str) -> bool {
 ///
 /// 头部字段的顺序钉死：`skills:` 一行插在 `tokens:` 与 `error:` 之间；`skills_used` 是
 /// `None` 或空串时整行**不出现**（不是 `skills: -`）。取值是 `TaskRunner` 在 `finish_task`
-/// 之前写的逗号连接技能名集合，与 `task list` 的 `SKILLS` 列同源、原样展示。
+/// 之前写的逗号连接技能名集合，与 `task list` 的 `SKILLS` 列同源；展示前过一遍 [`one_line`]
+/// 把换行/连续空白压成一个空格（**只改展示**，落库值一个字节不动），压平后为空同样不出现整行
+/// ——坏数据不能把头撑成多行，也不能塞进一行空白。
 ///
 /// 日志文件缺失按「没有事件流」处理（任务行还在、日志被删）；其它读取失败照常上抛。
 fn render_task(
@@ -125,7 +127,7 @@ fn render_task(
     let ended = task.ended_at.map_or_else(|| "-".to_string(), format_time);
     let error = task.error.as_deref().unwrap_or("-");
     let summary = task.summary.as_deref().unwrap_or("-");
-    let skills = match task.skills_used.as_deref() {
+    let skills = match task.skills_used.as_deref().map(one_line) {
         Some(list) if !list.is_empty() => format!("skills: {list}\n"),
         _ => String::new(),
     };
@@ -167,8 +169,9 @@ fn render_task(
 
 /// 最近任务表：id 短 id（13 字符）、status、kind、started、prompt 前 40 字符、技能集合。
 ///
-/// 第六列直接取 `task.skills_used`（逗号连接的技能名集合，由 `TaskRunner` 在 `finish_task`
-/// 之前写入）：**不截断**，没记过技能的行给 `-`。
+/// 第六列取 `task.skills_used`（逗号连接的技能名集合，由 `TaskRunner` 在 `finish_task`
+/// 之前写入）：**不截断**，但过一遍 [`skills_display`]（空白压平、空/纯空白给 `-`；
+/// 落库值与模型可见面一个字节不改）。
 pub(crate) fn render_list(tasks: &[TaskRecord]) -> String {
     let mut rows = vec![vec![
         "ID".to_string(),
@@ -186,10 +189,21 @@ pub(crate) fn render_list(tasks: &[TaskRecord]) -> String {
             task.kind.clone(),
             format_time(task.started_at),
             truncate(&one_line(&task.prompt), PROMPT_CHARS),
-            task.skills_used.as_deref().unwrap_or("-").to_string(),
+            skills_display(task.skills_used.as_deref()),
         ]);
     }
     render_table(&rows)
+}
+
+/// 技能集合的展示取值：换行/制表/连续空白压成一个空格，空或纯空白给 `-`。
+///
+/// **只作用于展示**（`task list` 的 `SKILLS` 单元格与 `task show` 的 `skills:` 行）：落库值、
+/// 结束行与模型可见面都逐字节不变（`tasks.skills_used` 存什么就是什么）。
+fn skills_display(skills_used: Option<&str>) -> String {
+    match one_line(skills_used.unwrap_or("")) {
+        rendered if rendered.is_empty() => "-".to_string(),
+        rendered => rendered,
+    }
 }
 
 /// 审批记录表：tool / risk / decision / mode / time。
@@ -670,6 +684,36 @@ mod tests {
         );
     }
 
+    /// `task show` 的 `skills:` 行与 `task list` 的 `SKILLS` 单元格同一口径：换行/制表/连续空白
+    /// 在**展示**时压成单个空格（落库值与模型可见面逐字节不变）；压平后为空（纯空白）时整行
+    /// 不出现——与空串同一条既有语义。
+    #[test]
+    fn task_show_normalizes_the_skills_line() {
+        let home = TempHome::new("show-skills-one-line");
+        let log_path = home.path().join("logs").join(format!("{TASK_ID}.jsonl"));
+
+        let mut messy = record(TASK_ID, "success", "run", STARTED_AT, "提示");
+        messy.skills_used = Some("a\nb\t  c".into());
+        let out = render_task(&messy, &[], &log_path).unwrap();
+        assert!(
+            out.contains("tokens: in=0 out=0\nskills: a b c\nerror: -\n"),
+            "{out}"
+        );
+        // 换行不能把头部撑成多行：`skills:` 仍只有一行
+        assert_eq!(
+            out.lines()
+                .filter(|line| line.starts_with("skills:"))
+                .count(),
+            1,
+            "{out}"
+        );
+
+        let mut blank = record(TASK_ID, "success", "run", STARTED_AT, "提示");
+        blank.skills_used = Some("\n\t  ".into());
+        let out = render_task(&blank, &[], &log_path).unwrap();
+        assert!(!out.contains("skills:"), "纯空白与空串同口径：{out}");
+    }
+
     /// `skills_used` 是空串时 `skills:` 整行同样不出现（落库的空表是 `NULL`，这一条挡的是
     /// 坏数据把空行塞进头部）。
     #[test]
@@ -855,5 +899,46 @@ mod tests {
         let rows: Vec<Vec<&str>> = out.lines().skip(1).map(cells).collect();
         assert_eq!(rows[0][5], "my-skill,other", "{out}");
         assert_eq!(rows[1][5], "-", "{out}");
+    }
+
+    /// 展示层的规范化：`skills_used` 里的换行/连续空白压成单个空格（**落库值一个字节不改**），
+    /// 空串/纯空白给 `-`——不留空白撑破表格，也不让「没记过技能」变成一格空白。
+    #[test]
+    fn task_list_normalizes_the_skills_cell() {
+        let mut wrapped = record(TASK_ID, "success", "run", STARTED_AT, "提示");
+        wrapped.skills_used = Some("a\nb".into());
+        let mut blank = record(
+            "019a1b2c-3d4e-7f00-8000-000000000002",
+            "success",
+            "run",
+            STARTED_AT,
+            "提示",
+        );
+        blank.skills_used = Some("  ".into());
+        let mut messy = record(
+            "019a1b2c-3d4e-7f00-8000-000000000003",
+            "success",
+            "run",
+            STARTED_AT,
+            "提示",
+        );
+        messy.skills_used = Some("a\t \nb".into());
+        let none = record(
+            "019a1b2c-3d4e-7f00-8000-000000000004",
+            "success",
+            "run",
+            STARTED_AT,
+            "提示",
+        );
+
+        let out = render_list(&[wrapped, blank, messy, none]);
+
+        // 换行被压平：仍旧一行一条（不是把单元格撑成两行）
+        assert_eq!(out.lines().count(), 5, "{out}");
+        let rows: Vec<Vec<&str>> = out.lines().skip(1).map(cells).collect();
+        assert_eq!(rows[0][5], "a b", "{out}");
+        assert_eq!(rows[1][5], "-", "{out}");
+        assert_eq!(rows[2][5], "a b", "{out}");
+        assert_eq!(rows[3][5], "-", "{out}");
     }
 }

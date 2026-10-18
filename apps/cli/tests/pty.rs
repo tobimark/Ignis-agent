@@ -1001,7 +1001,8 @@ fn pty_learn_discard_and_refusal_leave_no_file() {
 }
 
 /// `/skills reload` 的端到端：REPL 运行期间由测试直接往 home 里落一个新技能，reload 之后
-/// `/skills` 的表里就有它；起步时的 banner 计数（3）钉住「新技能确实是运行期间才出现的」。
+/// `/skills` 的表里就有它（`SOURCE` 列是 `user`）；起步时的 banner 计数（3）与 reload **之前**
+/// 那一次列表（负向对照：新技能还在盘上、但还没进会话快照）钉住「它确实是 reload 换进来的」。
 #[test]
 fn pty_skills_reload_picks_up_a_new_skill_file() {
     // 本轮不提交任务：脚本那一步只是给夹具一个 `base_url`（reload 是纯本地命令，不该碰模型）
@@ -1017,6 +1018,28 @@ fn pty_skills_reload_picks_up_a_new_skill_file() {
     pty.expect("❯ "); // raw mode 生效后再打字：canonical 下回车会被译成 Ctrl+J
     write_skill(&dir, "fresh-skill", "Added while running.");
 
+    // 负向对照：reload **之前**先看一眼目录——新技能文件已经落盘，但会话里那一份快照还是启动时
+    // 扫的（三个内置技能），表里不该有它。窗口按发送前的流长切（与 `expect_after_offset` 同一条
+    // 位置口径）：窗口里的命中只可能来自这一次列表输出。全流重扫在这里不能用作负向对照——reload
+    // 之后全流里必然有它，那样这条断言就永远「失败」而失去意义。
+    let before_reload = pty.output().len();
+    pty.send("/skills\r");
+    expect_after_offset(&pty, before_reload, "DESCRIPTION"); // 正信号：表画出来了
+    let listed = pty.output();
+    let start = (before_reload..=listed.len())
+        .find(|at| listed.is_char_boundary(*at))
+        .unwrap_or(listed.len());
+    let pre_reload = &listed[start..];
+    assert!(
+        !pre_reload.contains("fresh-skill"),
+        "reload 之前不该出现新技能：\n{pre_reload}"
+    );
+    assert_eq!(
+        pre_reload.matches("builtin").count(),
+        3,
+        "reload 之前的表就是启动时那三个内置技能：\n{pre_reload}"
+    );
+
     pty.send("/skills reload\r");
     pty.expect("reloaded skills (4)");
     wait_for_prompt_after(&pty, "reloaded skills (4)");
@@ -1025,6 +1048,24 @@ fn pty_skills_reload_picks_up_a_new_skill_file() {
     expect_after(&pty, "reloaded skills (4)", "fresh-skill");
 
     wait_for_prompt_after(&pty, "fresh-skill");
+    // `SOURCE` 列与 `skills_lines_match_the_cli_render` 同一口径（表行 = `{name}  {source}  {description}`）：
+    // 新技能来自用户目录，来源列只能是 `user`
+    let row = output_after(&pty, "reloaded skills (4)")
+        .lines()
+        .find(|line| line.starts_with("fresh-skill"))
+        .unwrap_or_else(|| panic!("表里应有 fresh-skill 那一行：\n{}", pty.output()))
+        .to_string();
+    let cells: Vec<&str> = row
+        .split("  ")
+        .map(str::trim)
+        .filter(|cell| !cell.is_empty())
+        .collect();
+    assert_eq!(
+        cells,
+        ["fresh-skill", "user", "Added while running."],
+        "{row}"
+    );
+
     pty.send("\x04");
     assert_eq!(pty.wait(), 0, "Ctrl-D 应以 0 退出：\n{}", pty.output());
 

@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ignis_runtime::{Runtime, RuntimeEvent};
-use ignis_storage::{TaskLog, TaskRecord};
+use ignis_storage::TaskRecord;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -123,12 +123,13 @@ pub fn parse_draft(text: &str) -> Result<SkillDraft, LearnError> {
     })
 }
 
-/// `{home}/logs/{task_id}.jsonl` 的原文（路径与写入方同源：`TaskLog::new(&home.join("logs"))`）。
+/// `{home}/logs/{task_id}.jsonl` 的原文（路径与写入方 `TaskLog` 同源：`{home}/logs/{task_id}.jsonl`）。
 ///
 /// 文件缺失给空串（任务行还在、日志被删：转录仍可生成，只是没有工具清单），其它读取失败给
-/// [`LearnError::Io`]（`reading {path} failed: {error}`）。
+/// [`LearnError::Io`]（`reading {path} failed: {error}`）。**只读**：`logs` 目录不存在时不会被
+/// 建出来（写入方按需创建，读路径不产生副作用）。
 pub fn read_task_log(home: &Path, task_id: &str) -> Result<String, LearnError> {
-    let path = task_log_path(home, task_id)?;
+    let path = task_log_path(home, task_id);
     match fs::read_to_string(&path) {
         Ok(raw) => Ok(raw),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
@@ -304,13 +305,13 @@ fn tool_exec_of(raw: &str) -> Option<(String, String)> {
     }
 }
 
-/// `{home}/logs/{task_id}.jsonl` 的路径（与写入方同源：目录与文件名都由 [`TaskLog`] 给出）。
-fn task_log_path(home: &Path, task_id: &str) -> Result<PathBuf, LearnError> {
-    let dir = home.join(LOGS_DIR);
-    let fallback = dir.join(format!("{task_id}.jsonl"));
-    TaskLog::new(&dir)
-        .map(|log| log.path(task_id))
-        .map_err(|error| LearnError::Io(format!("reading {} failed: {error}", fallback.display())))
+/// `{home}/logs/{task_id}.jsonl` 的路径（目录名 [`LOGS_DIR`]、文件名 `{task_id}.jsonl` 与写入方
+/// `TaskLog` 同源）。
+///
+/// **直拼、不碰磁盘**：读路径不该有副作用——经 `TaskLog::new` 取路径会顺手在 home 下建出 `logs`
+/// 目录（日志被删、从没写过日志时白留一个空目录）。按需创建是写入路径那一侧的契约。
+fn task_log_path(home: &Path, task_id: &str) -> PathBuf {
+    home.join(LOGS_DIR).join(format!("{task_id}.jsonl"))
 }
 
 #[cfg(test)]
@@ -641,7 +642,9 @@ mod tests {
         assert_eq!(read_task_log(&home, "01").unwrap(), "");
 
         // 有文件：原文逐字交回；别的任务 id 互不串
+        // （目录由夹具自己建：读路径不创建 `logs`，见 `read_task_log_does_not_create_the_logs_dir`）
         let logs = home.join("logs");
+        fs::create_dir_all(&logs).unwrap();
         let raw = "{\"type\":\"task_start\"}\n{\"type\":\"text_delta\",\"text\":\"hi\"}\n";
         fs::write(logs.join("01.jsonl"), raw).unwrap();
         assert_eq!(read_task_log(&home, "01").unwrap(), raw);
@@ -654,6 +657,26 @@ mod tests {
         let message = error.to_string();
         assert!(message.starts_with("learn: reading "), "{message}");
         assert!(message.contains("03.jsonl"), "{message}");
+    }
+
+    /// 读路径不碰磁盘：`home/logs` 不存在（日志被删、任务从没写过日志）时给空串，且**一个目录都
+    /// 不创建**——写入路径（`TaskLog::new`）才是按需建目录的那一侧。
+    ///
+    /// 经 `TaskLog::new` 取路径会在读之前把 `logs` 目录建出来：`/learn`、`task show` 这类只读动作
+    /// 白留一个空目录，也让「home 里有什么」变成看谁先跑过。
+    #[test]
+    fn read_task_log_does_not_create_the_logs_dir() {
+        let dir = TempDir::new("log-read-only");
+        let home = dir.path().join("ignis-home");
+        fs::create_dir_all(&home).unwrap();
+
+        assert_eq!(read_task_log(&home, "01").unwrap(), "");
+        assert!(!home.join("logs").exists(), "读路径不该创建 logs 目录");
+
+        // 没有 home 也不该被补建（路径直拼，不碰磁盘）
+        let absent = dir.path().join("no-home");
+        assert_eq!(read_task_log(&absent, "01").unwrap(), "");
+        assert!(!absent.exists(), "读路径不该创建 home");
     }
 
     /// 落盘：目录按需创建、内容等于 `to_skill_md()`、文件 0600、路径 `{dir}/{name}/SKILL.md`。
