@@ -7,7 +7,8 @@
 //!   调用方据此在进不去 raw mode 时回退 v0.1 的按行输入；
 //! - [`restore_terminal`] 是退出路径的兜底：守卫活在「读取区间」里，而读取跑在脱离线程上，
 //!   退出时那条线程可能仍握着守卫阻塞在 `read` 里、进程退出不会析构它——REPL 退出前按
-//!   这里记录下的现场做一次 best-effort 还原（没有活跃守卫时是无操作）。
+//!   这里记录下的现场做一次 best-effort 还原：复原 termios **并**补上 bracketed paste 的关闭
+//!   序列（`Drop` 永远跑不到时，那 6 个字节只能由它写；没有活跃守卫时是无操作）。
 //!
 //! 两条刻意保留的语义：
 //! - **`ISIG` 不动**：Ctrl+C 仍然是 SIGINT，空闲退出与任务取消的 watcher 都挂在信号上，
@@ -115,8 +116,11 @@ impl Drop for RawMode {
     }
 }
 
-/// 退出路径的 best-effort 还原：若某个守卫还活着（读取线程握着它阻塞在 `read` 里，进程退出
-/// 不会析构它），按 [`ACTIVE`] 的现场把终端恢复成进入前的形态；没有活跃守卫时什么都不做。
+/// 退出路径的 best-effort 还原：除按 [`ACTIVE`] 记录复原 termios 外，**还要关掉 bracketed
+/// paste**（`\x1b[?2004l`）。空闲 Ctrl+C 退出时读取线程仍握着守卫阻塞在 `read` 里，进程退出不会
+/// 析构它，`Drop` 的关闭序列因此永远不会写出——用户的 shell 会残留粘贴模式。
+///
+/// 没有活跃记录时不写任何字节（既有的「无操作」语义保留）；锁中毒一律不动终端。
 ///
 /// 由 REPL 在退出前调用（见 `repl::run`）——「退出时终端必须回到行规范 + 回显」的兜底。
 /// 锁中毒等任何异常都不 panic：退出路径只许做减法。
@@ -127,6 +131,9 @@ pub fn restore_terminal() {
     if let Some(entry) = active.as_ref() {
         // SAFETY: `entry.original` 由这条记录独占，`tcsetattr` 只读它。
         let _ = unsafe { libc::tcsetattr(entry.fd, libc::TCSANOW, &entry.original) };
+        // 守卫的 `Drop` 跑不到（读取线程握着它、进程不会析构它）：关闭序列在这里补上，
+        // 用户的 shell 不会残留粘贴模式。没有活跃记录时走不到这一行——零字节。
+        write_bytes(entry.fd, PASTE_DISABLE);
     }
 }
 
@@ -375,5 +382,49 @@ mod tests {
 
         // 现场清干净：被 forget 的守卫留下的记录不再指向别的用例
         *super::ACTIVE.lock().expect("记录锁不该中毒") = None;
+    }
+
+    /// 退出路径还要关掉 bracketed paste：空闲 Ctrl-C 退出时读取线程仍握着守卫阻塞在 `read` 里，
+    /// 进程退出不会析构它，`Drop` 的关闭序列因此永远不会写出——用户的 shell 会残留粘贴模式。
+    ///
+    /// 写入面就是终端（pty 主端读到的字节）：进入时那一段先读掉，之后的窗口只可能来自
+    /// `restore_terminal` 自己；守卫随后析构并清掉记录，再调一次还原就该是零字节。
+    #[test]
+    fn restore_terminal_closes_bracketed_paste_on_a_pty() {
+        let _serial = slot_guard();
+        let (master, slave) = open_pty();
+        let slave_fd = slave.as_raw_fd();
+        let baseline = get_termios(slave_fd);
+
+        let guard = RawMode::enable_on(slave_fd).expect("pty 从端是真 tty，进入 raw mode 必须成功");
+        assert_eq!(
+            read_master(&master),
+            b"\x1b[?2004h".to_vec(),
+            "进入时先写 bracketed paste 开（下面的窗口从它之后开始）"
+        );
+
+        // 模拟空闲 Ctrl-C 的退出现场：守卫还活着（读取线程握着它），只有进程记录可用
+        super::restore_terminal();
+
+        assert_eq!(
+            read_master(&master),
+            b"\x1b[?2004l".to_vec(),
+            "退出兜底必须补上 bracketed paste 关（shell 不该残留粘贴模式）"
+        );
+        let restored = get_termios(slave_fd);
+        assert_eq!(restored.c_iflag, baseline.c_iflag, "c_iflag 必须逐字段复原");
+        assert_eq!(restored.c_oflag, baseline.c_oflag, "c_oflag 必须逐字段复原");
+        assert_eq!(restored.c_cflag, baseline.c_cflag, "c_cflag 必须逐字段复原");
+        assert_eq!(restored.c_lflag, baseline.c_lflag, "c_lflag 必须逐字段复原");
+        assert_eq!(restored.c_cc, baseline.c_cc, "c_cc 必须逐字段复原");
+
+        // 守卫析构：它自己也写一遍关闭序列并清掉记录；此后没有活跃记录，还原一个字都不写
+        drop(guard);
+        let _ = read_master(&master);
+        super::restore_terminal();
+        assert!(
+            read_master(&master).is_empty(),
+            "没有活跃记录 → 零字节（既有的「无操作」语义保留）"
+        );
     }
 }

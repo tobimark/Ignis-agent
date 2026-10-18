@@ -314,6 +314,34 @@ fn pty_ctrl_c_at_the_prompt_exits_and_restores_the_terminal() {
     );
 }
 
+/// 空闲 Ctrl+C 连开 10 次：每次都以 0 结束（不是被默认处置杀掉的信号退出），且退出流里在
+/// 「发 `\x03` 之前的偏移之后」出现 bracketed paste 关。
+///
+/// 两条观察各由这里的一段钉住：①第一段 watcher 被首次轮询之前到达的 SIGINT 走默认处置——
+/// 安装必须先于任何可交互时机（提示符出现即意味着安装已完成）；②退出时读取线程仍握着守卫，
+/// `Drop` 的关闭序列永远写不出——退出路径要自己补那 6 个字节。
+#[test]
+fn pty_idle_ctrl_c_exits_cleanly_ten_times() {
+    for round in 1..=10 {
+        let (mut pty, _dir, _model) = spawn_repl("pty-idle-ctrl-c", Vec::new());
+
+        // 提示符 = 编辑器已接管终端，raw 保留了 ISIG，于是 0x03 是 SIGINT 而不是普通字节
+        pty.expect("❯ ");
+        // 偏移取在发送**之前**（见 [`expect_after_offset`]）：窗口里的命中只可能来自之后写出的字节
+        let offset = pty.output().len();
+        pty.send("\x03");
+
+        let code = pty.wait();
+        assert_eq!(
+            code,
+            0,
+            "第 {round} 次：空闲 Ctrl-C 应干净退出（不是信号退出）：\n{}",
+            pty.output()
+        );
+        expect_after_offset(&pty, offset, "\x1b[?2004l");
+    }
+}
+
 /// 空输入上的 Ctrl-D：与 v0.1 一致，以 0 退出。
 #[test]
 fn pty_ctrl_d_on_empty_input_exits_with_zero() {

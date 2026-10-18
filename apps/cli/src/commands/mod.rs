@@ -1023,6 +1023,38 @@ pub(crate) fn no_color_value(raw: Option<OsString>) -> Option<String> {
     raw.map(|value| value.to_string_lossy().into_owned())
 }
 
+/// REPL 启动时把进程级 SIGINT 处理器**提前装好**（一次），返回的句柄由调用方持有到进程退出。
+///
+/// 今日的竞态：`tokio::signal::ctrl_c` 的处理器在 future **首次轮询**时装，而
+/// `spawn_ctrl_c_watcher` 是「每段现起」——第一段 watcher 被轮询之前到达的 SIGINT 走默认处置，
+/// 直接杀掉进程（P5 台账记的偶发信号退出）。这里在进第一段等待之前先装一次，安装先于任何
+/// 可交互时机；之后各段 watcher 复用同一个已装好的处理器（监听者各自成流，互不消耗）。
+///
+/// 实现口径：`tokio::signal::unix::signal(SignalKind::interrupt())` **调用即注册**（不是首次
+/// 轮询），把返回的流移进后台任务持续 `recv()` 即完成安装；非 unix 返回 `None`（REPL 本身
+/// 也是 unix 门控，行为退化为今日）。安装失败（不支持的平台）同样 `None`，不 panic。
+#[cfg(unix)]
+pub fn install_ctrl_c_handler() -> Option<JoinHandle<()>> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    // `signal(...)` 返回流之前处理器已经装好（调用即注册，不等首次轮询）；装不上（不支持的
+    // 平台）给 `None`，调用方按「没有处理器」的今日行为继续。
+    let mut stream = signal(SignalKind::interrupt()).ok()?;
+    Some(tokio::spawn(async move {
+        // 常驻排空：本任务只负责「把信号接住」（不再走默认处置），取消语义仍归各段 watcher
+        // ——监听者各自成流、互不消耗，每一段 `ctrl_c()` 都收到属于自己的那一份。
+        while stream.recv().await.is_some() {
+            // 收到一次就继续排空：这里不取消任何东西
+        }
+    }))
+}
+
+/// 非 unix 上没有 unix 信号流（经典 REPL 本身也按 unix 门控）：交回 `None`，行为退化为今日。
+#[cfg(not(unix))]
+pub fn install_ctrl_c_handler() -> Option<JoinHandle<()>> {
+    None
+}
+
 /// 起一个 Ctrl-C 监听任务：收到信号就取消本次运行，返回的句柄由调用方在运行结束后 abort。
 ///
 /// `tokio::signal::ctrl_c()` 装的是进程级处理；装不上（不支持的平台）时监听任务直接结束，
@@ -1121,6 +1153,7 @@ pub(crate) mod fixtures {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::time::Duration;
 
     use ignis_core::config::{ColorChoice, OutputMode, Theme, UiConfig};
     use ignis_core::session::{COMPACT_SYSTEM_PROMPT, EARLIER_SUMMARY_PREFIX};
@@ -1133,6 +1166,39 @@ mod tests {
     };
     use super::*;
     use crate::commands::kernel::fixtures::{TempDir, set_executable};
+
+    /// 安装时机（P5 台账里的偶发信号退出）：[`install_ctrl_c_handler`] **调用即注册**，此后
+    /// 每段 `spawn_ctrl_c_watcher` 都建立在已装好的处理器之上——第一段 watcher 被首次轮询之前
+    /// 到达的 SIGINT 不再走默认处置把进程带走，而是由各段监听者各自收成取消。
+    ///
+    /// 断言顺序即判据：先断言「装上了」再 `raise`。没装上时 `raise(SIGINT)` 会按默认处置
+    /// **杀掉测试进程**——失败方式本身就是这条用例要钉住的东西。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn install_ctrl_c_handler_arms_the_handler_before_the_first_reader() {
+        // 安装先于任何监听者：返回 `Some` 表示进程级处理器此刻已经就位
+        let installed = install_ctrl_c_handler();
+        assert!(installed.is_some(), "unix 上必须装得上 SIGINT 处理器");
+
+        let token = CancellationToken::new();
+        let watcher = spawn_ctrl_c_watcher(token.clone());
+        // 让 watcher 先完成首次轮询（注册自己那条流）：本用例考的是「安装已经生效」，不是
+        // 「spawn 之后多久被轮询」——后者由生产侧「安装先于第一段等待」的时序负责。
+        tokio::task::yield_now().await;
+        // SAFETY: `raise` 只把信号递给本进程自己，不碰内存、也不需要初始化。
+        unsafe { libc::raise(libc::SIGINT) };
+        tokio::time::timeout(Duration::from_secs(2), token.cancelled())
+            .await
+            .expect("装好的处理器必须把 SIGINT 转成取消");
+        watcher.abort();
+        drop(installed);
+
+        // 重复调用：不 panic、不改变行为（第二次照样是「已装好」的形状）
+        assert!(
+            install_ctrl_c_handler().is_some(),
+            "重复调用不 panic，仍然交回 Some"
+        );
+    }
 
     /// 凭据来源与门槛：有 key（配置文件优先）就回填交回，没有时 native 报人话错误、外部内核照跑。
     #[test]

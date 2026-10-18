@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cli::Cli;
 use crate::commands::slash::{self, Dispatch, Parsed};
-use crate::commands::{Session, kernel_note, spawn_ctrl_c_watcher};
+use crate::commands::{Session, install_ctrl_c_handler, kernel_note, spawn_ctrl_c_watcher};
 use crate::editor::raw::{self, RawMode};
 use crate::editor::reader::{EditorLineReader, INVALID_WARNING};
 
@@ -197,6 +197,15 @@ pub async fn run(cli: &Cli) -> Result<ExitCode> {
             println!("{}", tui_unavailable_note("unsupported platform"));
         }
     }
+
+    // 经典路径的起点：先把进程级 SIGINT 处理器装好（一次），句柄活到 `run` 返回。
+    //
+    // 安装点必须在**任何可交互时机之前**：`tokio::signal::ctrl_c` 的处理器在 future 首次轮询时
+    // 才装，而空闲 / 任务 / `/compact` / `/learn` 四段的 watcher 都是「每段现起」——第一段 watcher
+    // 被轮询之前到达的 Ctrl+C 会走默认处置直接杀进程（P5 台账记的偶发信号退出）。装在这里，
+    // 会话装配、banner 与第一段等待都在它之后；各段 watcher 照旧只管自己那份令牌（监听者各自
+    // 成流、互不消耗）。TUI 路径自己管信号（进守卫之前注册），成功时早已返回，不走这一行。
+    let _ctrl_c = install_ctrl_c_handler();
 
     let mut session = Session::new(cli)?;
     // `-c`：装载本工作区最近一次会话（命中时 banner 的 Session 行带短 id；没有会话打一行 note）。
