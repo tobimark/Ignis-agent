@@ -20,9 +20,12 @@
 //! - **raw mode 按读取区间启用**：[`EditorLineReader::read_line`] 进入时进 raw mode、返回前
 //!   析构守卫还原（每一条路径都还原：提交、EOF、错误）——任务执行与交互审批（`InteractiveApproval`
 //!   的按行读）期间终端必须回到 canonical/echo，否则审批提示永远等不到一行、输入也不回显。
+//! - **宽度每次读取探一次**：进读取区间时用 [`width_for_stdout`] 探一次 stdout 的列数交给
+//!   [`draw::frame_with`]（非 tty → `usize::MAX` → 交给终端软换行，与今日逐字相同）。折行与
+//!   `\t` 展开都只改**画出来的字节**：提交的文本、历史与送进内核的 prompt 一个字节都不动。
 
 use std::collections::VecDeque;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -32,6 +35,7 @@ use super::keys::{Decoder, Key};
 use super::raw::RawMode;
 use super::state::{EditorState, Event};
 use crate::commands::slash::{self, Completion};
+use crate::render::width_for_stdout;
 use crate::repl::LineReader;
 
 /// 非法 UTF-8 的一行告警（英文 chrome）：编辑器按读取区间至多打一次，v0.1 的回退路径
@@ -58,6 +62,9 @@ pub struct EditorReader<R: Read, W: Write> {
     state: EditorState,
     /// 已解出但还没交给状态机的按键（见模块文档「跨提交边界的按键」）。
     pending: VecDeque<Key>,
+    /// 本次读取的终端列数：进读取区间时由 [`width_for_stdout`] 探一次（非 tty → `usize::MAX`，
+    /// 也就是「交给终端软换行」的既有口径），`draw` / `finish_submit` 都拿它去折行。
+    width: usize,
 }
 
 impl<R: Read, W: Write> EditorReader<R, W> {
@@ -70,6 +77,8 @@ impl<R: Read, W: Write> EditorReader<R, W> {
             decoder: Decoder::new(),
             state: EditorState::new(History::load(history_path)),
             pending: VecDeque::new(),
+            // 读取前先按「不折行」当底：真有终端时 `read_line` 会重探
+            width: usize::MAX,
         }
     }
 
@@ -81,6 +90,9 @@ impl<R: Read, W: Write> EditorReader<R, W> {
     /// - 非法 UTF-8：清掉输入行 → 一行告警 → 照常重绘；
     /// - 一批里的多个重绘请求只落一帧（见模块文档「按批重绘」），提交/EOF 仍当场落笔。
     pub fn read_line(&mut self, prompt: &str) -> io::Result<Option<String>> {
+        // 终端宽度每次读取探一次（与渲染器同一口径）：非 tty → `usize::MAX`，帧与今日逐字相同。
+        // 探在画第一帧之前：整条读取区间里的每一帧都用同一份宽度（中途改窗口不重排已经画出的行）。
+        self.width = width_for_stdout(io::stdout().is_terminal());
         self.draw(prompt)?;
         loop {
             // 这一批要处理的按键：上一次读取跨过提交边界留下的先来（提示符已经画好），
@@ -174,17 +186,19 @@ impl<R: Read, W: Write> EditorReader<R, W> {
     }
 
     /// 按当前状态画一帧（提示符 + 缓冲 + 光标归位）并立刻冲出去。
+    ///
+    /// 帧按本次读取探得的宽度折行（`\t` 也在这条路上展开成空格）：缓冲区里那份文本原样不动。
     fn draw(&mut self, prompt: &str) -> io::Result<()> {
         let text = self.state.text();
         let cursor = self.state.cursor();
-        let frame = draw::frame(prompt, CONTINUATION, &text, cursor);
+        let frame = draw::frame_with(prompt, CONTINUATION, &text, cursor, self.width);
         self.write_bytes(frame.as_bytes())
     }
 
     /// 提交：先把「光标在末尾」的一帧留在屏幕上（文本从事件里拿：状态机手里那份已经被清空），
     /// 再写 `\r\n` 把光标送到下一行——输入行原样留在屏幕上，与 readline 的观感一致。
     fn finish_submit(&mut self, prompt: &str, text: &str) -> io::Result<()> {
-        let frame = draw::frame(prompt, CONTINUATION, text, text.chars().count());
+        let frame = draw::frame_with(prompt, CONTINUATION, text, text.chars().count(), self.width);
         self.write_bytes(frame.as_bytes())?;
         self.write_bytes(b"\r\n")
     }

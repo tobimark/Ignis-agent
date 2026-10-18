@@ -20,7 +20,7 @@ use crate::editor::draw::CONTINUATION;
 use crate::editor::history::History;
 use crate::editor::keys::{Decoder, Key};
 use crate::editor::state::{EditorState, Event};
-use crate::render::width::display_width;
+use crate::render::width::{display_width, expand_tabs};
 use crate::tui::app::Action;
 use crate::tui::view::InputBlock;
 
@@ -103,6 +103,10 @@ impl InputState {
     /// 窗口取「光标所在行起的两行」（`window_start = cursor_line.min(text_lines - 2)`）：光标
     /// 因此在窗口里（末行也不越界），多行输入只看得到光标附近的两行。光标列按显示宽度算——`你`
     /// 占 2 列，`❯ `/`… ` 各 2 列。
+    ///
+    /// `\t` 只在显示层展开（8 列制表位，从行内容的列 0 起算，与滚动区同一口径）：落进
+    /// [`InputBlock::lines`] 的两个显示行里不再有制表符，光标列也在**展开后的**文本上算——
+    /// 缓冲里那份文本（提交时交给内核的）一个字节不动。
     pub fn block(&self) -> InputBlock {
         let text = self.state.text();
         let chars: Vec<char> = text.chars().collect();
@@ -119,6 +123,8 @@ impl InputState {
             }
         }
         let before: String = chars[line_start..cursor].iter().collect();
+        // 光标列按展开后的行内文本算（`\t` 占几列只有展开之后才知道）
+        let before = expand_tabs(&before, 0);
 
         let window_start = cursor_line.min(lines.len().saturating_sub(2));
         let mut rows = [String::new(), String::new(), self.hint.clone()];
@@ -132,7 +138,8 @@ impl InputState {
             } else {
                 CONTINUATION
             };
-            *row = format!("{marker}{content}");
+            // `\t` 只在这一层展开：提交层与历史里仍是字面制表符
+            *row = format!("{marker}{}", expand_tabs(content, 0));
         }
         // 光标行在窗口内的相对位置（0 或 1），列 = 该行标记的显示宽度 + 光标前文本的显示宽度
         let cursor_row = cursor_line - window_start;
@@ -315,6 +322,38 @@ mod tests {
         assert_eq!(state.on_bytes(b"\x1b[B"), [Action::Redraw]);
         assert_eq!(state.text(), "", "回到进历史前的草稿");
         assert_eq!(state.on_bytes(b"\x1b[B"), [Action::None]);
+    }
+
+    /// P6 T2：输入区的 `\t` 只在显示层展开（8 列制表位），光标列按**展开后的**文本算；
+    /// 缓冲里的字面制表符一个字节都不动（提交时仍是 `a\tb`）。
+    #[test]
+    fn block_expands_tabs_and_keeps_the_cursor_aligned() {
+        let mut state = input();
+        // 直接按键的 0x09 是补全（见 `keys.rs`），要插字面制表符得走粘贴区间
+        // （区间标记本身是空操作，三个字符各请求一次重绘）
+        assert_eq!(
+            state.on_bytes(b"\x1b[200~a\tb\x1b[201~"),
+            [
+                Action::None,
+                Action::Redraw,
+                Action::Redraw,
+                Action::Redraw,
+                Action::None
+            ]
+        );
+        assert_eq!(state.text(), "a\tb", "缓冲里仍是字面制表符");
+
+        let block = state.block();
+        assert_eq!(block.lines[0], "❯ a       b");
+        assert!(
+            !block.lines[0].contains('\t'),
+            "显示行里不该再有制表符：{:?}",
+            block.lines[0]
+        );
+        // `a` 之后补到第 8 列（7 个空格）再放 `b` → 行内正文 9 列，光标在末尾
+        assert_eq!(block.cursor, Some((0, 2 + 9)));
+        assert_eq!(block.lines[1], "", "单行输入的第二条显示行是空的");
+        assert_eq!(block.lines[2], "", "没有 Tab 候选提示");
     }
 
     /// Tab 走 `slash::complete`：唯一命中替换整行、多候选拼成一行提示、没有候选清空提示。

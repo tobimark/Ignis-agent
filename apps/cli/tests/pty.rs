@@ -101,6 +101,30 @@ fn spawn_repl_in_with_env(
     })
 }
 
+/// [`spawn_repl`] 的窗口尺寸变体：从端按用例给的列数/行数开（窄终端里的折行用例要它）。
+fn spawn_repl_with_window(
+    label: &str,
+    script: Vec<ScriptStep>,
+    window: (u16, u16),
+) -> (Pty, TempDir, ScriptedModelHandle) {
+    let model = ScriptedModel::start(script);
+    let dir = TempDir::new(label);
+    let home = dir.join("home");
+    let workspace = dir.join("workspace");
+    // 工作区必须预先存在（CLI 启动时会校验它是目录），home 由 CLI 自己建
+    fs::create_dir_all(&workspace).expect("工作区应可创建");
+
+    let pty = Pty::spawn(&PtyOptions {
+        home: &home,
+        workspace: &workspace,
+        base_url: &model.base_url(),
+        args: &[],
+        env: &[],
+        window: Some(window),
+    });
+    (pty, dir, model)
+}
+
 /// 技能文件的落点：`{IGNIS_HOME}/skills/{name}/SKILL.md`（`spawn_repl*` 建出来的 home 就是
 /// `dir.join("home")`）。
 fn skill_path(dir: &TempDir, name: &str) -> PathBuf {
@@ -431,6 +455,63 @@ fn pty_long_paste_does_not_submit_until_enter() {
     wait_for_prompt_after(&pty, "● Done");
     pty.send("\x04");
     assert_eq!(pty.wait(), 0, "Ctrl-D 应以 0 退出：\n{}", pty.output());
+}
+
+/// 超过终端列数的输入行按显示宽度折成多个物理行（续行提示符 `… `），提交的文本一字不差。
+///
+/// 40 列的从端：100 个字符的输入行在屏幕上折成 3 行（每行标记占 2 列），光标落在最后一行末尾——
+/// 折行只改画出来的字节，送进内核的仍是那一整行。
+#[test]
+fn pty_long_input_line_wraps_with_the_continuation_marker() {
+    let (mut pty, _dir, model) = spawn_repl_with_window(
+        "pty-wrap-input",
+        vec![ScriptStep::Text("ok".to_string())],
+        (40, 12),
+    );
+
+    // 提示符出现 = 编辑器已接管终端（raw mode 生效），此时回车才会被当 Enter 提交
+    pty.expect("❯ ");
+    let long = "x".repeat(100);
+    pty.send(&long);
+
+    // 输入行宽过 40 列：多余的部分折到续行（`… ` 开头）而不是堆在同一行上
+    pty.expect("… ");
+    pty.send("\r");
+    pty.expect("● Done");
+
+    let requests = model.requests();
+    assert_eq!(requests.len(), 1, "一轮交互只该发一次请求：{requests:#?}");
+    assert_eq!(
+        last_user_message(&requests[0]),
+        long.as_str(),
+        "折行只改显示，提交的正文仍是那一整行"
+    );
+}
+
+/// 粘贴里的 `\t` 在显示层按 8 列制表位展开成空格，但提交给模型的正文里仍是字面制表符。
+///
+/// 两件事分开钉：屏幕上看到的是展开后的行（`a` 之后补到第 8 列 = 7 个空格），而进内核的字节
+/// 与粘进来的一模一样——显示层的展开绝不改提交文本（设计 §2.3 的字节契约）。
+#[test]
+fn pty_pasted_text_with_tabs_renders_expanded_and_submits_verbatim() {
+    let (mut pty, _dir, model) =
+        spawn_repl("pty-paste-tab", vec![ScriptStep::Text("ok".to_string())]);
+
+    pty.expect("❯ ");
+    pty.send("\x1b[200~a\tb\x1b[201~");
+
+    // 显示层：制表符补到第 8 列（`a` 之后 7 个空格）
+    pty.expect("a       b");
+    pty.send("\r");
+    pty.expect("● Done");
+
+    let requests = model.requests();
+    assert_eq!(requests.len(), 1, "一轮交互只该发一次请求：{requests:#?}");
+    assert_eq!(
+        last_user_message(&requests[0]),
+        "a\tb",
+        "显示层展开不改提交文本：正文里是字面制表符"
+    );
 }
 
 /// ↑ 召回上一条提交、↓ 把进历史前打的草稿原样还回来；Ctrl+U 清行后第三次提交照常送模型。

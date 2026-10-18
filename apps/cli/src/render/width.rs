@@ -37,6 +37,51 @@ pub fn display_width(text: &str) -> usize {
     text.chars().map(char_width).sum()
 }
 
+/// 制表位步长：`\t` 前进到下一个 8 列的整数倍（与 TUI 滚动区的显示口径一致）。
+pub const TAB_STOP: usize = 8;
+
+/// 从 `column` 列消费一个字符后的新列位置：`\t` 跳到下一个 [`TAB_STOP`] 的整数倍，
+/// 其余按 [`char_width`]（`char_width('\t')` 仍是 0，既有口径不动）。
+///
+/// 列数一律是「显示列」（`你` 占 2 列）；加法用饱和写法兜住 `usize::MAX`——它是「不折行」的
+/// 哨兵值（见 [`frame_with`](crate::editor::draw::frame_with)），不该在这里加出 panic。
+pub fn advance_column(column: usize, c: char) -> usize {
+    if c == '\t' {
+        // `\t` 自己占 0 列，但屏幕上要补到下一个制表位（正好落在制表位上时前进一整步）
+        column.saturating_add(TAB_STOP - column % TAB_STOP)
+    } else {
+        column.saturating_add(char_width(c))
+    }
+}
+
+/// 把 `\t` 展开成空格（**仅显示层**：调用方拿它去画，不改任何被提交/落盘的文本）：
+/// `start_col` 是这段文本在屏幕上的起始列（提示符宽度），从它起按制表位补齐。
+///
+/// 本仓库的调用方（帧合成与 TUI 输入区）都把标记当行外的装饰：制表位从**内容自己的列 0**
+/// 起算（`start_col == 0`），与 TUI 滚动区（`crate::tui::view`）同一口径——粘进来的缩进因此
+/// 与滚动区里看到的对齐方式一致。
+pub fn expand_tabs(text: &str, start_col: usize) -> String {
+    if !text.contains('\t') {
+        // 绝大多数字符串没有制表符：不分配第二份
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut column = start_col;
+    for c in text.chars() {
+        let next = advance_column(column, c);
+        if c == '\t' {
+            // `\t` 自己不出字节：用空格补到下一个制表位（宽字符之后的制表位按显示宽度算）
+            if next > column {
+                out.extend(std::iter::repeat_n(' ', next - column));
+            }
+        } else {
+            out.push(c);
+        }
+        column = next;
+    }
+    out
+}
+
 /// ANSI 转义序列的引子（`\x1b[` …）。
 const ESC_CHAR: char = '\x1b';
 
@@ -238,7 +283,36 @@ impl Wrapper {
 
 #[cfg(test)]
 mod tests {
-    use super::{char_width, display_width, truncate_to_width, wrap};
+    use super::{
+        TAB_STOP, advance_column, char_width, display_width, expand_tabs, truncate_to_width, wrap,
+    };
+
+    /// P6 T2：制表位口径——`\t` 前进到下一个 8 列的整数倍，其余按显示宽度走。
+    ///
+    /// 展开只发生在**显示层**：`char_width('\t')` 仍是 0（既有契约不动），所以调用方要把展开后的
+    /// 串拿去画，被提交 / 落盘 / 送模型的文本保持字面制表符。
+    #[test]
+    fn advance_column_and_expand_tabs_use_eight_column_stops() {
+        assert_eq!(TAB_STOP, 8);
+        assert_eq!(advance_column(0, '\t'), 8);
+        assert_eq!(advance_column(3, '\t'), 8);
+        assert_eq!(advance_column(8, '\t'), 16);
+        assert_eq!(advance_column(2, '你'), 4);
+        assert_eq!(advance_column(0, 'a'), 1);
+        // 既有宽度口径不动：`\t` 自己仍是 0 列（展开是调用方的事）
+        assert_eq!(char_width('\t'), 0);
+
+        assert_eq!(expand_tabs("a\tb", 0), "a       b");
+        assert_eq!(expand_tabs("\t", 3), "     ");
+        assert_eq!(expand_tabs("你\t", 0), "你      ");
+        // 展开只补空格：没有 `\t` 的串逐字返回，空串还是空串
+        assert_eq!(expand_tabs("没有制表符", 0), "没有制表符");
+        assert_eq!(expand_tabs("", 0), "");
+        // 展开后的显示宽度 = 制表位跳到的列（`a` 之后补到第 8 列，再加 `b` 的 1 列）
+        assert_eq!(display_width(&expand_tabs("a\tb", 0)), 9);
+        // 宽字符之后的制表位按显示宽度算（`你` 占 2 列，补到第 8 列）
+        assert_eq!(display_width(&expand_tabs("你\t", 0)), 8);
+    }
 
     /// 去掉全部空白后的字符序列：折行不变量锚在它上面（不丢、不增、不重排）。
     fn non_whitespace(text: &str) -> Vec<char> {
