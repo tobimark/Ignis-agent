@@ -2524,11 +2524,13 @@ mod tests {
         assert_eq!(lines.len(), 4, "{lines:?}");
         assert_eq!(
             cells(&lines[0]),
-            ["ID", "STATUS", "KIND", "STARTED", "PROMPT"]
+            ["ID", "STATUS", "KIND", "STARTED", "PROMPT", "SKILLS"]
         );
         assert!(lines[1].starts_with("019a1b2c-2222"), "{lines:?}");
         assert!(lines[2].starts_with("019a1b2c-1111"), "{lines:?}");
         assert!(lines[1].contains("修复配置路径"), "{lines:?}");
+        // `insert_task` 造的行没记过技能：第六格是 `-`（与 `task list` 同一列的同一口径）
+        assert_eq!(cells(&lines[1])[5], "-", "{lines:?}");
         assert!(
             lines[1].contains("success") || lines[1].contains("running"),
             "{lines:?}"

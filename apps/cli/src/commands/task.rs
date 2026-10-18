@@ -109,6 +109,10 @@ pub(crate) fn is_id_prefix(arg: &str) -> bool {
 
 /// 任务详情：头部（一字段一行）→ 审批记录表 → 事件流。
 ///
+/// 头部字段的顺序钉死：`skills:` 一行插在 `tokens:` 与 `error:` 之间；`skills_used` 是
+/// `None` 或空串时整行**不出现**（不是 `skills: -`）。取值是 `TaskRunner` 在 `finish_task`
+/// 之前写的逗号连接技能名集合，与 `task list` 的 `SKILLS` 列同源、原样展示。
+///
 /// 日志文件缺失按「没有事件流」处理（任务行还在、日志被删）；其它读取失败照常上抛。
 fn render_task(
     task: &TaskRecord,
@@ -118,9 +122,13 @@ fn render_task(
     let ended = task.ended_at.map_or_else(|| "-".to_string(), format_time);
     let error = task.error.as_deref().unwrap_or("-");
     let summary = task.summary.as_deref().unwrap_or("-");
+    let skills = match task.skills_used.as_deref() {
+        Some(list) if !list.is_empty() => format!("skills: {list}\n"),
+        _ => String::new(),
+    };
     let mut out = format!(
         "id: {}\nstatus: {}\nkind: {}\nkernel: {}\nworkspace: {}\nstarted: {}\nended: {ended}\n\
-         duration: {}\ntokens: {}\nerror: {error}\nsummary: {summary}\n",
+         duration: {}\ntokens: {}\n{skills}error: {error}\nsummary: {summary}\n",
         task.id,
         task.status,
         task.kind,
@@ -154,7 +162,10 @@ fn render_task(
     Ok(out)
 }
 
-/// 最近任务表：id 短 id（13 字符）、status、kind、started、prompt 前 40 字符。
+/// 最近任务表：id 短 id（13 字符）、status、kind、started、prompt 前 40 字符、技能集合。
+///
+/// 第六列直接取 `task.skills_used`（逗号连接的技能名集合，由 `TaskRunner` 在 `finish_task`
+/// 之前写入）：**不截断**，没记过技能的行给 `-`。
 pub(crate) fn render_list(tasks: &[TaskRecord]) -> String {
     let mut rows = vec![vec![
         "ID".to_string(),
@@ -162,6 +173,7 @@ pub(crate) fn render_list(tasks: &[TaskRecord]) -> String {
         "KIND".to_string(),
         "STARTED".to_string(),
         "PROMPT".to_string(),
+        "SKILLS".to_string(),
     ]];
     for task in tasks {
         rows.push(vec![
@@ -171,6 +183,7 @@ pub(crate) fn render_list(tasks: &[TaskRecord]) -> String {
             task.kind.clone(),
             format_time(task.started_at),
             truncate(&one_line(&task.prompt), PROMPT_CHARS),
+            task.skills_used.as_deref().unwrap_or("-").to_string(),
         ]);
     }
     render_table(&rows)
@@ -581,6 +594,14 @@ mod tests {
         }
     }
 
+    /// 表格一行的单元格：列的间隔口径在 `render_table`（两个空格），这里只做拆行。
+    fn cells(line: &str) -> Vec<&str> {
+        line.split("  ")
+            .map(str::trim)
+            .filter(|cell| !cell.is_empty())
+            .collect()
+    }
+
     #[test]
     fn task_show_output_contains_status_and_events() {
         let home = TempHome::new("show");
@@ -600,6 +621,8 @@ mod tests {
         assert!(out.contains("tokens: in=12 out=34\n"), "{out}");
         assert!(out.contains("error: -\n"), "{out}");
         assert!(out.contains("summary: 已修复\n"), "{out}");
+        // 夹具任务没记过技能：`skills:` 整行不出现（不是 `skills: -`）
+        assert!(!out.contains("skills:"), "{out}");
 
         // 审批记录表：一行一条，时间取 HH:MM:SS
         assert!(out.contains("approvals:\n"), "{out}");
@@ -623,6 +646,40 @@ mod tests {
         assert!(out.contains("12:00:03 task_end status=success"), "{out}");
         // 无法解析的行不能让 show 失败，也不能被静默丢掉
         assert!(out.contains("--:--:-- (unparsable) {oops\n"), "{out}");
+    }
+
+    /// `skills_used` 有值时 `task show` 的头里多一行 `skills:`，位置钉死在 `tokens:` 与
+    /// `error:` 之间；列表与详情读的是同一条库列的两种展示面。
+    #[test]
+    fn task_show_carries_the_skills_line_when_present() {
+        let home = TempHome::new("show-skills");
+        let id = fixture(home.path());
+        Db::open(&home.path().join("ignis.db"))
+            .unwrap()
+            .set_task_skills_used(&id, &["my-skill".into(), "other".into()])
+            .unwrap();
+
+        let out = show_at(home.path(), &id).unwrap();
+
+        assert!(
+            out.contains("tokens: in=12 out=34\nskills: my-skill,other\nerror: -\n"),
+            "{out}"
+        );
+    }
+
+    /// `skills_used` 是空串时 `skills:` 整行同样不出现（落库的空表是 `NULL`，这一条挡的是
+    /// 坏数据把空行塞进头部）。
+    #[test]
+    fn task_show_omits_the_skills_line_for_an_empty_string() {
+        let home = TempHome::new("show-empty-skills");
+        let mut task = record(TASK_ID, "success", "run", STARTED_AT, "提示");
+        task.skills_used = Some(String::new());
+        let log_path = home.path().join("logs").join(format!("{TASK_ID}.jsonl"));
+
+        let out = render_task(&task, &[], &log_path).unwrap();
+
+        assert!(out.contains("tokens: in=0 out=0\nerror: -\n"), "{out}");
+        assert!(!out.contains("skills:"), "{out}");
     }
 
     #[test]
@@ -760,8 +817,11 @@ mod tests {
     #[test]
     fn task_list_shows_short_id_and_truncates_prompt() {
         let long_prompt = "改".repeat(50);
+        // 一条记过技能（逗号连接的集合原样展示）、一条没记过（`None`）
+        let mut with_skills = record(TASK_ID, "success", "run", STARTED_AT, &long_prompt);
+        with_skills.skills_used = Some("my-skill,other".into());
         let tasks = vec![
-            record(TASK_ID, "success", "run", STARTED_AT, &long_prompt),
+            with_skills,
             record(
                 "019a1b2c-3d4e-7f00-8000-000000000002",
                 "running",
@@ -775,7 +835,11 @@ mod tests {
 
         // 表头 + 两行
         assert_eq!(out.lines().count(), 3, "{out}");
-        assert!(out.contains("ID"), "{out}");
+        assert_eq!(
+            cells(out.lines().next().unwrap()),
+            ["ID", "STATUS", "KIND", "STARTED", "PROMPT", "SKILLS"],
+            "{out}"
+        );
         // id 列统一用 `short_id`（13 字符），与结束行的短 id 同一口径
         assert!(out.contains("019a1b2c-3d4e "), "{out}");
         assert!(!out.contains("7f00-8000"), "id 只展示前 13 位：{out}");
@@ -784,5 +848,9 @@ mod tests {
         assert!(out.contains("2026-10-15T12:00:00Z"), "{out}");
         assert!(out.contains(&format!("{}…", "改".repeat(40))), "{out}");
         assert!(!out.contains(&"改".repeat(41)), "{out}");
+        // 第六列：`skills_used` 原样（不做截断），没记过技能的是 `-`
+        let rows: Vec<Vec<&str>> = out.lines().skip(1).map(cells).collect();
+        assert_eq!(rows[0][5], "my-skill,other", "{out}");
+        assert_eq!(rows[1][5], "-", "{out}");
     }
 }
