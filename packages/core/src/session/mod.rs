@@ -319,38 +319,50 @@ pub fn render_transcript(messages: &[HistoryMessage]) -> String {
         .join("\n\n")
 }
 
-/// 一次无工具的 native 请求：`system` = [`COMPACT_SYSTEM_PROMPT`]、`user` = `transcript`，
-/// 累加 `TextDelta` 作为摘要；`Done{Failed}`、其余非成功终态与**无终态**（流提前结束）都报
-/// [`SessionError::Summarize`]，摘要正文为空（全空白也算）报 [`SessionError::EmptySummary`]。
+/// 无工具请求的失败形态：内核给的原因 / 正文全空白。
+#[derive(Debug)]
+pub(crate) enum ToolLessError {
+    /// 请求没有以成功终态收束：`{0}` 是内核交回的人话原因（`Done{Failed}` 的 `error`、非成功终态
+    /// 或流提前结束）。
+    Failed(String),
+    /// 请求成功但正文为空（全空白也算空）。
+    Empty,
+}
+
+/// 一次无工具请求的骨架：`system` + `user`，累加 `TextDelta` 作为正文；`Done{Failed}`、其余非成功
+/// 终态与**无终态**（流提前结束）都报 [`ToolLessError::Failed`]，正文全空白报
+/// [`ToolLessError::Empty`]。`/compact` 与 `/learn` 共用（执行器仍是私有的 [`ToolLessExecutor`]：
+/// `specs()` 恒空 → 请求体没有 `tools`）。
 ///
 /// 请求带 `config.limits` 与 `config.model`（调用方传会话的生效配置，`/model` 的会话级覆盖因此对摘要
-/// 也生效）。`tools()` 恒空：摘要请求不带工具，模型真回了工具调用也只会收到一条失败结果。
-pub async fn summarize_turns(
+/// 也生效）。调用方负责把 [`ToolLessError`] 映射成自己的错误类型。
+pub(crate) async fn run_tool_less(
     runtime: Arc<dyn Runtime>,
     config: &Config,
-    transcript: &str,
+    system: &str,
+    user: &str,
     cancel: CancellationToken,
-) -> Result<String, SessionError> {
+) -> Result<String, ToolLessError> {
     let request = RunRequest {
         messages: vec![ChatMessage {
             role: Role::User,
-            content: transcript.to_string(),
+            content: user.to_string(),
             tool_call_id: None,
             tool_calls: Vec::new(),
         }],
-        system_prompt: COMPACT_SYSTEM_PROMPT.to_string(),
+        system_prompt: system.to_string(),
         model: config.model.clone(),
         limits: config.limits,
         executor: Arc::new(ToolLessExecutor),
     };
 
     let mut stream = runtime.run(request, cancel).await;
-    let mut summary = String::new();
+    let mut text = String::new();
     let mut status: Option<RunStatus> = None;
     let mut failure: Option<String> = None;
     while let Some(event) = stream.next().await {
         match event {
-            RuntimeEvent::TextDelta { text } => summary.push_str(&text),
+            RuntimeEvent::TextDelta { text: delta } => text.push_str(&delta),
             // 恰好一条 `Done` 收束整条流；记下终态与内核给的原因
             RuntimeEvent::Done {
                 status: done,
@@ -360,31 +372,53 @@ pub async fn summarize_turns(
                 status = Some(done);
                 failure = error;
             }
-            // 摘要请求不带工具、也不看推理：其余事件（Usage / ReasoningDelta / ToolExec…）忽略
+            // 无工具请求不带工具、也不看推理：其余事件（Usage / ReasoningDelta / ToolExec…）忽略
             _ => {}
         }
     }
 
     match status {
         Some(RunStatus::Success) => {
-            if summary.trim().is_empty() {
-                return Err(SessionError::EmptySummary);
+            if text.trim().is_empty() {
+                return Err(ToolLessError::Empty);
             }
-            Ok(summary)
+            Ok(text)
         }
-        Some(done) => Err(SessionError::Summarize(
+        Some(done) => Err(ToolLessError::Failed(
             failure.unwrap_or_else(|| done.as_str().to_string()),
         )),
-        // 流结束却没有 `Done`：把缺失终态也报成摘要失败，不静默落半截正文
-        None => Err(SessionError::Summarize(
+        // 流结束却没有 `Done`：把缺失终态也报成失败，不静默落半截正文
+        None => Err(ToolLessError::Failed(
             "model stream ended without a final status".to_string(),
         )),
     }
 }
 
-/// 摘要请求的工具执行器：`specs()` 恒空 → 请求体里没有 `tools` 字段。
+/// 一次无工具的 native 请求：`system` = [`COMPACT_SYSTEM_PROMPT`]、`user` = `transcript`，
+/// 累加 `TextDelta` 作为摘要；`Done{Failed}`、其余非成功终态与**无终态**（流提前结束）都报
+/// [`SessionError::Summarize`]，摘要正文为空（全空白也算）报 [`SessionError::EmptySummary`]。
 ///
-/// 模型真的回了工具调用时给一条失败结果（这是防御性分支：摘要提示不含工具、请求也不带工具描述）。
+/// 请求骨架与 `/learn` 共用 `session::run_tool_less`（私有的 `ToolLessExecutor`：`tools()` 恒空，
+/// 模型真回了工具调用也只会收到一条失败结果）。
+pub async fn summarize_turns(
+    runtime: Arc<dyn Runtime>,
+    config: &Config,
+    transcript: &str,
+    cancel: CancellationToken,
+) -> Result<String, SessionError> {
+    // 骨架与 `/learn` 共用（`session::run_tool_less`），这里只把它翻成会话面的错误
+    match run_tool_less(runtime, config, COMPACT_SYSTEM_PROMPT, transcript, cancel).await {
+        Ok(summary) => Ok(summary),
+        Err(ToolLessError::Failed(reason)) => Err(SessionError::Summarize(reason)),
+        Err(ToolLessError::Empty) => Err(SessionError::EmptySummary),
+    }
+}
+
+/// 无工具请求（`/compact` 与 `/learn` 共用）的工具执行器：`specs()` 恒空 → 请求体里没有 `tools`
+/// 字段。
+///
+/// 模型真的回了工具调用时给一条失败结果（这是防御性分支：摘要 / 草稿提示不含工具、请求也不带
+/// 工具描述）。
 struct ToolLessExecutor;
 
 #[async_trait]
