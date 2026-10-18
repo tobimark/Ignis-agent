@@ -35,7 +35,7 @@ pub enum Slash {
     Status,
     /// `/tasks [N]`：最近任务表（默认 10 条 + `ignis task show` 提示）。
     Tasks,
-    /// `/skills`：技能目录（与 `ignis skills list` 同一份渲染）。
+    /// `/skills [reload]`：技能目录（与 `ignis skills list` 同一份渲染），或重扫目录。
     Skills,
     /// `/memory …`：长期记忆（list/search/add/edit/delete，复用 `ignis memory …` 的口径）。
     Memory,
@@ -108,6 +108,8 @@ const MEMORY_DELETE_USAGE: &str = "usage: /memory delete <id>";
 const TASKS_LIMIT_ERROR: &str = "tasks: limit must be a positive number";
 /// `/tasks` 无参时的条数（与帮助里的 `(default 10)` 同一口径）。
 const TASKS_DEFAULT_LIMIT: usize = 10;
+/// `/skills` 的参数面：只认 `reload` 这一个取值，其余（含多词）都是这条用法行。
+const SKILLS_USAGE: &str = "usage: /skills [reload]";
 /// `/resume` 缺参或多参时的用法行（命令只收一个位置）。
 const RESUME_USAGE: &str = "resume: usage: /resume <id>";
 /// `/compact` 的参数面：命令不收参数（多余词给这条用法行）。
@@ -211,9 +213,9 @@ const COMMANDS: [Spec; 14] = [
         command: Slash::Skills,
         group: Group::Agent,
         name: "/skills",
-        arg_hint: "",
-        summary: "List the skill catalog",
-        expects_args: false,
+        arg_hint: "[reload]",
+        summary: "List the skill catalog, or reload it",
+        expects_args: true,
     },
     Spec {
         command: Slash::Memory,
@@ -832,8 +834,18 @@ pub fn dispatch(
         // 三个复用面命令：数据面取会话字段（`/tasks` 的库、`/skills` 的目录）或落回既有命令
         // 助手（`/memory` 的读写与回执），渲染与文案都不在这里另写一份。
         Slash::Memory => Ok(Dispatch::Lines(memory_lines(session, args)?)),
-        // 多余参数不解释（与 `/status`、`/help` 同口径）；`reload` 属 P4
-        Slash::Skills => Ok(Dispatch::Lines(lines_of(&skills::render(session.skills())))),
+        // 三条分支都是本地动作：无参列表、`reload` 重扫并换掉会话里那一份、其余给用法行
+        // （用法错误不重扫：目录都不碰）。三条都不消耗模型。
+        Slash::Skills => match args {
+            [] => Ok(Dispatch::Lines(lines_of(&skills::render(
+                &session.skills(),
+            )))),
+            [word] if word == "reload" => {
+                let count = session.reload_skills();
+                Ok(Dispatch::Lines(vec![skills::reloaded_line(count)]))
+            }
+            _ => Err(SKILLS_USAGE.to_string()),
+        },
         Slash::Tasks => {
             let limit = tasks_limit(args)?;
             let rows = session
@@ -1044,7 +1056,7 @@ mod tests {
             assert!(hits[0].ends_with(spec.summary), "{:?}", hits[0]);
         }
 
-        // 分组对齐逐字钉住：AGENT 组最宽是 `/model [name]`（13 列），列间两个空格
+        // 分组对齐逐字钉住：AGENT 组最宽是 `/skills [reload]`（16 列），列间两个空格
         let agent = lines
             .iter()
             .position(|line| line == "AGENT")
@@ -1052,11 +1064,30 @@ mod tests {
         assert_eq!(
             &lines[agent + 1..agent + 5],
             [
-                "  /model [name]  Show or set the model of this session",
-                "  /status        Show kernel, model, workspace, alerts and last usage",
-                "  /tasks [N]     List the most recent tasks (default 10)",
-                "  /skills        List the skill catalog",
+                "  /model [name]     Show or set the model of this session",
+                "  /status           Show kernel, model, workspace, alerts and last usage",
+                "  /tasks [N]        List the most recent tasks (default 10)",
+                "  /skills [reload]  List the skill catalog, or reload it",
             ]
+        );
+
+        // `/skills` 仍是 AGENT 组第 4 条：参数提示进表，补全唯一命中时补一个空格
+        let skills_spec = COMMANDS
+            .iter()
+            .find(|spec| spec.command == Slash::Skills)
+            .expect("/skills 应进命令表");
+        assert_eq!(skills_spec.group, Group::Agent);
+        assert_eq!(skills_spec.arg_hint, "[reload]");
+        assert!(skills_spec.expects_args);
+        assert_eq!(skills_spec.summary, "List the skill catalog, or reload it");
+        assert_eq!(parse("/skills"), Parsed::Command(Slash::Skills, Vec::new()));
+        assert_eq!(
+            parse("/skills reload"),
+            Parsed::Command(Slash::Skills, vec!["reload".to_string()])
+        );
+        assert_eq!(
+            complete("/skills"),
+            Completion::Accepted("/skills ".to_string())
         );
         // 单条目的组：列宽就是它自己（参数提示与描述之间仍是两个空格）
         let intelligence = lines
@@ -2332,8 +2363,10 @@ mod tests {
         )
         .unwrap();
 
-        // 会话里的是构造时的快照（reload 属 P4）：按 `skills::run` 的同一加载路径取一份目录，
-        // 先渲染出 CLI 那边的逐行输出，再把它交给会话——断言的是「同一目录 → 同一逐行输出」。
+        // 会话里的快照是构造时扫的（那时技能目录还不存在）：`/skills reload` 换成新目录，
+        // 再按 `skills::run` 的同一加载路径**现算**一份 expected——断言的是「同一目录 → 同一
+        // 逐行输出」。
+        session.reload_skills();
         let catalog = SkillCatalog::load(&skills_dir);
         let expected: Vec<String> = skills::render(&catalog)
             .lines()
@@ -2341,7 +2374,6 @@ mod tests {
             .collect();
         let table_rows = catalog.metas().len() + 1;
         let warnings = catalog.warnings().len();
-        session.skills = catalog;
 
         let lines = dispatch_lines(&mut session, Slash::Skills, &[]);
         assert_eq!(lines, expected, "与 `ignis skills list` 不同");
@@ -2358,6 +2390,111 @@ mod tests {
                 .all(|line| line.starts_with("! ")),
             "警告只能跟在表后：{lines:?}"
         );
+    }
+
+    /// `/skills reload` 重扫 `~/.ignis/skills`：启动之后落下的技能进目录，旧快照一位不动，
+    /// 同名覆盖的既有约定（user 覆盖 builtin、覆盖不是新增）也不变。
+    #[test]
+    fn skills_reload_picks_up_a_new_skill_file() {
+        let (_dir, mut session) = session_fixture("slash-skills-reload", "native");
+
+        // 会话起步的快照：三个内置技能（技能目录这时还不存在）
+        let before = session.skills();
+        assert_eq!(before.metas().len(), 3, "起步只有内置三技能");
+
+        // 启动之后往 `~/.ignis/skills/` 落一个新技能
+        let new_skill = session.home().join("skills").join("new-skill");
+        fs::create_dir_all(&new_skill).unwrap();
+        fs::write(
+            new_skill.join("SKILL.md"),
+            "---\nname: new-skill\ndescription: Added after startup.\n---\n# 正文\n",
+        )
+        .unwrap();
+
+        let lines = dispatch_lines(&mut session, Slash::Skills, &args(&["reload"]));
+        assert_eq!(lines, ["reloaded skills (4)"]);
+
+        // `Arc` 快照语义：reload 换的是一份新目录，reload 前取到的那份内容不变
+        let after = session.skills();
+        assert!(!Arc::ptr_eq(&before, &after), "reload 应换掉那份目录");
+        assert_eq!(before.metas().len(), 3, "旧快照没被改写");
+        assert_eq!(after.metas().len(), 4, "新目录 = 内置三技能 + 新技能");
+
+        // 紧接着无参 `/skills` 打的就是新目录：新技能在表里（不是构造时的三行旧表）
+        let listed = dispatch_lines(&mut session, Slash::Skills, &[]);
+        assert!(
+            listed.iter().any(|line| line.starts_with("new-skill")),
+            "{listed:?}"
+        );
+        assert!(
+            !listed.iter().any(|line| line.contains("! ")),
+            "合法技能不该有警告行：{listed:?}"
+        );
+        // banner 的计数读的也是会话这一份快照：reload 之后跟着变成 4
+        assert_eq!(session.banner_counts().0, 4, "banner 与 /skills 同源");
+
+        // 覆盖语义不变：同一份文件改成内置技能名再 reload，来源列是 `user`，且**覆盖不是新增**
+        // ——合并目录仍是 3 条（只算一条 server-health）
+        fs::write(
+            new_skill.join("SKILL.md"),
+            "---\nname: server-health\ndescription: My own health checker.\n---\n# 正文\n",
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch_lines(&mut session, Slash::Skills, &args(&["reload"])),
+            ["reloaded skills (3)"]
+        );
+        let listed = dispatch_lines(&mut session, Slash::Skills, &[]);
+        let row = listed
+            .iter()
+            .find(|line| line.starts_with("server-health"))
+            .unwrap_or_else(|| panic!("server-health 行缺失：{listed:?}"));
+        assert_eq!(
+            cells(row),
+            ["server-health", "user", "My own health checker."],
+            "{listed:?}"
+        );
+    }
+
+    /// `/skills` 的参数面：只认 `reload`，其余（含多词与空串）都是同一句用法行——错误既不重扫
+    /// 目录，也不改会话里的那一份。
+    #[test]
+    fn skills_reload_rejects_unknown_arguments() {
+        let (_dir, mut session) = session_fixture("slash-skills-usage", "native");
+        let before = dispatch_lines(&mut session, Slash::Skills, &[]);
+
+        for words in [args(&["now"]), args(&["reload", "x"]), args(&[""])] {
+            let error = dispatch(&mut session, Slash::Skills, &words).unwrap_err();
+            assert_eq!(error, SKILLS_USAGE, "{words:?}");
+            assert_eq!(
+                session.skills().metas().len(),
+                3,
+                "{words:?}: 用法错误不该重扫目录"
+            );
+            assert_eq!(
+                dispatch_lines(&mut session, Slash::Skills, &[]),
+                before,
+                "{words:?}: 目录内容不变"
+            );
+        }
+    }
+
+    /// `/skills` 的三条分支都是本地命令面（只有 `/compact` 与 `/learn` 需要模型往返）：
+    /// 列表、reload 与用法错误一个模型请求都不产生。
+    #[test]
+    fn skills_lines_never_produce_a_model_request() {
+        // 空脚本：真发了请求只会拿到 500，`requests()` 因此能钉住「没碰模型」
+        let model = ScriptedModel::start(Vec::new());
+        let (_dir, mut session) =
+            session_fixture_with_config("slash-skills-model", "native", scripted_config(&model));
+
+        dispatch_lines(&mut session, Slash::Skills, &[]);
+        dispatch_lines(&mut session, Slash::Skills, &args(&["reload"]));
+        assert_eq!(
+            dispatch(&mut session, Slash::Skills, &args(&["now"])).unwrap_err(),
+            SKILLS_USAGE
+        );
+        assert!(model.requests().is_empty(), "本地命令面不该碰模型");
     }
 
     /// `/tasks` 的表与 `ignis task list` 逐行同形，后面跟一行 `ignis task show` 提示。

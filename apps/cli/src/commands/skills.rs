@@ -21,6 +21,13 @@ pub fn run(command: &SkillsCommand) -> Result<ExitCode> {
     }
 }
 
+/// `/skills reload` 与 `/learn` 落盘后的同一行回显（技能面的文案只有这一处）。
+///
+/// `count` 是重扫后**合并目录**的技能条数：同名 user 技能覆盖 builtin，只算一条。
+pub(crate) fn reloaded_line(count: usize) -> String {
+    format!("reloaded skills ({count})")
+}
+
 /// 技能表：每行 `{name}  {source}  {description}`；加载警告按 `! {msg}` 跟在表后。
 pub(crate) fn render(catalog: &SkillCatalog) -> String {
     let mut rows = vec![vec![

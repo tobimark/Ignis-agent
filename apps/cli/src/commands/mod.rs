@@ -17,6 +17,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -65,10 +66,13 @@ pub struct Session {
     approvals: Arc<dyn ApprovalHandler>,
     /// 任务日志目录。
     log_dir: PathBuf,
-    /// 与运行器同一份记忆存储与技能目录（`Arc` 克隆）：banner 计数从这里取，
-    /// 不重新开库、也不重新扫描技能目录。
+    /// 与运行器同一份记忆存储（`Arc` 克隆）：banner 的 active 事实计数从这里取，不重新开库。
     memory: Arc<MemoryStore>,
-    skills: Arc<SkillCatalog>,
+    /// 本会话当前的技能目录快照：banner 与 `/skills` 都读这一份，不每次重新扫描。
+    ///
+    /// 锁里放 `Arc`、读方克隆一次就走（[`Session::skills`]）——`Session` 本身是 `&mut` 独占的，
+    /// 加锁只为了 `/skills reload` 整份替换时不让读者看到半份目录；不加外层 `Arc`。
+    skills: Mutex<Arc<SkillCatalog>>,
     /// 告警投递渠道：每轮任务的运行器由它投递（CLI 侧暂时是空组合）。
     notifier: Arc<dyn Notifier>,
     /// 当前内核名：`/kernel` 只改它，切换只影响后续任务。
@@ -194,7 +198,7 @@ impl Session {
             policy,
             approvals,
             memory,
-            skills,
+            skills: Mutex::new(skills),
             // 告警投递渠道：CLI 侧先留空组合——告警照常落库与去重（`ignis alerts` 的未读收件箱
             // 就是渠道①），真实渠道（notify-send / 日志 / IM）由 T5 的 gateway 在这里注入
             notifier: Arc::new(MultiNotifier::new(Vec::new())),
@@ -524,9 +528,33 @@ impl Session {
         &self.db
     }
 
-    /// 技能目录：REPL 的 `/skills` 复用会话构造时的那一份（不重新扫描；reload 属 P4）。
-    pub(crate) fn skills(&self) -> &SkillCatalog {
-        &self.skills
+    /// 当前技能目录快照（每轮任务与 `/skills` 都读这一份）。
+    ///
+    /// 克隆的是 `Arc`：调用方拿到的那一刻起就是一份不会再变的目录——运行中的轮次、正在渲染的
+    /// `/skills` 都不会被随后的 [`Session::reload_skills`] 改到。锁中毒只取回内部值，不 panic。
+    pub(crate) fn skills(&self) -> Arc<SkillCatalog> {
+        let guard = self
+            .skills
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(&guard)
+    }
+
+    /// 重扫 `~/.ignis/skills` + 内置技能，换掉会话里的那一份；返回新目录的技能条数
+    /// （`metas().len()`，覆盖后仍是合并后的条数）。
+    ///
+    /// 目录来源与会话构造同一处（`self.home.join("skills")`）：`/skills reload` 认的就是这份
+    /// 安装的数据目录。已经在跑的那一轮任务握着自己那份快照（[`Session::run_task`] 每轮取一次），
+    /// 换掉的只影响后续轮次与之后的 `/skills`。锁中毒同样只取回内部值。
+    pub(crate) fn reload_skills(&mut self) -> usize {
+        let catalog = SkillCatalog::load(&self.home.join("skills"));
+        let count = catalog.metas().len();
+        let mut guard = self
+            .skills
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = catalog;
+        count
     }
 
     /// 本轮任务的生效配置：native 且有会话级模型覆盖时克隆一份并换掉 `model.model`（覆盖不写回
@@ -548,7 +576,7 @@ impl Session {
     /// 事实数读不出来时只打一行警告并退回 0（banner 显示 `Memory: 0 facts`）：状态行不该因为
     /// 记忆库读失败而拦住整个 REPL。
     pub fn banner_counts(&self) -> (usize, usize) {
-        let skills = self.skills.metas().len();
+        let skills = self.skills().metas().len();
         let memory = match self.memory.list(false) {
             Ok(facts) => facts.len(),
             Err(error) => {
@@ -616,6 +644,8 @@ impl Session {
         let config = self.effective_config();
         let runtime =
             mk_runtime(&self.kernel, &config, &self.workspace).map_err(anyhow::Error::msg)?;
+        // 技能目录每轮只取一次快照：这一轮运行期间 `/skills reload` 换掉的是下一轮的目录
+        let skills = self.skills();
         let runner = TaskRunner::new(
             Arc::clone(&self.db),
             Arc::clone(&config),
@@ -624,7 +654,7 @@ impl Session {
             Arc::clone(&self.approvals),
             self.log_dir.clone(),
             Arc::clone(&self.memory),
-            Arc::clone(&self.skills),
+            Arc::clone(&skills),
             Arc::clone(&self.notifier),
             // CLI 交互运行没有 job profile：执行器不包白名单（调度运行由守护进程注入）
             None,
@@ -835,7 +865,7 @@ pub(crate) mod fixtures {
             approvals: Arc::new(PolicyOnlyApproval),
             log_dir: home.join("logs"),
             memory: MemoryStore::new(db, home.join("memory")),
-            skills: SkillCatalog::load(&home.join("skills")),
+            skills: Mutex::new(SkillCatalog::load(&home.join("skills"))),
             notifier: Arc::new(MultiNotifier::new(Vec::new())),
             kernel: kernel.to_string(),
             already_prompted: AtomicBool::new(false),
