@@ -69,6 +69,9 @@ pub struct PtyOptions<'a> {
     pub args: &'a [&'a str],
     /// 覆盖默认环境里的同名变量（例如 `TERM=dumb` 走 v0.1 回退路径）。
     pub env: &'a [(&'a str, &'a str)],
+    /// 从端的窗口尺寸覆盖（`TIOCSWINSZ`）：`Some((cols, rows))` 时用它（过小终端的降级用例要它），
+    /// `None` 保持现有的 200×50。
+    pub window: Option<(u16, u16)>,
 }
 
 /// 一个跑在 pty 上的子进程 + 它的主端流。
@@ -90,6 +93,11 @@ impl Pty {
     pub fn spawn(options: &PtyOptions<'_>) -> Pty {
         let (master, slave) = openpty();
         set_window_size(&master, WINDOW_COLUMNS, WINDOW_ROWS);
+        // 用例要的尺寸（过小终端的降级）：在子进程起来之前按从端设好；`None` 时上面那份 200×50
+        // 一个字节都不动
+        if let Some((columns, rows)) = options.window {
+            set_window_size(&slave, columns, rows);
+        }
 
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ignis"));
         cmd.args(options.args)

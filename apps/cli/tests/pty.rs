@@ -96,6 +96,8 @@ fn spawn_repl_in_with_env(
         args,
         // 默认环境（模型地址、密钥、NO_COLOR、TERM）由夹具注入
         env,
+        // 窗口尺寸走夹具的默认 200×50（本套没有需要改尺寸的用例）
+        window: None,
     })
 }
 
