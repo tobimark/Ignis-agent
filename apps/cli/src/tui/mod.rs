@@ -12,6 +12,7 @@
 
 pub mod capture;
 pub mod term;
+pub mod view;
 
 /// 终端尺寸（列 × 行）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
