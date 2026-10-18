@@ -25,8 +25,13 @@
 //! `continuation`），`\t` 按 8 列制表位补成空格。两者只改**画出来的字节**：提交的文本、历史、
 //! 送进内核的 prompt 一个字节都不动，`width == usize::MAX`（非 tty）时连折行都不做。
 //!
+//! [`cursor_row`] 把同一套走行逻辑单独露出来（与 [`frame_with`] 共用 [`walk`]，算法只有一份）：
+//! 读取层每画完一帧就记下光标落在块里的第几个物理行，下一帧落笔前先写 `\r` + `\x1b[{n}A` 回到
+//! 块首，帧自己的 `\r\x1b[J` 才能从块首清掉**整个**折行块（重锚，见 `editor::reader`）。
+//!
 //! 已知限制：组合字符簇（emoji ZWJ 等）与 emoji 按字符近似（与 `render::width` 同口径）；
-//! 折叠只看显示宽度，不认识「一个字符簇」——近似口径与滚动区一致。
+//! 折叠只看显示宽度，不认识「一个字符簇」——近似口径与滚动区一致；可用列的下限是 1，比它更宽
+//! 的单个宽字符（只有 `available == 1` 这一种）整字放行，这一行的内容因此会多占一列。
 
 use crate::render::width::{advance_column, char_width, display_width};
 
@@ -49,8 +54,9 @@ pub fn frame(prefix: &str, continuation: &str, text: &str, cursor: usize) -> Str
 /// - 每个物理行的可用列 = `width - 该行标记的显示宽度`，下限 1（保证每行至少消费一个字符，
 ///   宽字符放不下时整字放行、不死循环）；
 /// - 折行路径里展开 `\t`：制表位从**该行内容的列 0** 起算（标记是行外的装饰，不进制表网格；
-///   与 TUI 滚动区同一口径），补出来的空格只进这一帧。放不下就先折行、仍放不下就整段放行
-///   （与宽字符同一条规则：宁可这一行多占几列，也不切开、也不空转）；
+///   与 TUI 滚动区同一口径），补出来的空格只进这一帧。放不下就先折行；折到新行的列 0 仍放不下
+///   （一格要 8 列、可用列更窄）就把这一格 clamp 到该行的可用列——制表位只是显示层的近似，
+///   宁可短一格，也不画出一条超宽的行（列 0 上再折只会空转）；宽字符与它不同：整字放行；
 /// - `width == usize::MAX` 时不折行、不展开 `\t`，输出与 [`frame`] 逐字节相等；
 /// - 光标行/列按折行后的物理行算，帧尾的 `\x1b[{n}A` / `\x1b[{m}C` 口径不变。
 pub fn frame_with(
@@ -60,6 +66,61 @@ pub fn frame_with(
     cursor: usize,
     width: usize,
 ) -> String {
+    let wrapped = walk(prefix, continuation, text, cursor, width);
+
+    let mut out = String::from(CLEAR);
+    for row in &wrapped.rows {
+        out.push_str(row);
+        out.push_str("\r\n");
+    }
+
+    // 每行写完都带 `\r\n`，此刻光标在最后一个物理行之后：上移回光标所在的那一行。
+    // `cursor_row` 必然 < 行数（`saturating_sub` 只是兜住不可能发生的反向差）。
+    let up = wrapped.rows.len().saturating_sub(wrapped.cursor_row);
+    if up > 0 {
+        out.push_str(&format!("\x1b[{up}A"));
+    }
+    out.push('\r');
+    // 光标行内已显示多少列（含该行标记的宽度）：列数为 0 时不写右移序列
+    if wrapped.cursor_columns > 0 {
+        out.push_str(&format!("\x1b[{}C", wrapped.cursor_columns));
+    }
+    out
+}
+
+/// 光标在折行块里落在第几个物理行（**行序数从 0 起算**）。
+///
+/// 与 [`frame_with`] 共用同一套走行逻辑（[`walk`]，算法只有一份）：读取层每画完一帧就用它记下
+/// 光标在块里的位置，下一帧落笔前先写 `\r` + `\x1b[{n}A` 回到**块首**，帧自己的 `\r\x1b[J`
+/// 因此从块首清掉整个折行块——少了这一步，它只清光标所在行以下，块的上半截会被帧在自己的下面
+/// 再画一遍（40 列下逐键输入 100 个字符就是这样叠出好几份输入行的）。
+///
+/// 行序数与帧尾 `\x1b[{n}A` 的「上移次数」同一口径：`width == usize::MAX`（不折行）时交回的是
+/// **逻辑行**的序数——那种口径下物理行由终端的软换行决定，帧自己也只按逻辑行数上移。
+pub fn cursor_row(
+    prefix: &str,
+    continuation: &str,
+    text: &str,
+    cursor: usize,
+    width: usize,
+) -> usize {
+    walk(prefix, continuation, text, cursor, width).cursor_row
+}
+
+/// 折行走行的产物：物理行与光标落点。
+struct Wrapped {
+    /// 已经定稿的物理行（标记 + 正文），[`frame_with`] 逐行拼进帧。
+    rows: Vec<String>,
+    /// 光标所在的物理行序数（0 起算）。
+    cursor_row: usize,
+    /// 光标在这一行里已显示的列数（含标记宽度）。
+    cursor_columns: usize,
+}
+
+/// 把文本折成物理行并算出光标落点：[`frame_with`] 与 [`cursor_row`] 唯一的走行实现。
+///
+/// 规则见 [`frame_with`] 的文档；`width == usize::MAX` 时不折行、不展开 `\t`。
+fn walk(prefix: &str, continuation: &str, text: &str, cursor: usize, width: usize) -> Wrapped {
     let chars: Vec<char> = text.chars().collect();
     let cursor = cursor.min(chars.len());
     // 只有真终端宽度才折行、才展开 `\t`（`usize::MAX` 是「交给终端软换行」的既有口径）
@@ -90,7 +151,8 @@ pub fn frame_with(
         }
 
         // 这个字符占几列：`\t` 补到本行内容的下一个制表位（不折行时不展开，按既有口径 0 列算）
-        let mut columns = if wrapping && *c == '\t' {
+        let tab = wrapping && *c == '\t';
+        let mut columns = if tab {
             advance_column(used, '\t') - used
         } else {
             char_width(*c)
@@ -101,12 +163,18 @@ pub fn frame_with(
             rows.push(std::mem::take(&mut row));
             (marker_width, available) = open_row(&mut row, false, prefix, continuation, width);
             used = 0;
-            if *c == '\t' {
+            if tab {
                 // 换了行，制表位要从新行的列 0 重新算
                 columns = advance_column(0, '\t');
             }
         }
-        if wrapping && *c == '\t' {
+        // `\t` 在新行的列 0 仍放不下（整段要 8 列、可用列更窄）就把这一格 clamp 到可用列：
+        // 制表位只是显示层的近似，宁可短一格，也不画出超宽的行；列 0 上再折只会空转，所以是
+        // clamp。宽字符不走这条路（它整字放行，见模块顶部的「已知限制」）。
+        if tab {
+            columns = columns.min(available);
+        }
+        if tab {
             // `\t` 在屏幕上就是补到制表位的那些空格（显示层的展开，帧外一切照旧）
             row.extend(std::iter::repeat_n(' ', columns));
         } else {
@@ -118,24 +186,11 @@ pub fn frame_with(
     let (cursor_row, cursor_columns) = cursor_at.unwrap_or((rows.len(), marker_width + used));
     rows.push(std::mem::take(&mut row));
 
-    let mut out = String::from(CLEAR);
-    for row in &rows {
-        out.push_str(row);
-        out.push_str("\r\n");
+    Wrapped {
+        rows,
+        cursor_row,
+        cursor_columns,
     }
-
-    // 每行写完都带 `\r\n`，此刻光标在最后一个物理行之后：上移回光标所在的那一行。
-    // `cursor_row` 必然 < 行数（`saturating_sub` 只是兜住不可能发生的反向差）。
-    let up = rows.len().saturating_sub(cursor_row);
-    if up > 0 {
-        out.push_str(&format!("\x1b[{up}A"));
-    }
-    out.push('\r');
-    // 光标行内已显示多少列（含该行标记的宽度）：列数为 0 时不写右移序列
-    if cursor_columns > 0 {
-        out.push_str(&format!("\x1b[{cursor_columns}C"));
-    }
-    out
 }
 
 /// 开一个物理行：把标记写进 `row`，交回 `(标记宽度, 这一行的可用正文列)`。
@@ -162,7 +217,23 @@ fn open_row(
 
 #[cfg(test)]
 mod tests {
-    use super::{CONTINUATION, frame, frame_with};
+    use super::{CONTINUATION, cursor_row, display_width, frame, frame_with};
+
+    /// 从一帧里取出物理行（`\r\n` 分隔的段）：最后一截是帧尾的光标归位序列，不算行。
+    fn rows_of(frame: &str) -> Vec<&str> {
+        let mut rows: Vec<&str> = frame.split("\r\n").collect();
+        rows.pop();
+        // 第一行带着帧首的清屏序列 `\r\x1b[J`
+        rows[0] = rows[0].trim_start_matches("\r\u{1b}[J");
+        rows
+    }
+
+    /// 一个物理行的**内容**（去掉该行自己的标记）。
+    fn content_of(row: &str) -> &str {
+        row.strip_prefix("❯ ")
+            .or_else(|| row.strip_prefix("… "))
+            .unwrap_or_else(|| panic!("每行都以自己的标记开头：{row:?}"))
+    }
 
     /// 折行与不折行是同一个帧协议：`width == usize::MAX`（非 tty）那一份必须与 `frame` 逐字节相等。
     #[test]
@@ -256,6 +327,71 @@ mod tests {
         assert_eq!(rows[0], "\r\u{1b}[J❯ 你");
         assert_eq!(rows[1], "… 好");
         assert_eq!(rows[2], "\u{1b}[1A\r\u{1b}[4C", "{wide:?}");
+    }
+
+    /// 窄终端里的 `\t` 不再画出一条超宽的行：这一格（从列 0 起就是 8 列）放不下时先折行，
+    /// 折到新行的列 0 仍放不下就 clamp 到该行的可用列——列 0 上再折只会空转，宁可短一格。
+    #[test]
+    fn tabs_never_emit_a_row_wider_than_the_available_columns() {
+        // 5 列、标记 2 列 → 可用 3 列：`a` 之后的 `\t` 从列 1 要补 7 格，先折行；新行列 0 仍要
+        // 8 格，clamp 到 3 格（`… ` 之后 3 个空格，整行正好 5 列），`b` 再折到第三行
+        let clamped = format!("… {}", " ".repeat(3));
+        assert_eq!(
+            frame_with("❯ ", CONTINUATION, "a\tb", 3, 5),
+            format!("\r\u{1b}[J❯ a\r\n{clamped}\r\n… b\r\n\u{1b}[1A\r\u{1b}[3C")
+        );
+        // 行首的 `\t` 不折（列 0 上折不动）：整格 clamp 到可用列 2
+        let padded = format!("❯ {}", " ".repeat(2));
+        assert_eq!(
+            frame_with("❯ ", CONTINUATION, "\t", 1, 4),
+            format!("\r\u{1b}[J{padded}\r\n\u{1b}[1A\r\u{1b}[4C")
+        );
+
+        // 性质：窄宽度 × 带 `\t` 的语料，每个物理行的内容都不超过这一行的可用列。唯一的例外是
+        // 模块顶部记着的那条已知限制——可用列只有 1 列时，单个宽字符整字放行（多占一列）。
+        for width in 1..=9 {
+            for text in [
+                "a\tb", "\t", "a\t\tb", "你\tb", "ab\tc", "\t\t", "a\tbcdef", "你",
+            ] {
+                let frame = frame_with("❯ ", CONTINUATION, text, text.chars().count(), width);
+                // `❯ ` 与 `… ` 都是 2 列标记：可用列 = 宽度 − 2，下限 1
+                let available = width.saturating_sub(2).max(1);
+                for row in rows_of(&frame) {
+                    let content = content_of(row);
+                    let wide_char_limit = available == 1 && content.chars().count() == 1;
+                    assert!(
+                        display_width(content) <= available || wide_char_limit,
+                        "{text:?} @ width={width}：行 {row:?} 的内容占 {} 列，超出可用列 {available}",
+                        display_width(content)
+                    );
+                }
+            }
+        }
+    }
+
+    /// 光标行：与 [`frame_with`] 同一套走行（帧尾的上移次数也按它算），读取层拿它做重锚记账。
+    #[test]
+    fn cursor_row_follows_the_wrapped_layout() {
+        // 5 列、标记 2 列 → 每行 3 列可用：`abcdef` 折成两行，光标在末尾 → 第 1 行（0 起算）
+        assert_eq!(cursor_row("❯ ", CONTINUATION, "abcdef", 6, 5), 1);
+        assert_eq!(
+            cursor_row("❯ ", CONTINUATION, "abcdef", 3, 5),
+            0,
+            "光标在第一行里"
+        );
+        assert_eq!(cursor_row("❯ ", CONTINUATION, "abcdef", 0, 5), 0);
+        // 逻辑行的续行同样是物理行：`\n` 之后的行序数接着往下数
+        assert_eq!(cursor_row("❯ ", CONTINUATION, "abcd\nef", 7, 5), 2);
+        // 不折行（非 tty）时交回的是逻辑行序数，与帧尾 `\x1b[{n}A` 的上移次数同一口径
+        assert_eq!(cursor_row("❯ ", CONTINUATION, "a\nb", 3, usize::MAX), 1);
+        // 与帧对得上：帧里上移「行数 − 光标行」次（每一行都以 `\r\n` 收尾）
+        for (text, cursor, width) in [("abcdef", 6, 5), ("abcdef", 3, 5), ("a\nbc", 4, 5)] {
+            let frame = frame_with("❯ ", CONTINUATION, text, cursor, width);
+            let rows = rows_of(&frame).len();
+            let up = rows - cursor_row("❯ ", CONTINUATION, text, cursor, width);
+            assert!(up > 0, "这一组用例的光标都不在最后一行：{frame:?}");
+            assert!(frame.contains(&format!("\u{1b}[{up}A")), "{frame:?}");
+        }
     }
 
     /// 续行提示：与首行提示符一起由读取层传进来。

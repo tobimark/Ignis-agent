@@ -23,6 +23,11 @@
 //! - **宽度每次读取探一次**：进读取区间时用 [`width_for_stdout`] 探一次 stdout 的列数交给
 //!   [`draw::frame_with`]（非 tty → `usize::MAX` → 交给终端软换行，与今日逐字相同）。折行与
 //!   `\t` 展开都只改**画出来的字节**：提交的文本、历史与送进内核的 prompt 一个字节都不动。
+//! - **折行块重锚**：`draw` 记着上一帧画完后光标落在块里的第几个物理行（[`draw::cursor_row`]），
+//!   下一帧落笔前先写 `\r` + `\x1b[{n}A` 把光标提回**块首**，帧自己的 `\r\x1b[J` 因此从块首
+//!   清掉整个折行块——少了这一步它只清光标所在行以下，块的上半截会被帧在自己的下面再画一遍
+//!   （40 列下逐键输入 100 个字符会叠出好几份输入行）。提交、Tab 候选列表与非法 UTF-8 告警
+//!   这三条「块没了 / 块从头来过」的路径把记账归零（见 [`EditorReader::clear_block`]）。
 
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Read, Write};
@@ -65,6 +70,11 @@ pub struct EditorReader<R: Read, W: Write> {
     /// 本次读取的终端列数：进读取区间时由 [`width_for_stdout`] 探一次（非 tty → `usize::MAX`，
     /// 也就是「交给终端软换行」的既有口径），`draw` / `finish_submit` 都拿它去折行。
     width: usize,
+    /// 上一帧画完后光标落在折行块里的第几个物理行（0 起算，见 [`draw::cursor_row`]）：
+    /// 下一帧落笔前据此把光标提回块首，让帧自己的 `\r\x1b[J` 清掉整个块（重锚，见 [`draw_sequence`]）。
+    /// 块从当前行重新开始时归零：每次读取开始时、`finish_submit` 写完 `\r\n` 之后，
+    /// 以及 [`EditorReader::clear_block`] 清掉整块之后。
+    prev_cursor_row: usize,
 }
 
 impl<R: Read, W: Write> EditorReader<R, W> {
@@ -79,6 +89,8 @@ impl<R: Read, W: Write> EditorReader<R, W> {
             pending: VecDeque::new(),
             // 读取前先按「不折行」当底：真有终端时 `read_line` 会重探
             width: usize::MAX,
+            // 还没有画过任何一帧：光标与「块首」同位置
+            prev_cursor_row: 0,
         }
     }
 
@@ -93,6 +105,9 @@ impl<R: Read, W: Write> EditorReader<R, W> {
         // 终端宽度每次读取探一次（与渲染器同一口径）：非 tty → `usize::MAX`，帧与今日逐字相同。
         // 探在画第一帧之前：整条读取区间里的每一帧都用同一份宽度（中途改窗口不重排已经画出的行）。
         self.width = width_for_stdout(io::stdout().is_terminal());
+        // 新的一块从光标当前所在的那一行开始：上一次读取留下的块已经在它下面结束（不会再有东西
+        // 需要从块首清），重锚记账从零起。
+        self.prev_cursor_row = 0;
         self.draw(prompt)?;
         loop {
             // 这一批要处理的按键：上一次读取跨过提交边界留下的先来（提示符已经画好），
@@ -188,31 +203,56 @@ impl<R: Read, W: Write> EditorReader<R, W> {
     /// 按当前状态画一帧（提示符 + 缓冲 + 光标归位）并立刻冲出去。
     ///
     /// 帧按本次读取探得的宽度折行（`\t` 也在这条路上展开成空格）：缓冲区里那份文本原样不动。
+    /// 落笔前先按上一帧记下的光标行回到块首（见 [`draw_sequence`]），再记下这一帧的新位置。
     fn draw(&mut self, prompt: &str) -> io::Result<()> {
         let text = self.state.text();
         let cursor = self.state.cursor();
-        let frame = draw::frame_with(prompt, CONTINUATION, &text, cursor, self.width);
-        self.write_bytes(frame.as_bytes())
+        let (bytes, row) = draw_sequence(self.prev_cursor_row, prompt, &text, cursor, self.width);
+        self.prev_cursor_row = row;
+        self.write_bytes(bytes.as_bytes())
     }
 
     /// 提交：先把「光标在末尾」的一帧留在屏幕上（文本从事件里拿：状态机手里那份已经被清空），
     /// 再写 `\r\n` 把光标送到下一行——输入行原样留在屏幕上，与 readline 的观感一致。
+    ///
+    /// 这一帧同样先重锚：否则光标落在折行块的下半截时，帧自己的 `\r\x1b[J` 只从那里往下清，
+    /// 块的上半截会被再画一遍。`\r\n` 之后块结束在光标上一行，记账归零。
     fn finish_submit(&mut self, prompt: &str, text: &str) -> io::Result<()> {
-        let frame = draw::frame_with(prompt, CONTINUATION, text, text.chars().count(), self.width);
-        self.write_bytes(frame.as_bytes())?;
-        self.write_bytes(b"\r\n")
+        let (bytes, _) = draw_sequence(
+            self.prev_cursor_row,
+            prompt,
+            text,
+            text.chars().count(),
+            self.width,
+        );
+        self.write_bytes(bytes.as_bytes())?;
+        self.write_bytes(b"\r\n")?;
+        self.prev_cursor_row = 0;
+        Ok(())
+    }
+
+    /// 清掉当前的输入块：`prev_cursor_row > 0`（块不止一行、光标不在块首）时先写 `\r` +
+    /// `\x1b[{n}A` 回到块首，再 `\r\x1b[J`——只从光标那一行往下清会留下一截旧块在上头。
+    /// 清完块就没了，记账归零（调用方要重绘输入行时，它是从当前这一行重新开始的）。
+    fn clear_block(&mut self) -> io::Result<()> {
+        if self.prev_cursor_row > 0 {
+            self.output
+                .write_all(format!("\r\x1b[{}A", self.prev_cursor_row).as_bytes())?;
+        }
+        self.prev_cursor_row = 0;
+        self.output.write_all(CLEAR_LINE)
     }
 
     /// 非法 UTF-8 的告警：清掉输入行 → 一行告警（调用方随后照常重绘输入行）。
     fn warn_invalid(&mut self) -> io::Result<()> {
-        self.output.write_all(CLEAR_LINE)?;
+        self.clear_block()?;
         self.output.write_all(INVALID_WARNING.as_bytes())?;
         self.write_bytes(b"\r\n")
     }
 
     /// 候选列表：清掉输入行 → 逐行列出 → 把输入行画回来（缓冲与光标都原样）。
     fn write_listing(&mut self, prompt: &str, lines: &[String]) -> io::Result<()> {
-        self.output.write_all(CLEAR_LINE)?;
+        self.clear_block()?;
         for line in lines {
             self.output.write_all(line.as_bytes())?;
             self.output.write_all(b"\r\n")?;
@@ -225,6 +265,31 @@ impl<R: Read, W: Write> EditorReader<R, W> {
         self.output.write_all(bytes)?;
         self.output.flush()
     }
+}
+
+/// 重绘一帧的完整字节（重锚 + 帧），以及这一帧画完后光标落在折行块里的物理行。
+///
+/// `prev_cursor_row > 0`（上一帧的光标不在块首）时，先写 `\r` + `\x1b[{prev_cursor_row}A` 把光标
+/// 从块内提回**块首**；跟在后面的帧自己以 `\r\x1b[J` 开头，于是从块首清掉**整个**折行块。少了
+/// 这一提，`\r\x1b[J` 只清光标所在行以下，块的上半截会被帧在自己的下面再画一遍——40 列里逐键
+/// 输入 100 个字符，屏幕上就会堆出好几份输入行（光标被留在块内低处，一帧比一帧低）。
+///
+/// 帧本身的字节一个字都不动（[`draw::frame_with`]）：多出来的这几个字节在帧**之前**。
+/// `prev_cursor_row == 0`（光标本来就在块首/块只有一行）时不写移动序列——`\x1b[0A` 没有意义。
+fn draw_sequence(
+    prev_cursor_row: usize,
+    prompt: &str,
+    text: &str,
+    cursor: usize,
+    width: usize,
+) -> (String, usize) {
+    let frame = draw::frame_with(prompt, CONTINUATION, text, cursor, width);
+    // 这一帧自己会画在哪一行：与帧同一套折行（`walk`），读取层据此记账
+    let row = draw::cursor_row(prompt, CONTINUATION, text, cursor, width);
+    if prev_cursor_row == 0 {
+        return (frame, row);
+    }
+    (format!("\r\x1b[{prev_cursor_row}A{frame}"), row)
 }
 
 /// 一次按键处理完之后，这次读取的去路。
@@ -292,8 +357,11 @@ mod tests {
     use std::rc::Rc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{EditorReader, INVALID_WARNING};
+    use super::{EditorReader, INVALID_WARNING, draw_sequence};
     use crate::editor::draw::{self, CONTINUATION};
+    use crate::editor::keys::Key;
+    use crate::editor::state::Event;
+    use crate::render::width::char_width;
 
     /// 提示符：与 `repl::PROMPT` 同一条字面量（REPL 传进来的就是它）。
     const PROMPT: &str = "❯ ";
@@ -333,6 +401,12 @@ mod tests {
         /// 录到的字节按 UTF-8 交回（帧与告警都是读取层自己写的，必然合法）。
         fn text(&self) -> String {
             String::from_utf8(self.0.borrow().clone()).expect("读取层写出的必须是合法 UTF-8")
+        }
+
+        /// 取走自上次取走之后写出的字节：逐帧画屏幕的用例按帧喂给屏幕仿真器。
+        fn take(&self) -> String {
+            let mut written = self.0.borrow_mut();
+            String::from_utf8(std::mem::take(&mut *written)).expect("读取层写出的必须是合法 UTF-8")
         }
     }
 
@@ -574,6 +648,264 @@ mod tests {
             reader.read_line(PROMPT).unwrap(),
             Some("第一次".to_string()),
             "↑ 召回上一次提交，回车把它再交回一次"
+        );
+    }
+
+    /// P6 T2 修复：折行块里的连续两帧之间，读取层先把光标提回块首（`\r` + `\x1b[{n}A`），
+    /// 帧自己的字节一字不改；上一帧的光标本来就在块首（`n == 0`）时不写移动序列。
+    #[test]
+    fn redraw_reanchors_at_the_block_top_with_the_previous_cursor_row() {
+        let dir = TempDir::new("reanchor");
+        let (mut reader, out) = editor(b"", &dir.history_path());
+        // 单测进程的 stdout 不是 tty：`read_line` 会探出 `usize::MAX`（不折行）。这条用例要的是
+        // 真终端口径的 5 列（`❯ ` 2 列 → 每行 3 列可用），所以把宽度钉死再走绘制的两条路。
+        reader.width = 5;
+        reader.state.replace("abcdef");
+
+        // 绘制助手本身的口径：光标在块首（0）时交回的就是帧自己，一个字都不多写
+        let (plain, row) = draw_sequence(0, PROMPT, "abcdef", 6, 5);
+        assert_eq!(
+            plain,
+            draw::frame_with(PROMPT, CONTINUATION, "abcdef", 6, 5)
+        );
+        assert_eq!(row, 1, "`abcdef` 在 5 列里折成两行，末尾的光标在第 1 行");
+
+        reader.draw(PROMPT).unwrap();
+        let first = out.take();
+        assert_eq!(
+            first,
+            draw::frame_with(PROMPT, CONTINUATION, "abcdef", 6, 5),
+            "第一帧：上一帧的光标在块首"
+        );
+        assert!(
+            !first.contains("\u{1b}[0A"),
+            "`n == 0` 不写移动序列：{first:?}"
+        );
+
+        // 上一帧把光标留在了块的第 1 行：这一帧前面就多一条回块首的移动（帧本身逐字节不变）
+        reader.draw(PROMPT).unwrap();
+        assert_eq!(
+            out.take(),
+            format!(
+                "\r\u{1b}[1A{}",
+                draw::frame_with(PROMPT, CONTINUATION, "abcdef", 6, 5)
+            )
+        );
+
+        // 换成三行的文本：数跟着**上一帧**留下的行（还是 1）走，之后才是这一帧自己的行（2）
+        reader.state.replace("abcdefghi");
+        reader.draw(PROMPT).unwrap();
+        assert!(
+            out.take().starts_with("\r\u{1b}[1A"),
+            "重锚按上一帧的光标行走，不是这一帧的"
+        );
+        reader.draw(PROMPT).unwrap();
+        assert_eq!(
+            out.take(),
+            format!(
+                "\r\u{1b}[2A{}",
+                draw::frame_with(PROMPT, CONTINUATION, "abcdefghi", 9, 5)
+            ),
+            "三行块的光标在最后一行：这一帧的回提是 2"
+        );
+    }
+
+    /// 测试用的极简 ANSI 屏幕：只认读取层会写的那几条序列，够用来数「屏幕上到底留了几份输入行」。
+    ///
+    /// 认 `\r`、`\n`（带滚动）、`\x1b[J`（清到屏幕底）、`\x1b[K`（清到行尾）、`\x1b[{n}A`（上移）、
+    /// `\x1b[{n}C`（右移）、宽字符（占两格）与**待折行**语义（写满最后一列后光标停在该列，下一个
+    /// 字符才折行——终端不会把「正好写满」当成换行）。其余序列一律 panic：读取层不该写。
+    struct Screen {
+        /// 终端列数 / 行数。
+        cols: usize,
+        rows: usize,
+        /// 屏幕格子：`cells[行][列]`，宽字符的第二格是 [`WIDE_TAIL`]。
+        cells: Vec<Vec<char>>,
+        /// 光标的位置与「待折行」标记。
+        row: usize,
+        col: usize,
+        wrap_pending: bool,
+    }
+
+    /// 宽字符占的第二格：渲染可见文本时写成空格（保持列对齐）。
+    const WIDE_TAIL: char = '\u{0}';
+
+    impl Screen {
+        fn new(cols: usize, rows: usize) -> Self {
+            assert!(cols >= 2, "屏幕仿真器至少要有 2 列（宽字符占两格）");
+            Self {
+                cols,
+                rows,
+                cells: vec![vec![' '; cols]; rows],
+                row: 0,
+                col: 0,
+                wrap_pending: false,
+            }
+        }
+
+        /// 喂一段读取层写出的字节。
+        fn feed(&mut self, bytes: &str) {
+            let mut chars = bytes.chars().peekable();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\r' => {
+                        self.col = 0;
+                        self.wrap_pending = false;
+                    }
+                    // LF：只往下走一行（读取层的换行都是 `\r\n`，列由 `\r` 归零）
+                    '\n' => self.down_one_row(),
+                    '\u{1b}' => {
+                        assert_eq!(chars.next(), Some('['), "读取层只写 CSI 序列：{bytes:?}");
+                        let mut params = String::new();
+                        while let Some(&next) = chars.peek() {
+                            if ('@'..='~').contains(&next) {
+                                break;
+                            }
+                            params.push(chars.next().expect("peek 过"));
+                        }
+                        let final_byte = chars.next().expect("CSI 有终结字节");
+                        self.csi(&params, final_byte, bytes);
+                    }
+                    c => self.put(c),
+                }
+            }
+        }
+
+        /// 一条 CSI：`J` 清到屏幕底、`K` 清到行尾、`A` 上移、`C` 右移（参数缺省 1 次）。
+        fn csi(&mut self, params: &str, final_byte: char, bytes: &str) {
+            let count = if params.is_empty() {
+                1
+            } else {
+                params.parse().unwrap_or(1)
+            };
+            match final_byte {
+                'J' => {
+                    self.clear_to_end_of_line();
+                    for row in self.row + 1..self.rows {
+                        self.cells[row].fill(' ');
+                    }
+                }
+                'K' => self.clear_to_end_of_line(),
+                'A' => {
+                    self.row = self.row.saturating_sub(count);
+                    self.wrap_pending = false;
+                }
+                'C' => {
+                    self.col = (self.col + count).min(self.cols - 1);
+                    self.wrap_pending = false;
+                }
+                other => panic!("屏幕仿真器不认识的序列 \\x1b[{params}{other}：{bytes:?}"),
+            }
+        }
+
+        /// 写一个可见字符：待折行先落地，放不下的宽字符整字挪到下一行（终端不切开它）。
+        fn put(&mut self, c: char) {
+            let width = char_width(c);
+            if self.wrap_pending || self.col + width > self.cols {
+                self.col = 0;
+                self.down_one_row();
+            }
+            for offset in 0..width {
+                self.cells[self.row][self.col + offset] = if offset == 0 { c } else { WIDE_TAIL };
+            }
+            self.col += width;
+            if self.col >= self.cols {
+                // 正好写满最后一列：光标停在该列，下一个字符才折行
+                self.col = self.cols - 1;
+                self.wrap_pending = true;
+            }
+        }
+
+        /// 光标下移一行；已经在最后一行就滚动（整屏上移一行，底部补一空行）。
+        fn down_one_row(&mut self) {
+            self.wrap_pending = false;
+            if self.row + 1 >= self.rows {
+                self.cells.remove(0);
+                self.cells.push(vec![' '; self.cols]);
+            } else {
+                self.row += 1;
+            }
+        }
+
+        /// 从光标清到行尾。
+        fn clear_to_end_of_line(&mut self) {
+            self.cells[self.row][self.col..].fill(' ');
+            self.wrap_pending = false;
+        }
+
+        /// 屏幕上的可见文本：每行去掉右侧空白，宽字符的第二格渲染成空格（保持列对齐）。
+        fn visible(&self) -> Vec<String> {
+            self.cells
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|&c| if c == WIDE_TAIL { ' ' } else { c })
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect()
+        }
+    }
+
+    /// 屏幕上剩下的输入字符个数：一份 100 个字符的输入行 = 100，堆了 N 份就会数出更多。
+    fn input_chars_on_screen(screen: &[String]) -> usize {
+        screen.iter().map(|row| row.matches('x').count()).sum()
+    }
+
+    /// P6 T2 修复的回归：超宽输入行在**逐键重绘**下不再一份一份往下堆。
+    ///
+    /// 走读取层真实的绘制步骤（提示符一帧 → 每敲一个字符画一帧 → 提交一帧），只是绕开 `read_line`
+    /// 的 tty 探测与按批合并：单测的 stdout 不是 tty，`read_line` 会探出 `usize::MAX`（不折行），
+    /// 而这条回归要的是真终端的 40 列；交互式输入本来也是一次读一个按键、一个按键一次重绘。
+    /// 屏幕仿真器照终端语义重放这些字节，于是能直接问「屏幕上到底有几份输入行」。
+    #[test]
+    fn wrapped_input_line_is_redrawn_in_place_keystroke_by_keystroke() {
+        let dir = TempDir::new("stack");
+        let (mut reader, out) = editor(b"", &dir.history_path());
+        reader.width = 40;
+        let mut screen = Screen::new(40, 12);
+
+        reader.draw(PROMPT).unwrap();
+        screen.feed(&out.take());
+
+        let line = "x".repeat(100);
+        for c in line.chars() {
+            assert_eq!(reader.state.handle(Key::Char(c)), Event::Redraw);
+            reader.draw(PROMPT).unwrap();
+            screen.feed(&out.take());
+        }
+
+        // 40 列、标记 2 列 → 每行 38 个字符：100 个字符正好折成 38 + 38 + 24 三行，一份都不多。
+        // 修复前每一帧只从光标那一行往下清，块被自己再画一遍、光标又被留在更低处，屏幕上会叠出
+        // 好几份（越高越往下沉，直到滚出屏幕）。
+        let typed = screen.visible();
+        assert_eq!(typed[0], format!("❯ {}", "x".repeat(38)));
+        assert_eq!(typed[1], format!("… {}", "x".repeat(38)));
+        assert_eq!(typed[2], format!("… {}", "x".repeat(24)));
+        assert!(
+            typed[3..].iter().all(String::is_empty),
+            "块下面不该还有内容：{typed:#?}"
+        );
+        assert_eq!(
+            input_chars_on_screen(&typed),
+            100,
+            "100 个字符在屏幕上只该是一份：{typed:#?}"
+        );
+
+        // 提交帧同样先重锚：定稿的输入行留在屏幕上，还是一份（光标落到块的下一行）
+        reader.finish_submit(PROMPT, &line).unwrap();
+        screen.feed(&out.take());
+        let submitted = screen.visible();
+        assert_eq!(submitted[..3], typed[..3], "定稿的输入行留在屏幕上");
+        assert!(
+            submitted[3..].iter().all(String::is_empty),
+            "提交不该再多出一份：{submitted:#?}"
+        );
+        assert_eq!(
+            input_chars_on_screen(&submitted),
+            100,
+            "提交之后仍然只有一份：{submitted:#?}"
         );
     }
 }
