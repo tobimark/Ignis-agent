@@ -196,14 +196,14 @@ v0.2 的目标是「Ubuntu 默认终端、`tmux`、SSH、80 列、无色、浅�
 
 | 终端 | 检查项 | 结论 | 记录 |
 |---|---|---|---|
-| Ubuntu 终端（默认） | 启动 banner、提交一次任务、编辑器重绘/历史/Ctrl+C、`/help` 在 80 列不折行错乱、TUI 可用或降级、退出后 `stty` 复原 | 待 Task 6 记录 | `docs/acceptance.md` 的终端矩阵（Task 6 填真机结果）；本机自动化覆盖见下 |
-| tmux | 启动 banner、提交一次任务、编辑器重绘/历史/Ctrl+C、`/help` 在 80 列不折行错乱、TUI 可用或降级、退出后 `stty` 复原 | 待 Task 6 记录 | 同上；`apps/cli/tests/pty.rs` 的 pty 用例是接近 tmux 的自动化面 |
-| SSH | 启动 banner、提交一次任务、编辑器重绘/历史/Ctrl+C、`/help` 在 80 列不折行错乱、TUI 可用或降级、退出后 `stty` 复原 | 待 Task 6 记录 | 同上；本机没有可用的目标终端时该项记 SKIP + 原因（**不记 PASS**） |
-| 80 列 | 启动 banner、提交一次任务、编辑器重绘/历史/Ctrl+C、`/help` 在 80 列不折行错乱、TUI 可用或降级、退出后 `stty` 复原 | 待 Task 6 记录 | 同上；折行/制表位的本地自动化在 `apps/cli/src/render/width.rs` 与 `tests/render.rs` |
-| 无色（`NO_COLOR=1`） | 启动 banner、提交一次任务、编辑器重绘/历史/Ctrl+C、`/help` 在 80 列不折行错乱、TUI 可用或降级、退出后 `stty` 复原 | 待 Task 6 记录 | 同上；无色帧的本地自动化在 `apps/cli/src/tui/view.rs` 与 `tests/render.rs` |
-| 浅色主题（`ui.theme=light`） | 启动 banner、提交一次任务、编辑器重绘/历史/Ctrl+C、`/help` 在 80 列不折行错乱、TUI 可用或降级、退出后 `stty` 复原 | 待 Task 6 记录 | 同上；调色板的本地自动化在 `apps/cli/src/render/mod.rs` 的 palette 用例 |
+| Ubuntu 终端（默认） | 启动 banner、提交一次任务、编辑器重绘/历史/Ctrl+C、`/help` 在 80 列不折行错乱、TUI 可用或降级、退出后 `stty` 复原 | **SKIP + 原因**：本机没有可用的图形终端（`gnome-terminal` / `konsole` 未安装，X 显示不可用） | `docs/acceptance.md` 的终端矩阵（Task 6 填真机结果）；本机自动化覆盖见下 |
+| tmux | 启动 banner、提交一次任务、编辑器重绘/历史/Ctrl+C、`/help` 在 80 列不折行错乱、TUI 可用或降级、退出后 `stty` 复原 | **PASS**：经典 REPL 与 `--tui` 各一轮；空闲 Ctrl+C 以 0 退出、退出后 `stty` 复原 | 同上；`apps/cli/tests/pty.rs` 的 pty 用例是接近 tmux 的自动化面 |
+| SSH | 启动 banner、提交一次任务、编辑器重绘/历史/Ctrl+C、`/help` 在 80 列不折行错乱、TUI 可用或降级、退出后 `stty` 复原 | **SKIP + 原因**：本机没有可用的 SSH 目标终端（回环探测退出 255） | 同上；本机没有可用的目标终端时该项记 SKIP + 原因（**不记 PASS**） |
+| 80 列 | 启动 banner、提交一次任务、编辑器重绘/历史/Ctrl+C、`/help` 在 80 列不折行错乱、TUI 可用或降级、退出后 `stty` 复原 | **PASS（含 1 条版式注意）**：输入行按显示宽度折行（`… ` 续行标记）、答复折行与 `stty` 复原正常；`/help` 3 行 >80 列由终端软折行（文字完整，见 `docs/acceptance.md`） | 同上；折行/制表位的本地自动化在 `apps/cli/src/render/width.rs` 与 `tests/render.rs` |
+| 无色（`NO_COLOR=1`） | 启动 banner、提交一次任务、编辑器重绘/历史/Ctrl+C、`/help` 在 80 列不折行错乱、TUI 可用或降级、退出后 `stty` 复原 | **PASS**：`NO_COLOR=1` 与 `ignis config set ui.color never` 各一轮，原始流**零 SGR**（彩色正对照 6 条） | 同上；无色帧的本地自动化在 `apps/cli/src/tui/view.rs` 与 `tests/render.rs` |
+| 浅色主题（`ui.theme=light`） | 启动 banner、提交一次任务、编辑器重绘/历史/Ctrl+C、`/help` 在 80 列不折行错乱、TUI 可用或降级、退出后 `stty` 复原 | **SKIP + 原因（主观项）**：本机没有可用显示环境，浅色背景的对比度无法目视判断；`ui.theme light` 下的客观观察（不崩、调色板只差 dim 槽）已记录在 `docs/acceptance.md`，不构成该项 PASS | 同上；调色板的本地自动化在 `apps/cli/src/render/mod.rs` 的 palette 用例 |
 
-> **结论列的口径**：这一列只放 Task 6 真机跑完后**实际写进** [`docs/acceptance.md`](docs/acceptance.md) 的结果（逐项 PASS，或在跑不了时记 SKIP 并写明原因）；本文档提交时该列统一记为「待 Task 6 记录」——不预写任何 PASS/SKIP。矩阵行与 `docs/acceptance.md` 的终端矩阵同源，README 只写结论列。
+> **结论列的口径**：这一列只放 Task 6 真机跑完后**实际写进** [`docs/acceptance.md`](docs/acceptance.md) 的结果（逐项 PASS，或在跑不了时记 SKIP 并写明原因）。2026-10-19 发布门已按该口径填入：本机三门 SKIP（默认终端、SSH、浅色主题的主观项）都带原因，**SKIP 不记 PASS**；逐项命令与实际观察见 `docs/acceptance.md` 的「v0.2 验收」段。矩阵行与那段里的终端矩阵同源，README 只写结论列。
 
 ## 三个演示
 
@@ -239,7 +239,7 @@ ignis --tui -c
 #   /exit
 ```
 
-- 第一次的确认行形状固定为 `  ✓ memory: <key> (<scope>) <文本 ≤60 字符>`（key 与文本由模型按你的话定，示例里是 `pkg_manager`）；`/memory` 的第二列能看到同一事实。记忆是 `scope=project`，因此只在本工作区注入。
+- 第一次的确认行形状固定为 `  ✓ memory: <key> (<scope>) <文本 ≤60 字符>`（key 与文本由模型按你的话定，示例里是 `pkg_manager`）；`/memory` 的 `KEY` 列能看到同一事实（`SCOPE` 列是 `project`）。记忆是 `scope=project`，因此只在本工作区注入。
 - 第二次的 `uv sync` / `uv run` 是**模型的选择**：机器上没装 uv 时按本仓库既有口径只断言「模型选择了 uv 工作流」（工具日志里出现这两个命令），不断言依赖真的装上。
 - 第三次的短 id 取会话 id 前 13 字符（与 `/sessions`、`/status` 同一口径，`/resume` 与 `ignis task show` 接受 ≥8 字符的唯一前缀）。TUI 不打印经典 banner，会话身份看顶部状态行与 `/status` 的 `session:` 行。
 - 任务与会话的绑定落在 `tasks.session_id`（每轮任务都写）：`ignis task list` 显示最近任务（第 5 列 `PROMPT` 即上面第二/第三次那条），**表里不含会话列**；要核对绑定就直接查库，例如
@@ -380,7 +380,7 @@ ignis daemon stop            # 幂等：没在跑也算成功
 - **经典 REPL 在「读一行」期间不响应 Ctrl-C**：审批提示与 `/learn` 的保存确认（`save this skill draft? [s]ave [d]iscard> `）在读一行期间不响应 Ctrl-C——进程级 SIGINT 只被接住、不取消那次同步读；模型往返本身（任务轮次、`/compact`、`/learn` 的草稿生成）可以被 Ctrl-C 取消。TUI 里 Ctrl-C 会取消本轮（任务 / 压缩 / 学习），不转发给工具、也不改审批决定。
 - **`/compact` 与 `/learn` 需要 native 凭据**：两者各发一次无工具的 native 请求，外置内核或没有 Ignis 凭据时明确报错（不静默降级、不改状态）；外置内核的用量 / 上限退化（token 记 0、只剩墙钟超时与取消）与「不经 Ignis 审批、无 `approvals` 行」见[限制](#限制) #2、#7。
 - **脱敏是字面替换**：已知密钥按字面替换为 `***`（先 JSON 转义形式、后原文），不做正则或相似度匹配——密钥的截断 / 重组 / 编码变体不在覆盖内；**修复前已落库的明文行不回写**（没有 scrub / migration，新代码不再产生新的明文行）。
-- **banner 形状与 `demo.md` 概念图不同**（`demo.md` 原文标注「CLI 概念展示，并非已经实现的 Ignis 界面」）：实际启动屏为 `IGNIS v0.2` / `● Ready` / `Workspace: <dir>` / `Runtime: <kernel> · Skills: <n> · Memory: <n> facts` / `Session: <new|13 字符短 id>`，有未读告警时追加一行 `⚠ N unread alerts — run \`ignis alerts\``（版本号取包版本，当前 `0.2.0`）。
+- **banner 形状与 `demo.md` 概念图不同**（`demo.md` 原文标注「CLI 概念展示，并非已经实现的 Ignis 界面」）：实际启动屏为 `IGNIS v0.2.0` / `● Ready` / `Workspace: <dir>` / `Runtime: <kernel> · Skills: <n> · Memory: <n> facts` / `Session: <new|13 字符短 id>`（版本号逐字取包版本 `env!("CARGO_PKG_VERSION")`，当前 `0.2.0`），有未读告警时追加一行 `⚠ N unread alerts — run \`ignis alerts\``。
 - **设计文档措辞与 `demo.md` 不完全一致**：`docs/superpowers/specs/2026-10-15-ignis-v0.1-design.md` 与 `docs/superpowers/specs/2026-10-16-ignis-v0.2-design.md` 按对话中的新决定固化了工程取舍（Rust 取代 TS/Node、Telegram 推迟为 CLI 收件箱 / 桌面通知、内核数量、v0.2 的交付口径等），冲突时以设计文档为准。
 - **设计文档的 DDL 措辞与实现的库表不同**：v0.1 设计文档 §6.7「任务模型」只给字段级草案（§9 把「数据库 schema 字段级细化」留给构建者），与实现有三处出入——实现多了 `jobs.workspace` / `jobs.last_run_at` / `job_runs.task_id`，用量是 `job_runs.input_tokens` + `output_tokens` 两列（没有单列 `usage`），`alerts` 表在设计文档里只有文字描述；v0.2 设计 §6.6 的会话 DDL 与实现的 004 一致。一律以 [`packages/storage/src/migrations.rs`](packages/storage/src/migrations.rs) 的 001–004 DDL 为准。
 - **`demo.md` 按作者要求保持原文未修改**；上述偏差只记录在这里，不回改历史文档。
