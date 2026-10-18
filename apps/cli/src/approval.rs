@@ -9,8 +9,11 @@ use async_trait::async_trait;
 use ignis_core::security::ApprovalMode;
 use ignis_runtime::{ApprovalDecision, ApprovalHandler, ApprovalRequest, RiskLevel};
 
-/// 连续无效输入的容忍上限，超过即 fail-safe 拒绝。
-const MAX_UNKNOWN_INPUTS: usize = 10;
+/// 选项行（逐字）：`[a]pprove  [s]ession-allow  [r]eject  [d]etails`。
+pub const CHOICES_LINE: &str = "[a]pprove  [s]ession-allow  [r]eject  [d]etails";
+
+/// 连续无效输入的容忍上限，超过即 fail-safe 拒绝（TUI 的按键计数复用同一上限）。
+pub(crate) const MAX_UNKNOWN_INPUTS: usize = 10;
 
 /// 提示词下可选的四个动作。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,21 +43,34 @@ pub fn resolve_mode(yes: bool, unsafe_ops: bool, stdin_is_tty: bool) -> Approval
     }
 }
 
-/// 审批提示词（格式锁定，以 `choice> ` 结尾、不带换行）。
-///
-/// `risk` 用 `RiskLevel` 的 serde lowercase 名字：`safe` / `elevated` / `dangerous`。
-pub fn format_prompt(req: &ApprovalRequest) -> String {
-    let risk = match req.risk {
+/// risk 的展示名：`RiskLevel` 的 serde lowercase 名字（`safe` / `elevated` / `dangerous`）。
+fn risk_word(risk: RiskLevel) -> &'static str {
+    match risk {
         RiskLevel::Safe => "safe",
         RiskLevel::Elevated => "elevated",
         RiskLevel::Dangerous => "dangerous",
-    };
+    }
+}
 
-    format!(
-        "Approval required\n  Action: {}\n  Risk: {risk}\n\
-         [a]pprove  [s]ession-allow  [r]eject  [d]etails\nchoice> ",
-        req.summary
-    )
+/// 审批提示的文本行（4 行，经典 REPL 与 TUI 共用的唯一来源）：
+/// `["Approval required", "  Action: {summary}", "  Risk: {risk}", CHOICES_LINE]`。
+pub fn prompt_lines(req: &ApprovalRequest) -> Vec<String> {
+    vec![
+        "Approval required".to_string(),
+        format!("  Action: {}", req.summary),
+        format!("  Risk: {}", risk_word(req.risk)),
+        CHOICES_LINE.to_string(),
+    ]
+}
+
+/// 审批提示词（格式锁定，以 `choice> ` 结尾、不带换行）：四行正文逐字来自 [`prompt_lines`]。
+pub fn format_prompt(req: &ApprovalRequest) -> String {
+    prompt_lines(req).join("\n") + "\nchoice> "
+}
+
+/// 参数明细的美化 JSON（serde_json 默认按键排序）：经典提示的 `d` 与 TUI 的 `d` 共用这一份。
+pub(crate) fn details_json(args: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string())
 }
 
 /// 解析一行输入：大小写与首尾空白都容忍，无法识别返回 `None`。
@@ -92,8 +108,7 @@ pub fn decide_from_lines(
             Some(Choice::Always) => return ApprovalDecision::AllowSession,
             Some(Choice::Reject) => return ApprovalDecision::Reject,
             Some(Choice::Details) => {
-                let args = serde_json::to_string_pretty(&req.args)
-                    .unwrap_or_else(|_| req.args.to_string());
+                let args = details_json(&req.args);
                 let _ = writeln!(out, "{args}");
             }
             None => {
@@ -188,6 +203,39 @@ mod tests {
         ] {
             let prompt = format_prompt(&request(risk));
             assert!(prompt.contains(&format!("\n  Risk: {name}\n")), "{prompt}");
+        }
+    }
+
+    /// 提示文案的唯一来源（裁定 1）：四条正文逐字，且 `format_prompt` 与
+    /// `prompt_lines().join("\n") + "\nchoice> "` 逐字相等（经典 REPL 与 TUI 共用同一份）。
+    #[test]
+    fn prompt_lines_are_the_classic_bytes() {
+        assert_eq!(
+            CHOICES_LINE,
+            "[a]pprove  [s]ession-allow  [r]eject  [d]etails"
+        );
+
+        for (risk, name) in [
+            (RiskLevel::Safe, "safe"),
+            (RiskLevel::Elevated, "elevated"),
+            (RiskLevel::Dangerous, "dangerous"),
+        ] {
+            let req = request(risk);
+            assert_eq!(
+                prompt_lines(&req),
+                [
+                    "Approval required".to_string(),
+                    "  Action: Writing a.txt".to_string(),
+                    format!("  Risk: {name}"),
+                    CHOICES_LINE.to_string(),
+                ],
+                "{name}"
+            );
+            assert_eq!(
+                format_prompt(&req),
+                prompt_lines(&req).join("\n") + "\nchoice> ",
+                "两个来源必须逐字等价：{name}"
+            );
         }
     }
 

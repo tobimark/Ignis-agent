@@ -142,12 +142,41 @@ fn resolve_api_key_with(config: &Config, get: impl Fn(&str) -> Option<String>) -
         .or_else(|| get(&config.model.api_key_env).filter(|key| !key.trim().is_empty()))
 }
 
+/// 审批处理器选择：交互模式用注入的那个（没有则 [`InteractiveApproval`]），其余模式一律
+/// [`PolicyOnlyApproval`]——`--yes`/`--unsafe` 的预授权语义不该被 TUI 的提问面绕开。
+///
+/// 私有：选择规则由内联用例直测（[`Session::build`] 是唯一调用点）。
+fn approvals_for(
+    mode: ApprovalMode,
+    injected: Option<Arc<dyn ApprovalHandler>>,
+) -> Arc<dyn ApprovalHandler> {
+    match mode {
+        ApprovalMode::Interactive => injected.unwrap_or_else(|| Arc::new(InteractiveApproval)),
+        ApprovalMode::Preauthorized { .. } | ApprovalMode::Unattended => {
+            Arc::new(PolicyOnlyApproval)
+        }
+    }
+}
+
 impl Session {
     /// 装配会话：配置 → 工作区 → 选定内核 → 存储 → 策略 → 凭据 → 审批。
     ///
     /// 缺 API key（只有 native 需要）、配置解析失败、工作区不存在、建库失败、选定内核不可用都是
     /// 预期内的失败，返回人话 `Err` 即可，调用方不会因此 panic 或打印堆栈。
+    ///
+    /// 审批处理器按模式选（见 [`approvals_for`]）：交互模式是 [`InteractiveApproval`]；TUI 用
+    /// [`Session::new_with_handler`] 把内联审批注入进来。
     pub fn new(cli: &Cli) -> Result<Self> {
+        Self::build(cli, None)
+    }
+
+    /// 与 [`Session::new`] 相同，但审批处理器由调用方注入（只对交互模式生效，见 [`approvals_for`]）。
+    pub fn new_with_handler(cli: &Cli, approvals: Arc<dyn ApprovalHandler>) -> Result<Self> {
+        Self::build(cli, Some(approvals))
+    }
+
+    /// 两个会话入口的公共实现：`injected` 只对交互模式生效（预授权/无人值守下策略结论优先）。
+    fn build(cli: &Cli, injected: Option<Arc<dyn ApprovalHandler>>) -> Result<Self> {
         // 配置里的 api_key 已被 IGNIS_API_KEY 覆盖过，这里只是读出生效值
         let home = ignis_home();
         // 数据目录先落地（新建时 0700）：密钥、任务库与日志都在它下面
@@ -180,13 +209,9 @@ impl Session {
         let output_mode = config.ui.output_mode;
         let config = Arc::new(config);
 
-        // 只有交互模式才该问到人：其余模式策略已经给出结论，被问到说明策略漏判 → 一律拒绝
-        let approvals: Arc<dyn ApprovalHandler> = match mode {
-            ApprovalMode::Interactive => Arc::new(InteractiveApproval),
-            ApprovalMode::Preauthorized { .. } | ApprovalMode::Unattended => {
-                Arc::new(PolicyOnlyApproval)
-            }
-        };
+        // 只有交互模式才该问到人：其余模式策略已经给出结论，被问到说明策略漏判 → 一律拒绝。
+        // 注入的处理器（TUI 的内联审批）只在这里生效——`--yes`/`--unsafe` 的预授权语义不可绕开
+        let approvals = approvals_for(mode, injected);
 
         // 选定内核先构造一次：缺二进制的错误在碰记忆库与第一轮任务之前就变成人话（构造开销小）
         mk_runtime(kernel, &config, &workspace).map_err(anyhow::Error::msg)?;
@@ -1070,8 +1095,8 @@ mod tests {
 
     use ignis_core::config::{ColorChoice, OutputMode, Theme, UiConfig};
     use ignis_core::session::{COMPACT_SYSTEM_PROMPT, EARLIER_SUMMARY_PREFIX};
-    use ignis_runtime::Role;
     use ignis_runtime::test_support::{ScriptStep, ScriptedModel, ScriptedModelHandle};
+    use ignis_runtime::{ApprovalDecision, ApprovalRequest, RiskLevel, Role};
     use ignis_storage::NewTask;
 
     use super::fixtures::{
@@ -1103,6 +1128,67 @@ mod tests {
         let error = missing_api_key(&missing);
         assert!(error.contains("未配置 API key"), "{error}");
         assert!(error.contains("IGNIS_T3_ABSENT_KEY"), "{error}");
+    }
+
+    /// 脚本化审批处理器：只交回调用方给的那一个决定（用来分辨「注入的那个」与策略占位）。
+    struct StubApproval(ApprovalDecision);
+
+    #[async_trait::async_trait]
+    impl ignis_runtime::ApprovalHandler for StubApproval {
+        async fn decide(&self, _req: ApprovalRequest) -> ApprovalDecision {
+            self.0
+        }
+    }
+
+    /// 审批处理器的选择规则（裁定 2）：只有交互模式用注入的那个（没注入则用默认的交互处理器）；
+    /// 预授权 / 无人值守下注入的一律被忽略、恒是策略占位（`--yes`/`--unsafe` 的语义不可被 TUI
+    /// 的提问面绕开）。
+    #[tokio::test]
+    async fn approvals_for_uses_the_injected_handler_only_when_interactive() {
+        use ApprovalMode::{Interactive, Preauthorized, Unattended};
+
+        let request = || ApprovalRequest {
+            tool: "fs_write".to_string(),
+            summary: "Writing a.txt".to_string(),
+            args: serde_json::json!({ "path": "a.txt" }),
+            risk: RiskLevel::Elevated,
+        };
+        let injected: Arc<dyn ApprovalHandler> =
+            Arc::new(StubApproval(ApprovalDecision::AllowSession));
+
+        // 交互 + 注入：就是注入的那个（同一个 Arc），决定原样交回
+        let handler = approvals_for(Interactive, Some(Arc::clone(&injected)));
+        assert!(Arc::ptr_eq(&handler, &injected), "交互模式用注入的处理器");
+        assert_eq!(
+            handler.decide(request()).await,
+            ApprovalDecision::AllowSession
+        );
+
+        // 交互 + 没注入：默认的交互处理器（按「不是注入那个」断言；**不调 decide**——它会去读
+        // 真实 stdin，用例在 tty 下会卡住）
+        let plain = approvals_for(Interactive, None);
+        assert!(
+            !Arc::ptr_eq(&plain, &injected),
+            "没注入就轮到默认的交互处理器"
+        );
+
+        // 其余三个模式 + 注入：注入的被忽略，策略结论优先（被问到一律拒绝）
+        for mode in [
+            Preauthorized { unsafe_ops: false },
+            Preauthorized { unsafe_ops: true },
+            Unattended,
+        ] {
+            let handler = approvals_for(mode, Some(Arc::clone(&injected)));
+            assert!(
+                !Arc::ptr_eq(&handler, &injected),
+                "{mode:?} 不该用注入的处理器"
+            );
+            assert_eq!(
+                handler.decide(request()).await,
+                ApprovalDecision::Reject,
+                "{mode:?}：策略已经给出结论，被问到一律拒绝"
+            );
+        }
     }
 
     /// 空串/纯空白一律视为没配 key（`IGNIS_API_KEY=""`、配置里写了空串、`model.api_key_env`

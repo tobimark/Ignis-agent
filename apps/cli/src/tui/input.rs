@@ -11,7 +11,9 @@
 //!   帧合成器）、没有候选清空提示；
 //! - **`Ctrl+C` 字节与 SIGINT 同义**（`ISIG` 关掉的终端上它就是那个字节）：这里只回
 //!   [`Action::Exit`]，退出还是留在界内由外层按输入模式决定；
-//! - **提示行只由 Tab 写**：其余按键不动它（T4/T5/T6 的输入态各自管自己那一条）。
+//! - **提示行只由 Tab 写**：其余按键不动它（T4/T5/T6 的输入态各自管自己那一条）；
+//! - **审批态不走本模块的动作面**：[`InputState::keys`] 把按键原样交给调用方（审批按键与编辑器
+//!   缓冲无关），编辑器的解码器仍复用这一份（跨批缓存不丢）。
 
 use crate::commands::slash::{self, Completion};
 use crate::editor::draw::CONTINUATION;
@@ -45,12 +47,20 @@ impl InputState {
         }
     }
 
+    /// 解码一段字节（跨批缓存留在解码器里），按键交给调用方处置。
+    ///
+    /// 审批态（`TuiApp::approval_key`）走这条路：它要的是按键而不是编辑器动作——审批按键绝不
+    /// 进编辑器缓冲，`a`/`s`/`r`/`d` 的语义只归审批面。
+    pub(crate) fn keys(&mut self, bytes: &[u8]) -> Vec<Key> {
+        self.decoder.feed(bytes)
+    }
+
     /// 喂一段原始字节，返回要外层执行的动作（顺序即处理顺序）。
     ///
     /// `Submit`/`Exit` 之后这一批的剩余按键忽略：回车提交之后跟着的字节（快速输入、粘贴后紧跟
     /// 回车）不许落到已经清空的缓冲里——与忙碌期禁用输入是同一条规则。
     pub fn on_bytes(&mut self, bytes: &[u8]) -> Vec<Action> {
-        let keys = self.decoder.feed(bytes);
+        let keys = self.keys(bytes);
         let mut actions = Vec::new();
         for key in keys {
             let action = self.on_key(key);

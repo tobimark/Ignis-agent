@@ -9,19 +9,28 @@
 //! - 忙碌期由 [`TuiApp::drive`] 在同一个 `select!` 里推进 future、每 100ms 排空捕获并重绘、
 //!   接 SIGINT/SIGWINCH/输入块。SIGINT 不结束忙碌循环：任务轮次的取消在 `run_task_with_out`
 //!   自己的 watcher 里，`/compact` `/learn` 由 TUI 持有的令牌收。
+//!
+//! 审批（T4）是叠在忙碌期上的一态：`drive` 的同一个 `select!` 里收 [`ApprovalJob`]（请求与任务
+//! future 一起推进，不「UI 等 UI」），4 行提示进滚动区、输入区首行换成经典的 `choice> `，按键由
+//! [`TuiApp::approval_key`] 收——**绝不进编辑器**。
 
 use std::future::Future;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use ignis_runtime::{ApprovalDecision, ApprovalRequest};
 use tokio::signal::unix::{Signal, SignalKind, signal};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use crate::approval::{Choice, MAX_UNKNOWN_INPUTS, details_json, parse_choice, prompt_lines};
 use crate::editor::history::History;
+use crate::editor::keys::Key;
 use crate::editor::reader::INVALID_WARNING;
+use crate::render::width::display_width;
 use crate::tui::Size;
+use crate::tui::approval::ApprovalJob;
 use crate::tui::capture::{self, CaptureSink};
 use crate::tui::input::InputState;
 use crate::tui::term;
@@ -40,6 +49,13 @@ pub(crate) const BUSY_HINT: &str = "Ctrl+C cancels";
 
 /// 忙碌期输入区第 1 行的说明（chrome 里唯一一句「正在进行」）。
 const WORKING: &str = "working…";
+
+/// 审批态输入区第 1 行的提示词（逐字与经典审批提示词的最后一段一致）：4 行提示放不下 3 行的
+/// 输入区，正文在滚动区，输入区只留经典的提示词。
+const CHOICE_PROMPT: &str = "choice> ";
+
+/// 审批态输入区第 3 行的提示（四个可选按键；`d` 先看明细再问一轮）。
+const APPROVAL_HINT: &str = "a/s/r/d";
 
 /// 进入主循环前的默认面板尺寸（守卫探到尺寸之前用；与 `term` 的回退 80×24 同值）。
 const INITIAL_SIZE: Size = Size { cols: 80, rows: 24 };
@@ -73,13 +89,22 @@ pub enum Busy {
 }
 
 /// 输入模式：T3 只有编辑器与忙碌两态；T4/T5/T6 各自**追加**一个变体（`Approval`/`Confirm`/
-/// `Selector`，那几个变体不带 `Copy`，所以这里只派生 `Clone/PartialEq/Eq`）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Selector`）。审批态带 [`oneshot::Sender`]，所以这里只派生 `Debug`（不再有 `Clone`/`Eq`）。
+#[derive(Debug)]
 pub enum InputMode {
     /// 编辑器：按键进 [`InputState`]。
     Editor,
     /// 忙碌：输入禁用，只等 future 结束。
     Busy(Busy),
+    /// 审批：4 行提示已进滚动区，按键由 [`TuiApp::approval_key`] 收（**不进编辑器**）。
+    Approval {
+        /// 待审批的请求（`d` 打它的参数明细）。
+        request: ApprovalRequest,
+        /// 回信口（`None` = 已经回信）。
+        reply: Option<oneshot::Sender<ApprovalDecision>>,
+        /// 连续无效输入的计数（到 `MAX_UNKNOWN_INPUTS` 即 fail-safe 拒绝）。
+        unknown: usize,
+    },
 }
 
 /// TUI 的应用状态：不持有会话（future 借用 `&mut Session` 期间的借用冲突规避）。
@@ -96,6 +121,11 @@ pub struct TuiApp {
     size: Size,
     /// 输入读取线程交回的一批批字节（空闲与忙碌两个循环共用）。
     chunks: Option<mpsc::UnboundedReceiver<InputChunk>>,
+    /// 审批处理器交回的请求（`drive` 的审批分支从这里收；主循环进入时接上）。
+    approvals: Option<mpsc::UnboundedReceiver<ApprovalJob>>,
+    /// 本轮的取消令牌（`drive` 进入时挂上、退出时摘掉）：审批态的 `Ctrl+C` 字节与 SIGINT 同义，
+    /// 靠它取消本轮任务（`/compact` `/learn` 的令牌；任务轮次给 `None`，取消在 `run_task` 内部）。
+    cancel: Option<CancellationToken>,
     /// SIGINT 信号流（第一次用到时装上；装不上就永远挂起）。
     sigint: Option<Signal>,
     /// SIGWINCH 信号流（同上）。
@@ -112,6 +142,8 @@ impl TuiApp {
             capture,
             size: INITIAL_SIZE,
             chunks: None,
+            approvals: None,
+            cancel: None,
             sigint: None,
             sigwinch: None,
         }
@@ -120,6 +152,12 @@ impl TuiApp {
     /// 接上输入读取线程的接收端（主循环进入时调一次）。
     pub(crate) fn attach_chunks(&mut self, chunks: mpsc::UnboundedReceiver<InputChunk>) {
         self.chunks = Some(chunks);
+    }
+
+    /// 接上审批处理器交回请求的接收端（主循环进入时调一次；没接上时 `drive` 的审批分支永远
+    /// 挂起——经典路径与不提问的任务不受影响）。
+    pub fn attach_approvals(&mut self, approvals: mpsc::UnboundedReceiver<ApprovalJob>) {
+        self.approvals = Some(approvals);
     }
 
     /// 面板尺寸（主循环进入时与 SIGWINCH 之后刷新）。
@@ -135,8 +173,12 @@ impl TuiApp {
     /// 喂一段原始字节；返回要外层执行的动作。
     ///
     /// 忙碌期一律没有动作（输入禁用）：字节照吃（别留给空闲期），缓冲一个字符都不进。
+    /// 审批期的按键走 [`TuiApp::approval_key`]（**绝不进编辑器**）。
     pub fn on_bytes(&mut self, bytes: &[u8]) -> Vec<Action> {
-        if self.mode != InputMode::Editor {
+        if matches!(self.mode, InputMode::Approval { .. }) {
+            return self.approval_bytes(bytes);
+        }
+        if !matches!(self.mode, InputMode::Editor) {
             return Vec::new();
         }
         let mut actions = self.input.on_bytes(bytes);
@@ -148,6 +190,26 @@ impl TuiApp {
             }
         }
         actions
+    }
+
+    /// 审批态的一批字节：解码成按键逐个交给 [`TuiApp::approval_key`]。回信之后这一批剩下的按键
+    /// 丢掉（与 `Submit`/`Exit` 之后忽略剩余按键同一条规则）——审批按键因此绝不落进编辑器。
+    fn approval_bytes(&mut self, bytes: &[u8]) -> Vec<Action> {
+        let keys = self.input.keys(bytes);
+        let mut redraw = false;
+        for key in keys {
+            redraw |= self.approval_key(key).is_some();
+            if !matches!(self.mode, InputMode::Approval { .. }) {
+                // 回信即结束审批：界面回到编辑器（要重绘一帧），剩下的按键随这一批丢掉
+                redraw = true;
+                break;
+            }
+        }
+        if redraw {
+            vec![Action::Redraw]
+        } else {
+            Vec::new()
+        }
     }
 
     /// 每 tick：排空捕获缓冲、消化「一个裸 ESC」；返回是否需要重绘。
@@ -195,31 +257,118 @@ impl TuiApp {
         self.mode = InputMode::Busy(busy);
     }
 
+    /// 收到一次审批请求：共用文案（[`prompt_lines`]，与经典 REPL 同一份）4 行逐字进滚动区
+    /// ——3 行输入区放不下 4 行提示 + `choice> `，正文由滚动区承担；输入态切到审批。
+    ///
+    /// 返回落地的那些行（调用方据此重绘一帧；滚动区已经写好了）。工具调用是串行的，同一时刻
+    /// 只会有一个待审批请求；真撞上第二个时前一个随替换丢掉——它的回信端掉落，那次审批因此
+    /// fail-safe 拒绝（与 [`crate::tui::approval::TuiApproval`] 同一口径）。
+    pub fn begin_approval(&mut self, job: ApprovalJob) -> Vec<String> {
+        let lines = prompt_lines(&job.request);
+        self.push_lines(lines.clone());
+        self.mode = InputMode::Approval {
+            request: job.request,
+            reply: Some(job.reply),
+            unknown: 0,
+        };
+        lines
+    }
+
+    /// 审批按键（`a`/`s`/`r`/`d`，大小写与空白归一——与经典 [`parse_choice`] 同一份）：`a`/`s`/`r`
+    /// 回信并回到编辑器；`d` 把参数明细（与经典同一份美化 JSON）逐行打进滚动区后继续等；连续
+    /// `MAX_UNKNOWN_INPUTS` 次无效输入或 EOF（`Ctrl+D`）＝ [`ApprovalDecision::Reject`]（fail-safe）；
+    /// `Ctrl+C` 的字节与 SIGINT 同义：拒绝并取消本轮任务令牌。
+    ///
+    /// 返回要落进滚动区的行（只有 `d` 的明细有；滚动区已经写好了）；不在审批态时什么都不做。
+    pub fn approval_key(&mut self, key: Key) -> Option<Vec<String>> {
+        if !matches!(self.mode, InputMode::Approval { .. }) {
+            return None;
+        }
+        match approval_step(key) {
+            ApprovalStep::Reply(decision) => {
+                // `Ctrl+C` 字节（终端没开 ISIG 时它就是那个信号）：与 SIGINT 同义，顺手取消本轮令牌
+                if key == Key::CtrlC
+                    && let Some(token) = self.cancel.as_ref()
+                {
+                    token.cancel();
+                }
+                self.end_approval(decision);
+                None
+            }
+            ApprovalStep::Details => {
+                let InputMode::Approval { request, .. } = &self.mode else {
+                    return None;
+                };
+                let lines: Vec<String> = details_json(&request.args)
+                    .lines()
+                    .map(str::to_string)
+                    .collect();
+                self.push_lines(lines.clone());
+                Some(lines)
+            }
+            ApprovalStep::Unknown => {
+                let InputMode::Approval { unknown, .. } = &mut self.mode else {
+                    return None;
+                };
+                *unknown += 1;
+                let give_up = *unknown >= MAX_UNKNOWN_INPUTS;
+                if give_up {
+                    // 连续无效输入到上限：fail-safe 拒绝（与经典 `decide_from_lines` 同一口径）
+                    self.end_approval(ApprovalDecision::Reject);
+                }
+                None
+            }
+        }
+    }
+
+    /// 收下审批态：回信（回信端已经没了就算了）并回到编辑器。
+    fn end_approval(&mut self, decision: ApprovalDecision) {
+        // 用编辑器态换出审批态：请求与无效输入计数随替换一起丢掉
+        if let InputMode::Approval { reply, .. } =
+            std::mem::replace(&mut self.mode, InputMode::Editor)
+            && let Some(reply) = reply
+        {
+            let _ = reply.send(decision);
+        }
+    }
+
     /// 离开忙碌态：回到编辑器（缓冲是空的，光标在段首）。
     pub fn end_busy(&mut self) {
         self.mode = InputMode::Editor;
     }
 
-    /// 当前是不是忙碌态（`None` = 空闲）。
+    /// 当前是不是忙碌态（`None` = 空闲；审批自成一态，不算忙碌）。
     pub fn busy(&self) -> Option<Busy> {
         match self.mode {
-            InputMode::Editor => None,
             InputMode::Busy(busy) => Some(busy),
+            InputMode::Editor | InputMode::Approval { .. } => None,
         }
     }
 
     /// 组装一帧（合成器是纯函数；这里只把状态拼进 [`TuiView`]）。
     pub fn view(&self, facts: &ViewFacts) -> TuiView {
-        let (input, hint) = match self.busy() {
+        let (input, hint) = match &self.mode {
             // 忙碌期没有可编辑的输入：光标藏起来，两行都是说明性文案
-            Some(_) => (
+            InputMode::Busy(_) => (
                 InputBlock {
                     lines: [WORKING.to_string(), String::new(), BUSY_HINT.to_string()],
                     cursor: None,
                 },
                 BUSY_HINT,
             ),
-            None => (self.input.block(), IDLE_HINT),
+            // 审批：正文（4 行提示）在滚动区，输入区首行只留经典的 `choice> `（光标停在它后面）
+            InputMode::Approval { .. } => (
+                InputBlock {
+                    lines: [
+                        CHOICE_PROMPT.to_string(),
+                        String::new(),
+                        APPROVAL_HINT.to_string(),
+                    ],
+                    cursor: Some((0, display_width(CHOICE_PROMPT))),
+                },
+                BUSY_HINT,
+            ),
+            InputMode::Editor => (self.input.block(), IDLE_HINT),
         };
         TuiView {
             size: self.size,
@@ -287,7 +436,8 @@ impl TuiApp {
 
     /// 两个入口的公共实现：`term` 为空 = 不画帧（用例）。**循环体内不碰会话**（状态读 `facts`）。
     ///
-    /// T4/T5 在这里**追加**审批/确认的接收分支（同一个 `select!` 里收请求，才不会「UI 等 UI」）。
+    /// 审批（T4）与确认（T5）的请求在同一个 `select!` 里收：请求到达即 [`TuiApp::begin_approval`]
+    /// （提示进滚动区、输入态切到审批），future 照常推进——「UI 等 UI」的死锁因此不可能发生。
     async fn drive_with<F>(
         &mut self,
         mut term: Option<&mut term::TerminalGuard>,
@@ -305,8 +455,11 @@ impl TuiApp {
         let mut tick = tokio::time::interval(TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut chunks = self.chunks.take();
+        let mut approvals = self.approvals.take();
         let mut sigint = self.sigint.take();
         let mut sigwinch = self.sigwinch.take();
+        // 本轮令牌挂进应用：审批态的 `Ctrl+C` 字节靠它取消本轮任务（见 `TuiApp::approval_key`）
+        self.cancel = cancel.clone();
 
         // 进场先画一帧：忙碌态的输入区（`working…`）立刻可见
         self.draw(term.as_deref_mut(), facts);
@@ -331,17 +484,30 @@ impl TuiApp {
                     }
                     self.draw(term.as_deref_mut(), facts);
                 }
+                job = next_approval(&mut approvals) => {
+                    // 收到审批请求：提示进滚动区、输入态切到审批，然后重绘一帧；future 继续推进
+                    if let Some(job) = job {
+                        let _ = self.begin_approval(job);
+                        self.draw(term.as_deref_mut(), facts);
+                    }
+                }
                 chunk = next_chunk(&mut chunks) => {
-                    // 忙碌期输入禁用：字节照收（别留给空闲期），动作一律丢掉
-                    if let Some(InputChunk::Bytes(bytes)) = chunk {
-                        let _ = self.on_bytes(&bytes);
+                    // 忙碌期输入禁用：字节照收（别留给空闲期），动作一律丢掉；审批态的按键由
+                    // `on_bytes` 路由到审批面，真改了界面（明细/回信）就立刻重绘一帧，不等心跳
+                    if let Some(InputChunk::Bytes(bytes)) = chunk
+                        && !self.on_bytes(&bytes).is_empty()
+                    {
+                        self.draw(term.as_deref_mut(), facts);
                     }
                 }
             }
         };
         self.chunks = chunks;
+        self.approvals = approvals;
         self.sigint = sigint;
         self.sigwinch = sigwinch;
+        // 本轮结束：摘掉令牌（审批态的按键不该动下一轮的取消）
+        self.cancel = None;
         // 收尾：把捕获里剩下的字节排空、半行落地（本轮输出必须完整落进滚动区）
         self.flush_pending();
         output
@@ -443,24 +609,77 @@ async fn next_signal(slot: &mut Option<Signal>) {
     }
 }
 
+/// 等下一次审批请求；没接上（经典路径、没注入审批处理器的会话）时永远挂起。
+///
+/// 发送端全消失（`Session` 连同它的审批处理器一起掉了）时清掉槽位并返回 `None`：此后 `recv()`
+/// 会立刻返回 `None`，不清掉就是空转。
+async fn next_approval(
+    slot: &mut Option<mpsc::UnboundedReceiver<ApprovalJob>>,
+) -> Option<ApprovalJob> {
+    let closed = match slot.as_mut() {
+        Some(rx) => match rx.recv().await {
+            Some(job) => return Some(job),
+            None => true,
+        },
+        None => std::future::pending().await,
+    };
+    if closed {
+        *slot = None;
+    }
+    None
+}
+
+/// 审批态一次按键的语义（纯函数：归一与经典 [`parse_choice`] 同一份）。
+enum ApprovalStep {
+    /// 回信并回到编辑器。
+    Reply(ApprovalDecision),
+    /// `d`：参数明细进滚动区，继续等。
+    Details,
+    /// 无效输入：计数（到 `MAX_UNKNOWN_INPUTS` 即 fail-safe 拒绝）。
+    Unknown,
+}
+
+/// 按键 → 审批语义：`a`/`s`/`r`/`d` 走经典的 [`parse_choice`]（大小写与空白归一），
+/// `Ctrl+C` 与 SIGINT 同义、`Ctrl+D`（EOF）也是 Reject，其余按键都算无效输入。
+fn approval_step(key: Key) -> ApprovalStep {
+    match key {
+        Key::CtrlC | Key::CtrlD => ApprovalStep::Reply(ApprovalDecision::Reject),
+        Key::Char(ch) => match parse_choice(&ch.to_string()) {
+            Some(Choice::ApproveOnce) => ApprovalStep::Reply(ApprovalDecision::AllowOnce),
+            Some(Choice::Always) => ApprovalStep::Reply(ApprovalDecision::AllowSession),
+            Some(Choice::Reject) => ApprovalStep::Reply(ApprovalDecision::Reject),
+            Some(Choice::Details) => ApprovalStep::Details,
+            None => ApprovalStep::Unknown,
+        },
+        _ => ApprovalStep::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use ignis_core::config::{OutputMode, Theme};
+    use ignis_runtime::{ApprovalDecision, ApprovalHandler, ApprovalRequest, RiskLevel};
+    use serde_json::json;
+    use tokio::sync::{mpsc, oneshot};
     use tokio_util::sync::CancellationToken;
 
+    use crate::approval::{MAX_UNKNOWN_INPUTS, format_prompt, prompt_lines};
     use crate::editor::history::History;
+    use crate::editor::keys::Key;
     use crate::editor::raw::RawMode;
     use crate::editor::reader::INVALID_WARNING;
     use crate::tui::Size;
+    use crate::tui::approval::{ApprovalJob, TuiApproval};
     use crate::tui::capture::CaptureSink;
     use crate::tui::term::TerminalGuard;
     use crate::tui::view::{Scrollback, ViewFacts, compose, status_line, top_line};
 
-    use super::{BUSY_HINT, Busy, IDLE_HINT, TuiApp};
+    use super::{BUSY_HINT, Busy, IDLE_HINT, InputChunk, TuiApp};
 
     /// 事实快照：顶/底状态行只关心拼法（与 T2 的用例同形）。
     fn facts() -> ViewFacts {
@@ -774,5 +993,208 @@ mod tests {
             "忙碌态的输入区必须画出来：{}",
             recorder.text()
         );
+    }
+
+    // ---- 内联审批（T4） ----
+
+    /// 一次审批请求（与 `approval.rs` 的用例同形：工具名/摘要/参数/风险各一格）。
+    fn approval_request() -> ApprovalRequest {
+        ApprovalRequest {
+            tool: "fs_write".to_string(),
+            summary: "Writing a.txt".to_string(),
+            args: json!({ "path": "a.txt", "recursive": true }),
+            risk: RiskLevel::Elevated,
+        }
+    }
+
+    /// 一条审批请求 + 回信口的收端（用例在这一侧观察回信）。
+    fn approval_job() -> (ApprovalJob, oneshot::Receiver<ApprovalDecision>) {
+        let (reply, rx) = oneshot::channel();
+        (
+            ApprovalJob {
+                request: approval_request(),
+                reply,
+            },
+            rx,
+        )
+    }
+
+    /// 内联审批的版式与键位（裁定 3）：4 行共用文案逐字进滚动区（3 行输入区放不下）、输入区首行
+    /// 恰好是经典的 `choice> `、提示行 `a/s/r/d`；`a`/`s`/`r` 各回各的信并回到编辑器，`d` 打参数
+    /// 明细（与经典同一份美化 JSON）后继续等，到上限的无效输入与 `Ctrl+D` 都 fail-safe 拒绝。
+    #[tokio::test]
+    async fn approval_keys_reply_to_the_pending_request() {
+        let (mut app, _buffer) = app();
+        let facts = facts();
+
+        // 版式：四行提示落在滚动区，输入区是 `choice> ` + `a/s/r/d`
+        let (job, mut rx) = approval_job();
+        let landed = app.begin_approval(job);
+        assert_eq!(
+            landed,
+            prompt_lines(&approval_request()),
+            "落地的就是共用文案"
+        );
+        assert_eq!(
+            app.view(&facts).viewport,
+            prompt_lines(&approval_request()),
+            "4 行提示逐字进滚动区"
+        );
+        let block = app.view(&facts).input;
+        assert_eq!(block.lines[0], "choice> ", "输入区首行是经典的提示词");
+        assert_eq!(block.lines[2], "a/s/r/d", "提示行");
+        assert!(
+            format_prompt(&approval_request()).ends_with(&block.lines[0]),
+            "输入区首行与经典提示词的最后一段逐字一致"
+        );
+        assert!(rx.try_recv().is_err(), "还没按键：没有回信");
+        assert_eq!(app.view(&facts).status, status_line(&facts, BUSY_HINT));
+
+        // `a`：回信 AllowOnce、输入态回编辑器、编辑器缓冲一个字符都不进
+        assert_eq!(app.on_bytes(b"a"), [super::Action::Redraw]);
+        assert_eq!(rx.try_recv(), Ok(ApprovalDecision::AllowOnce));
+        assert_eq!(app.busy(), None, "审批不是忙碌态");
+        assert_eq!(app.view(&facts).input.lines[0], "❯ ", "回信即回编辑器");
+        assert_eq!(app.input.text(), "");
+
+        // `s`/`r`（大写也归一）：每次各起一次审批
+        for (key, want) in [
+            ("s", ApprovalDecision::AllowSession),
+            ("R", ApprovalDecision::Reject),
+        ] {
+            let (job, mut rx) = approval_job();
+            app.begin_approval(job);
+            app.on_bytes(key.as_bytes());
+            assert_eq!(rx.try_recv(), Ok(want), "{key}");
+            assert_eq!(app.view(&facts).input.lines[0], "❯ ", "{key}");
+        }
+
+        // `d`：参数明细（美化 JSON 逐行）落进滚动区，提示保持、继续等回信
+        let (job, mut rx) = approval_job();
+        app.begin_approval(job);
+        let lines = app
+            .approval_key(Key::Char('d'))
+            .expect("`d` 的明细就是要落地的行");
+        assert!(
+            lines.contains(&"{".to_string())
+                && lines.iter().any(|line| line.starts_with("  \"path\"")),
+            "明细是美化 JSON：{lines:?}"
+        );
+        let viewport = app.view(&facts).viewport;
+        assert!(viewport.contains(&"{".to_string()), "{viewport:?}");
+        assert!(
+            viewport.iter().any(|line| line.starts_with("  \"path\"")),
+            "{viewport:?}"
+        );
+        assert_eq!(app.view(&facts).input.lines[0], "choice> ", "还在等回信");
+        for line in prompt_lines(&approval_request()) {
+            assert!(viewport.contains(&line), "提示仍在：{line:?}");
+        }
+        assert!(rx.try_recv().is_err(), "`d` 不回信");
+
+        // 连续无效输入：到 `MAX_UNKNOWN_INPUTS` 才 fail-safe 拒绝（与经典同一常量）
+        let (job, mut rx) = approval_job();
+        app.begin_approval(job);
+        for _ in 0..MAX_UNKNOWN_INPUTS - 1 {
+            app.on_bytes(b"?");
+            assert!(rx.try_recv().is_err(), "没到上限不拒绝");
+            assert_eq!(app.view(&facts).input.lines[0], "choice> ", "还在审批态");
+        }
+        app.on_bytes(b"?");
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ApprovalDecision::Reject),
+            "{MAX_UNKNOWN_INPUTS} 次无效输入"
+        );
+        assert_eq!(app.view(&facts).input.lines[0], "❯ ");
+
+        // EOF（`Ctrl+D`）＝ Reject（fail-safe）
+        let (job, mut rx) = approval_job();
+        app.begin_approval(job);
+        assert_eq!(app.approval_key(Key::CtrlD), None);
+        assert_eq!(rx.try_recv(), Ok(ApprovalDecision::Reject));
+        assert_eq!(app.view(&facts).input.lines[0], "❯ ");
+    }
+
+    /// 审批按键绝不落进编辑器（裁定 3）：审批态喂 `"abc"`，`a` 照契约回信，同一批剩下的按键随
+    /// 审批结束一起丢掉（与「提交之后忽略剩余按键」同一条规则）；编辑器缓冲一个字符都不进，
+    /// 也没有任何提交/退出动作——审批按键与编辑器缓冲是两条路。
+    #[tokio::test]
+    async fn approval_key_does_not_reach_the_editor() {
+        let (mut app, _buffer) = app();
+        let (job, mut rx) = approval_job();
+        app.begin_approval(job);
+
+        let actions = app.on_bytes(b"abc");
+
+        assert_eq!(app.input.text(), "", "审批按键一个字符都不进编辑器缓冲");
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ApprovalDecision::AllowOnce),
+            "`a` 是审批键：照契约回信"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, super::Action::Submit(_) | super::Action::Exit)),
+            "审批态不产编辑器的动作：{actions:?}"
+        );
+        assert_eq!(app.view(&facts()).input.lines[0], "❯ ", "回到编辑器");
+        assert!(rx.try_recv().is_err(), "只有一次回信");
+
+        // 审批结束之后才轮到编辑器：`b`/`c` 这一次才进缓冲
+        assert_eq!(
+            app.on_bytes(b"bc"),
+            [super::Action::Redraw, super::Action::Redraw]
+        );
+        assert_eq!(app.input.text(), "bc");
+    }
+
+    /// 审批与任务 future 在同一个 `select!` 里推进（裁定 4：无「UI 等 UI」死锁）：请求到达 → 提示
+    /// 落进滚动区 → 输入态切到审批；`Ctrl+C` 的字节与 SIGINT 同义（裁定 3）：Reject + 取消本轮
+    /// 任务令牌。
+    #[tokio::test]
+    async fn drive_receives_approvals_and_ctrl_c_rejects_and_cancels_the_token() {
+        let (mut app, _buffer) = app();
+        let facts = facts();
+        let (handler, approvals) = TuiApproval::channel();
+        let (chunks_tx, chunks) = mpsc::unbounded_channel();
+        app.attach_approvals(approvals);
+        app.attach_chunks(chunks);
+
+        // 审批处理器在另一个任务上等回信（UI 一收下请求就会画进滚动区）
+        let deciding = tokio::spawn(async move { handler.decide(approval_request()).await });
+        let cancel = CancellationToken::new();
+        // 等审批态真的建立（第一轮 select 就会收下通道里那条请求）再送 `Ctrl+C` 的字节
+        let bytes = chunks_tx.clone();
+        let sender = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = bytes.send(InputChunk::Bytes(b"\x03".to_vec()));
+        });
+
+        let token = cancel.clone();
+        let outcome = app
+            .drive_headless(
+                &facts,
+                async move {
+                    cancel.cancelled().await;
+                    "cancelled"
+                },
+                Some(token),
+            )
+            .await;
+
+        sender.await.expect("送字节的任务应结束");
+        assert_eq!(outcome, "cancelled", "`Ctrl+C` 的字节取消了本轮令牌");
+        assert_eq!(
+            deciding.await.expect("审批任务应结束"),
+            ApprovalDecision::Reject
+        );
+        assert_eq!(
+            app.view(&facts).viewport,
+            prompt_lines(&approval_request()),
+            "请求被 UI 收下并画进滚动区（与 future 同一个 select，没有死锁）"
+        );
+        assert_eq!(app.view(&facts).input.lines[0], "❯ ", "回信后回编辑器");
     }
 }

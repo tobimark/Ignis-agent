@@ -9,6 +9,8 @@
 //! - [`input`]：编辑器输入态（复用 P2 的状态机与解码器，只多一条瞬时提示行）；
 //! - [`app`]：应用状态与两个循环的公共机件（[`app::TuiApp::on_bytes`] 出动作、
 //!   [`app::TuiApp::drive`] 在忙碌期驱动借用会话的 future）；
+//! - [`approval`]：通道式审批（[`approval::TuiApproval`] 把请求交给 UI 循环、按键由
+//!   [`app::TuiApp::approval_key`] 收）——提示文案与经典 REPL 同源（`crate::approval`）；
 //! - 本文件：可用性判定（[`tui_unavailable_reason`]）、降级 note（[`fallback_note`]）、帧用的
 //!   会话事实快照（[`refresh_facts`]）、提交分类（[`classify`]）与主循环（[`run`]）。
 //!
@@ -16,6 +18,7 @@
 //! 必改环境变量（`repl::run` 与 `tui::start` 各自把现场探好）。
 
 pub mod app;
+pub mod approval;
 pub mod capture;
 pub mod input;
 pub mod term;
