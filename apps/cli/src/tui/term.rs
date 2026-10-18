@@ -171,7 +171,7 @@ mod tests {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::sync::{Arc, Mutex};
 
-    use crate::editor::raw::RawMode;
+    use crate::editor::raw::{RawMode, serial_slot};
     use crate::tui::Size;
 
     use super::{TerminalGuard, install_panic_hook, probe_size};
@@ -285,6 +285,8 @@ mod tests {
     /// `Drop` 字节逐字、termios 逐字段复原。
     #[test]
     fn guard_enters_and_leaves_the_alt_screen_on_a_pty() {
+        // 真进一次 raw mode 就会写进程级的 `ACTIVE`：与 `editor::raw` 的用例共用同一条串行槽
+        let _serial = serial_slot();
         let (_master, slave) = open_pty();
         let slave_fd = slave.as_raw_fd();
         set_winsize(slave_fd, 100, 30);
@@ -349,6 +351,8 @@ mod tests {
     /// 之外，用户看到的 shell 会残留一半的终端状态。
     #[test]
     fn drop_leaves_the_alt_screen_before_restoring_raw_mode() {
+        // 同上：这条也真进 raw mode（进程级 `ACTIVE` 与 `editor::raw` 的用例共享）
+        let _serial = serial_slot();
         let (_master, slave) = open_pty();
         let slave_fd = slave.as_raw_fd();
         let echo = Arc::new(Mutex::new(Vec::new()));

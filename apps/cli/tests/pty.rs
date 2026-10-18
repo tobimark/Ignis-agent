@@ -528,9 +528,15 @@ fn pty_up_arrow_recalls_history_and_restores_the_draft() {
     pty.expect("❯ ");
     pty.send("第一次\r");
     pty.expect("● Done");
+    // 结束行写完 ≠ 编辑器已经接管：任务运行期间终端是 canonical（raw 只在读取区间里生效），这时
+    // 送进去的字节由行规范吃掉。等第一轮提交帧（`❯ 第一次`）之后出现的新提示符 = raw 已重新生效。
+    wait_for_prompt_after(&pty, "第一次");
 
     pty.send("第二次\r");
     wait_for_requests(&model, 2); // 第二次已经在模型侧留下请求
+    // 同上：请求到了模型 ≠ 这一轮已经跑完（终端可能还是 canonical），等第二次的提交帧之后的新
+    // 提示符再打字——固定时长在这里是赌「应答一定已经渲染完」，等 marker 才是等稳定态。
+    wait_for_prompt_after(&pty, "第二次");
 
     pty.send("草稿");
     pty.expect("❯ 草稿");

@@ -612,19 +612,41 @@ async fn missing_claude_binary_reports_a_clear_failure() {
 }
 
 /// 取消：杀整个进程组（后台 sleep 也逃不掉），收束成 `Done{Aborted}`，不能拖时间。
+///
+/// 取消点等的是**事件流自己**（到 5s 为止的有界轮询）：夹具把 `挂起前` 那一帧写进管道之后才算进了
+/// 挂起态，读到它再取消——原来那个固定 `sleep(300ms)` 是在赌「300ms 内夹具一定已经起了进程并吐完
+/// 前导事件」；负载下这个赌注会输，取消会抢在前导帧之前命中内核的 `select!` 取消分支，那一帧被
+/// 丢掉（事件断言随机失败）。
 #[tokio::test]
 async fn cancel_kills_the_process_group_and_reports_aborted() {
     let workspace = TempWorkspace::new("cancel");
     let runtime = ClaudeRuntime::with_command(fake_claude(), workspace.path(), None);
     let cancel = CancellationToken::new();
-    let trigger = cancel.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        trigger.cancel();
-    });
 
     let started = Instant::now();
-    let events = collect(&runtime, request("sys", "CANCEL_HANG", 60), cancel).await;
+    let mut stream = runtime
+        .run(request("sys", "CANCEL_HANG", 60), cancel.clone())
+        .await;
+    let mut events = Vec::new();
+    loop {
+        let event = timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("等待夹具的前导事件超时（5s）")
+            .expect("挂起前应当先送到一帧文本");
+        let lead_in = event
+            == RuntimeEvent::TextDelta {
+                text: "挂起前".into(),
+            };
+        events.push(event);
+        if lead_in {
+            break;
+        }
+    }
+    // 挂起态已就位（前导帧已经在事件流里）：此刻取消才不会把还没读出来的那一帧连带丢掉
+    cancel.cancel();
+    while let Some(event) = stream.next().await {
+        events.push(event);
+    }
     let elapsed = started.elapsed();
 
     assert_eq!(

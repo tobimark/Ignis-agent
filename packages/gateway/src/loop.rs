@@ -1177,7 +1177,13 @@ mod tests {
             !env.runs(&watch).is_empty()
         })
         .await;
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // 有界轮询到稳定态：watch 跨过完整间隔的第二轮也跑到了（调度确实在按 1s 节拍醒），期间
+        // 「永不到期」的那一条一行都没落——把原来的固定 `sleep(1500ms)` 换成到 deadline 的轮询：
+        // 负载下那个固定窗口既可能白等，也可能短到还没跨过一个间隔。断言逐字不变。
+        wait_for(Duration::from_secs(5), "watch 第二轮运行", || {
+            env.runs(&watch).len() >= 2
+        })
+        .await;
         assert!(env.runs(&never).is_empty(), "永不到期的 job 不该运行");
 
         stop_loop(cancel, running).await;

@@ -1052,7 +1052,7 @@ mod tests {
     };
     use crate::editor::history::History;
     use crate::editor::keys::Key;
-    use crate::editor::raw::RawMode;
+    use crate::editor::raw::{RawMode, serial_slot};
     use crate::editor::reader::INVALID_WARNING;
     use crate::tui::Size;
     use crate::tui::approval::{ApprovalJob, TuiApproval};
@@ -1466,7 +1466,11 @@ mod tests {
 
     /// 忙碌子循环：每 tick 排空捕获并重绘；future 结束时把最后一半行落地。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 刻意跨 await 持槽：测试整段都要与 editor::raw / tui::term 的用例串行
     async fn drive_drains_the_capture_and_redraws_while_the_task_runs() {
+        // 真进一次 raw mode（守卫走 `enter_guard`）就会写进程级的 `ACTIVE`：与 `editor::raw` /
+        // `tui::term` 的用例共用同一条串行槽
+        let _serial = serial_slot();
         let (_master, slave) = open_pty();
         let slave_fd = slave.as_raw_fd();
         set_winsize(slave_fd, 100, 30);
@@ -1511,7 +1515,9 @@ mod tests {
 
     /// SIGINT 不结束忙碌子循环：取消令牌交回 TUI 持有，future 收令返回、`drive` 正常收尾。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 同上：串行槽刻意持到测试结束
     async fn drive_sigint_does_not_end_the_busy_loop() {
+        let _serial = serial_slot();
         let (_master, slave) = open_pty();
         let slave_fd = slave.as_raw_fd();
         let recorder = Recorder::default();

@@ -583,6 +583,49 @@ mod tests {
         }
     }
 
+    /// 锁相关等待点（拿到锁 / 读到终态）共用的 deadline：抖动只改等待方式，门槛与断言不动。
+    const LOCK_WAIT: Duration = Duration::from_secs(5);
+
+    /// 到 deadline 为止轮询：拿到 pidfile 上的独占锁为止。
+    ///
+    /// 「能不能拿到锁」在这个测试二进制里是个等待点：同进程并行跑的用例会 spawn 子进程，`fork`
+    /// 之后、`exec` 之前子进程会短暂继承本进程打开着的 fd——`lock_is_free` 探针刚放掉的锁可能还
+    /// 没在子进程里被 `O_CLOEXEC` 关掉，这时拿锁会瞬时拿到 `EWOULDBLOCK`（P2/P4 各记录过一次）。
+    fn wait_for_lock(file: &File) {
+        let deadline = Instant::now() + LOCK_WAIT;
+        loop {
+            match flock_exclusive(file) {
+                Ok(()) => return,
+                Err(error) => assert!(
+                    Instant::now() < deadline,
+                    "等待 pidfile 的独占锁超时（{}s）：{error}",
+                    LOCK_WAIT.as_secs()
+                ),
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    /// 到 deadline 为止轮询 `status` 读到 `want` 为止（`drop(holder)` 之后的重读）。
+    ///
+    /// 锁的释放与「下一次读到的状态」之间同样隔着一个等待点（同上：被 fork 出去的子进程可能还
+    /// 捏着继承来的那份 fd，锁要到它 `exec` 时才真正消失），故重读到终态再断言。
+    fn wait_for_status(home: &Path, want: &DaemonStatus) {
+        let deadline = Instant::now() + LOCK_WAIT;
+        loop {
+            let seen = status(home);
+            if seen == *want {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "等待状态 {want:?} 超时（{}s）：现在是 {seen:?}",
+                LOCK_WAIT.as_secs()
+            );
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
     /// 三态：没有 pidfile → `Stopped`；残留 pidfile（锁空闲）→ `StalePidfile`；
     /// 有人持锁 → `Running { pid }`。锁的争夺在同一个进程里换一个 fd 同样成立。
     #[test]
@@ -598,13 +641,15 @@ mod tests {
         fs::write(&path, format!("{}\n", std::process::id())).unwrap();
         assert_eq!(status(home.path()), DaemonStatus::StalePidfile);
 
-        // 有人持锁（模拟在跑的守护进程）：Running，pid 取自文件
+        // 有人持锁（模拟在跑的守护进程）：Running，pid 取自文件。
+        // 拿锁这一步是等待点（见 `wait_for_lock`）：探针刚放掉的锁可能还没从 fork 出去的子进程里
+        // 消失，有界轮询到拿到为止——断言逐字不变。
         let holder = OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
             .unwrap();
-        flock_exclusive(&holder).unwrap();
+        wait_for_lock(&holder);
         assert_eq!(
             status(home.path()),
             DaemonStatus::Running {
@@ -618,8 +663,10 @@ mod tests {
             "{error}"
         );
 
-        // 锁释放（守护进程退出）→ 回到 Stopped/Stale 判定
+        // 锁释放（守护进程退出）→ 回到 Stopped/Stale 判定：锁的去与下一次读之间也是等待点
+        // （被 fork 的子进程要到 exec 才交回继承来的 fd），有界轮询重读到终态再断言。
         drop(holder);
+        wait_for_status(home.path(), &DaemonStatus::StalePidfile);
         assert_eq!(status(home.path()), DaemonStatus::StalePidfile);
         fs::remove_file(&path).unwrap();
         assert_eq!(status(home.path()), DaemonStatus::Stopped);

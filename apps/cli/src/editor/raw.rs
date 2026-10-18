@@ -151,6 +151,19 @@ fn apply_raw(t: &mut libc::termios) {
     t.c_cc[libc::VTIME] = 0;
 }
 
+/// 触碰进程级 `ACTIVE` 的用例共用的串行槽（`editor::raw` 与 `tui::term` 的用例在同一测试二进制里
+/// 共享这条记录，默认并行会互相清掉对方的现场）。只给 `#[cfg(test)]` 用，不进生产路径。
+///
+/// 语义与 `restore_terminal` 的「锁中毒只做减法」不同：这里锁中毒（前一个用例 panic 过）也照常
+/// 放行，不让一次失败级联成第二个 panic。
+#[cfg(test)]
+pub(crate) fn serial_slot() -> std::sync::MutexGuard<'static, ()> {
+    static SLOT_LOCK: Mutex<()> = Mutex::new(());
+    SLOT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// 往 `fd` 写一段字节，best-effort：调用方不靠它的成败判断任何事。
 fn write_bytes(fd: i32, bytes: &[u8]) {
     // SAFETY: 指针与长度都来自同一块 `bytes`，`write` 只读这段内存，不持有它。
@@ -161,20 +174,8 @@ fn write_bytes(fd: i32, bytes: &[u8]) {
 mod tests {
     use std::ffi::OsStr;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-    use std::sync::{Mutex, MutexGuard};
 
-    use super::{RawMode, apply_raw};
-
-    /// 触碰进程级记录的用例必须串行：`ACTIVE` 是进程全局的，而同一个测试二进制里的用例默认
-    /// 并行跑——并行会让「把守卫 forget 掉再 restore」这类用例的现场被别的用例覆盖。
-    static SLOT_LOCK: Mutex<()> = Mutex::new(());
-
-    /// 拿串行锁；锁中毒（前一个用例 panic 过）也继续，不让失败级联成第二个 panic。
-    fn slot_guard() -> MutexGuard<'static, ()> {
-        SLOT_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
+    use super::{RawMode, apply_raw, serial_slot};
 
     /// 一份「典型」终端 termios：行规范、回显、ISIG、ICRNL、IXON、OPOST 都置位，
     /// `VMIN`/`VTIME` 给非默认值（好看出 `apply_raw` 是否真的动过它们）。
@@ -300,7 +301,7 @@ mod tests {
 
     #[test]
     fn enable_on_then_drop_restores_the_original_termios() {
-        let _serial = slot_guard();
+        let _serial = serial_slot();
         let (master, slave) = open_pty();
         let slave_fd = slave.as_raw_fd();
         let baseline = get_termios(slave_fd);
@@ -359,7 +360,7 @@ mod tests {
     /// 按进程记录把终端还原——用户回到 shell 不会留在 raw mode。
     #[test]
     fn restore_terminal_puts_the_tty_back_when_the_guard_is_still_held() {
-        let _serial = slot_guard();
+        let _serial = serial_slot();
         let (_master, slave) = open_pty();
         let slave_fd = slave.as_raw_fd();
         let baseline = get_termios(slave_fd);
@@ -391,7 +392,7 @@ mod tests {
     /// `restore_terminal` 自己；守卫随后析构并清掉记录，再调一次还原就该是零字节。
     #[test]
     fn restore_terminal_closes_bracketed_paste_on_a_pty() {
-        let _serial = slot_guard();
+        let _serial = serial_slot();
         let (master, slave) = open_pty();
         let slave_fd = slave.as_raw_fd();
         let baseline = get_termios(slave_fd);
