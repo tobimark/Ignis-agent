@@ -104,6 +104,9 @@ pub enum InputMode {
         reply: Option<oneshot::Sender<ApprovalDecision>>,
         /// 连续无效输入的计数（到 `MAX_UNKNOWN_INPUTS` 即 fail-safe 拒绝）。
         unknown: usize,
+        /// 进入审批时记下的忙碌态：回信后恢复它——审批叠在忙碌期上（任务的 future 还在跑），
+        /// 回信**不是**回编辑器的理由。
+        resume: Busy,
     },
 }
 
@@ -200,7 +203,7 @@ impl TuiApp {
         for key in keys {
             redraw |= self.approval_key(key).is_some();
             if !matches!(self.mode, InputMode::Approval { .. }) {
-                // 回信即结束审批：界面回到编辑器（要重绘一帧），剩下的按键随这一批丢掉
+                // 回信即结束审批：界面回到审批记下的忙碌态（要重绘一帧），剩下的按键随这一批丢掉
                 redraw = true;
                 break;
             }
@@ -258,24 +261,31 @@ impl TuiApp {
     }
 
     /// 收到一次审批请求：共用文案（[`prompt_lines`]，与经典 REPL 同一份）4 行逐字进滚动区
-    /// ——3 行输入区放不下 4 行提示 + `choice> `，正文由滚动区承担；输入态切到审批。
+    /// ——3 行输入区放不下 4 行提示 + `choice> `，正文由滚动区承担；输入态切到审批，并记下
+    /// **当时的忙碌态**（[`TuiApp::busy`]）：回信之后恢复到它，而不是回到编辑器——审批只在任务
+    /// 的 future 推进期间到达，任务还在跑，输入必须继续禁用。
     ///
     /// 返回落地的那些行（调用方据此重绘一帧；滚动区已经写好了）。工具调用是串行的，同一时刻
     /// 只会有一个待审批请求；真撞上第二个时前一个随替换丢掉——它的回信端掉落，那次审批因此
     /// fail-safe 拒绝（与 [`crate::tui::approval::TuiApproval`] 同一口径）。
     pub fn begin_approval(&mut self, job: ApprovalJob) -> Vec<String> {
+        // 审批叠在忙碌期上：记下当时的忙碌态。真从空闲态被驱动（只在用例里可能）时按任务轮次
+        // 恢复——唯一会在运行中输入的那一档，也保证这里不 panic。
+        let resume = self.busy().unwrap_or(Busy::Task);
         let lines = prompt_lines(&job.request);
         self.push_lines(lines.clone());
         self.mode = InputMode::Approval {
             request: job.request,
             reply: Some(job.reply),
             unknown: 0,
+            resume,
         };
         lines
     }
 
     /// 审批按键（`a`/`s`/`r`/`d`，大小写与空白归一——与经典 [`parse_choice`] 同一份）：`a`/`s`/`r`
-    /// 回信并回到编辑器；`d` 把参数明细（与经典同一份美化 JSON）逐行打进滚动区后继续等；连续
+    /// 回信并恢复审批开始时记下的忙碌态（**不是**编辑器：任务的 future 还在跑）；`d` 把参数明细
+    /// （与经典同一份美化 JSON）逐行打进滚动区后继续等；连续
     /// `MAX_UNKNOWN_INPUTS` 次无效输入或 EOF（`Ctrl+D`）＝ [`ApprovalDecision::Reject`]（fail-safe）；
     /// `Ctrl+C` 的字节与 SIGINT 同义：拒绝并取消本轮任务令牌。
     ///
@@ -321,27 +331,34 @@ impl TuiApp {
         }
     }
 
-    /// 收下审批态：回信（回信端已经没了就算了）并回到编辑器。
+    /// 收下审批态：回信（回信端已经没了就算了）并恢复审批开始时记下的忙碌态——审批叠在忙碌期
+    /// 上（任务的 future 还在跑），**绝不**直接回编辑器；回编辑器只有 [`TuiApp::end_busy`] 一条路。
     fn end_approval(&mut self, decision: ApprovalDecision) {
-        // 用编辑器态换出审批态：请求与无效输入计数随替换一起丢掉
-        if let InputMode::Approval { reply, .. } =
-            std::mem::replace(&mut self.mode, InputMode::Editor)
-            && let Some(reply) = reply
-        {
+        let InputMode::Approval { reply, resume, .. } = &mut self.mode else {
+            return; // 不在审批态：什么都不做（只有审批按键会走到这里）
+        };
+        // 先把回信口与恢复态取出来：请求与无效输入计数随换态一起丢掉
+        let reply = reply.take();
+        let resume = *resume;
+        self.mode = InputMode::Busy(resume);
+        if let Some(reply) = reply {
             let _ = reply.send(decision);
         }
     }
 
-    /// 离开忙碌态：回到编辑器（缓冲是空的，光标在段首）。
+    /// 离开忙碌态：回到编辑器（缓冲是空的，光标在段首）——这是回编辑器的**唯一**一条路
+    /// （审批回信只回到它记下的忙碌态，见 [`TuiApp::end_approval`]）。
     pub fn end_busy(&mut self) {
         self.mode = InputMode::Editor;
     }
 
-    /// 当前是不是忙碌态（`None` = 空闲；审批自成一态，不算忙碌）。
+    /// 当前是不是忙碌态（`None` = 空闲）：审批叠在忙碌期上，返回它记下的那一档（`resume`）——
+    /// 回信前后对调用方都是「还在忙」。
     pub fn busy(&self) -> Option<Busy> {
         match self.mode {
             InputMode::Busy(busy) => Some(busy),
-            InputMode::Editor | InputMode::Approval { .. } => None,
+            InputMode::Approval { resume, .. } => Some(resume),
+            InputMode::Editor => None,
         }
     }
 
@@ -631,7 +648,7 @@ async fn next_approval(
 
 /// 审批态一次按键的语义（纯函数：归一与经典 [`parse_choice`] 同一份）。
 enum ApprovalStep {
-    /// 回信并回到编辑器。
+    /// 回信并恢复审批开始时记下的忙碌态（不是编辑器）。
     Reply(ApprovalDecision),
     /// `d`：参数明细进滚动区，继续等。
     Details,
@@ -1050,11 +1067,20 @@ mod tests {
         assert!(rx.try_recv().is_err(), "还没按键：没有回信");
         assert_eq!(app.view(&facts).status, status_line(&facts, BUSY_HINT));
 
-        // `a`：回信 AllowOnce、输入态回编辑器、编辑器缓冲一个字符都不进
+        // `a`：回信 AllowOnce、输入态回到审批开始时记下的忙碌态（**不是**编辑器——任务的 future
+        // 还在跑）、编辑器缓冲一个字符都不进
         assert_eq!(app.on_bytes(b"a"), [super::Action::Redraw]);
         assert_eq!(rx.try_recv(), Ok(ApprovalDecision::AllowOnce));
-        assert_eq!(app.busy(), None, "审批不是忙碌态");
-        assert_eq!(app.view(&facts).input.lines[0], "❯ ", "回信即回编辑器");
+        assert_eq!(
+            app.busy(),
+            Some(Busy::Task),
+            "回信后回到记下的忙碌态（这条用例没走 `begin_busy`，按任务轮次兜底）"
+        );
+        assert_eq!(
+            app.view(&facts).input.lines[0],
+            "working…",
+            "回信即回忙碌态，不是回编辑器"
+        );
         assert_eq!(app.input.text(), "");
 
         // `s`/`r`（大写也归一）：每次各起一次审批
@@ -1066,7 +1092,7 @@ mod tests {
             app.begin_approval(job);
             app.on_bytes(key.as_bytes());
             assert_eq!(rx.try_recv(), Ok(want), "{key}");
-            assert_eq!(app.view(&facts).input.lines[0], "❯ ", "{key}");
+            assert_eq!(app.view(&facts).input.lines[0], "working…", "{key}");
         }
 
         // `d`：参数明细（美化 JSON 逐行）落进滚动区，提示保持、继续等回信
@@ -1106,14 +1132,14 @@ mod tests {
             Ok(ApprovalDecision::Reject),
             "{MAX_UNKNOWN_INPUTS} 次无效输入"
         );
-        assert_eq!(app.view(&facts).input.lines[0], "❯ ");
+        assert_eq!(app.view(&facts).input.lines[0], "working…");
 
         // EOF（`Ctrl+D`）＝ Reject（fail-safe）
         let (job, mut rx) = approval_job();
         app.begin_approval(job);
         assert_eq!(app.approval_key(Key::CtrlD), None);
         assert_eq!(rx.try_recv(), Ok(ApprovalDecision::Reject));
-        assert_eq!(app.view(&facts).input.lines[0], "❯ ");
+        assert_eq!(app.view(&facts).input.lines[0], "working…");
     }
 
     /// 审批按键绝不落进编辑器（裁定 3）：审批态喂 `"abc"`，`a` 照契约回信，同一批剩下的按键随
@@ -1139,10 +1165,16 @@ mod tests {
                 .any(|action| matches!(action, super::Action::Submit(_) | super::Action::Exit)),
             "审批态不产编辑器的动作：{actions:?}"
         );
-        assert_eq!(app.view(&facts()).input.lines[0], "❯ ", "回到编辑器");
+        assert_eq!(
+            app.view(&facts()).input.lines[0],
+            "working…",
+            "回信后回到忙碌态：编辑器还没轮到"
+        );
         assert!(rx.try_recv().is_err(), "只有一次回信");
 
-        // 审批结束之后才轮到编辑器：`b`/`c` 这一次才进缓冲
+        // 编辑器要等 `end_busy()`（任务的 future 结束）才轮到：`b`/`c` 这一次才进缓冲
+        app.end_busy();
+        assert_eq!(app.view(&facts()).input.lines[0], "❯ ");
         assert_eq!(
             app.on_bytes(b"bc"),
             [super::Action::Redraw, super::Action::Redraw]
@@ -1195,6 +1227,121 @@ mod tests {
             prompt_lines(&approval_request()),
             "请求被 UI 收下并画进滚动区（与 future 同一个 select，没有死锁）"
         );
-        assert_eq!(app.view(&facts).input.lines[0], "❯ ", "回信后回编辑器");
+        assert_eq!(
+            app.view(&facts).input.lines[0],
+            "working…",
+            "回信后回忙碌态（任务的 future 还在跑），不是编辑器"
+        );
+    }
+
+    /// 审批回信之后任务 future 还在跑（T3 的单任务策略）：`end_approval` 恢复的是审批开始时记下的
+    /// 忙碌态，**不是**编辑器——输入区首行仍是 `working…`（既没有 `❯ ` 提示词、也没有
+    /// `PgUp/PgDn scroll`）、喂键产不出动作、编辑器缓冲一个字符都不进、`busy()` 也是 `Some(resume)`；
+    /// 只有 `end_busy()`（future 结束）才回编辑器、按键才重新进缓冲。
+    #[tokio::test]
+    async fn approval_reply_restores_the_busy_state_instead_of_the_editor() {
+        let (mut app, _buffer) = app();
+        let facts = facts();
+
+        // 三档忙碌态各起一次审批：回信恢复的就是各档自己（不是写死某一档）
+        for busy in [Busy::Task, Busy::Compact, Busy::Learn] {
+            app.begin_busy(busy);
+            let (job, mut rx) = approval_job();
+            app.begin_approval(job);
+            assert_eq!(app.busy(), Some(busy), "审批叠在忙碌期上：忙碌态照旧");
+            assert_eq!(
+                app.view(&facts).input.lines[0],
+                "choice> ",
+                "审批态还是经典提示词"
+            );
+
+            assert_eq!(app.on_bytes(b"a"), [super::Action::Redraw]);
+            assert_eq!(rx.try_recv(), Ok(ApprovalDecision::AllowOnce));
+            assert_eq!(app.busy(), Some(busy), "回信后恢复记下的忙碌态");
+            let block = app.view(&facts).input;
+            assert_eq!(block.lines[0], "working…", "输入区首行是忙碌行，不是 `❯ `");
+            assert_eq!(block.lines[2], BUSY_HINT, "提示行也回到忙碌那一句");
+            assert_eq!(block.cursor, None, "忙碌期藏起光标");
+            assert_eq!(
+                app.view(&facts).status,
+                status_line(&facts, BUSY_HINT),
+                "底部状态行也是忙碌那一句（不是 `PgUp/PgDn scroll`）"
+            );
+        }
+
+        // 任务还在跑：`x\r` 一个动作都产不出来（更没有 `Submit`），编辑器缓冲一个字符都不进
+        let actions = app.on_bytes(b"x\r");
+        assert!(actions.is_empty(), "忙碌期输入禁用：{actions:?}");
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, super::Action::Submit(_))),
+            "忙碌期产不出 `Submit`：{actions:?}"
+        );
+        assert_eq!(app.input.text(), "", "缓冲一个字符都不进");
+
+        // 只有 `end_busy()`（任务的 future 结束）才回编辑器：这之后按键才进缓冲、Enter 才提交
+        app.end_busy();
+        assert_eq!(app.busy(), None);
+        assert_eq!(app.view(&facts).input.lines[0], "❯ ");
+        assert_eq!(
+            app.on_bytes(b"x\r"),
+            [
+                super::Action::Redraw,
+                super::Action::Submit("x".to_string())
+            ]
+        );
+        assert_eq!(app.input.text(), "", "提交后缓冲清空");
+    }
+
+    /// 循环级：审批在任务 future 推进期间回信之后，界面必须留在忙碌态——回信键那一批之后紧跟的
+    /// 编辑器按键（`x`）也不进缓冲，要等 `end_busy()`（future 结束，调用方在 `drive` 之后调）才回
+    /// 编辑器。审批态在进循环前就建立（与生产同序：`begin_busy` → 收下请求 → `drive`），两条输入
+    /// 块的先后由通道 FIFO 决定——没有时序竞态。
+    #[tokio::test]
+    async fn approval_reply_inside_the_loop_stays_busy_until_the_future_ends() {
+        let (mut app, _buffer) = app();
+        let facts = facts();
+        let (chunks_tx, chunks) = mpsc::unbounded_channel();
+        app.attach_chunks(chunks);
+        app.begin_busy(Busy::Task);
+        let (job, mut rx) = approval_job();
+        app.begin_approval(job);
+
+        let bytes = chunks_tx.clone();
+        let outcome = app
+            .drive_headless(
+                &facts,
+                async move {
+                    // 回信键先进审批面：`a` → AllowOnce、界面回忙碌态
+                    let _ = bytes.send(InputChunk::Bytes(b"a".to_vec()));
+                    // 紧跟着的编辑器按键（同一轮任务里用户敲的）：忙碌期必须一个字符都不收
+                    let _ = bytes.send(InputChunk::Bytes(b"x".to_vec()));
+                    // 让出到下一次心跳之后：两条输入块都排到（通道 FIFO），future 还在跑
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    "done"
+                },
+                None,
+            )
+            .await;
+
+        assert_eq!(outcome, "done");
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ApprovalDecision::AllowOnce),
+            "`a` 在循环里回信"
+        );
+        assert_eq!(app.busy(), Some(Busy::Task), "future 结束前一直在忙碌态");
+        assert_eq!(
+            app.view(&facts).input.lines[0],
+            "working…",
+            "输入区首行还是忙碌行（不是 `❯ `）"
+        );
+        assert_eq!(app.input.text(), "", "回信之后的按键一个字符都不进缓冲");
+
+        // 只有 `end_busy()`（future 结束）回编辑器
+        app.end_busy();
+        assert_eq!(app.busy(), None);
+        assert_eq!(app.view(&facts).input.lines[0], "❯ ");
     }
 }
