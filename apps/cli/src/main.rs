@@ -7,6 +7,10 @@ pub mod editor;
 pub mod input;
 pub mod render;
 pub mod repl;
+// TUI（Beta）整块按平台门控：信号流、termios 与 `TIOCGWINSZ` 都是 unix 的；非 unix 上
+// `--tui` 由入口层按「不可用」处理，走同一条降级 note + 经典路径。
+#[cfg(unix)]
+pub mod tui;
 
 use std::process::ExitCode;
 

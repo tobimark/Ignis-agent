@@ -37,6 +37,58 @@ pub fn display_width(text: &str) -> usize {
     text.chars().map(char_width).sum()
 }
 
+/// ANSI 转义序列的引子（`\x1b[` …）。
+const ESC_CHAR: char = '\x1b';
+
+/// 按**显示宽度**截断：返回最长的、显示宽度 ≤ `width` 的前缀。
+///
+/// - ANSI 转义序列（`\x1b[` + 参数/中间字节 + 终结字节 0x40..=0x7E）不计宽且原样保留在结果里
+///   （帧里的定位/着色序列不会把行宽算爆）；
+/// - 宽字符不会被切开：放不下就停在它前面，**宁少一列，不多占一列**；
+/// - 控制字符与 [`char_width`] 同口径（0 列），因此 `\n`、`\t` 不参与宽度、也不会被截断位置跳过；
+/// - 不完整的转义序列（认不出终结字节）在引子处收住：结果里不会出现半条序列。
+///
+/// 返回的是 `&str` 前缀（借用调用方的字符串，不分配）：帧合成的热路径按片段拼帧时不必复制。
+pub fn truncate_to_width(text: &str, width: usize) -> &str {
+    let mut used = 0usize;
+    let mut index = 0usize;
+    while let Some(c) = text[index..].chars().next() {
+        if c == ESC_CHAR {
+            let Some(next) = csi_end(text, index) else {
+                break;
+            };
+            index = next;
+            continue;
+        }
+        let columns = char_width(c);
+        if used + columns > width {
+            break;
+        }
+        used += columns;
+        index += c.len_utf8();
+    }
+    &text[..index]
+}
+
+/// `text[start..]` 开头的 CSI 之后的字节下标；不是完整的 CSI 就给 `None`（调用方在引子处收住）。
+fn csi_end(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if bytes.get(start + 1) != Some(&b'[') {
+        return None; // 只认 CSI：帧里出现的序列都是它（OSC 从不进帧）
+    }
+    let mut index = start + 2;
+    while let Some(&byte) = bytes.get(index) {
+        if (0x40..=0x7e).contains(&byte) {
+            return Some(index + 1); // 终结字节：序列到此为止
+        }
+        if !(0x20..=0x3f).contains(&byte) {
+            return None; // 破序列：不当作 ANSI，宁少不多
+        }
+        index += 1;
+    }
+    None
+}
+
 /// 按显示宽度折行。
 ///
 /// 规则（`width` 是每行的目标显示宽度）：
@@ -186,7 +238,7 @@ impl Wrapper {
 
 #[cfg(test)]
 mod tests {
-    use super::{char_width, display_width, wrap};
+    use super::{char_width, display_width, truncate_to_width, wrap};
 
     /// 去掉全部空白后的字符序列：折行不变量锚在它上面（不丢、不增、不重排）。
     fn non_whitespace(text: &str) -> Vec<char> {
@@ -290,6 +342,66 @@ mod tests {
                     assert!(
                         display_width(line) <= width.max(2),
                         "{text:?} @ width={width} → {lines:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 帧合成的截断口径：按显示宽度取最长前缀，ANSI 不计宽、宽字符不切开。
+    #[test]
+    fn truncate_to_width_never_splits_a_wide_char_or_counts_ansi() {
+        // 宽字符不许被切开：放不下就停在它前面（宁少一列，不多占一列）。
+        assert_eq!(truncate_to_width("你好abc", 3), "你");
+        assert_eq!(truncate_to_width("你好", 2), "你");
+        assert_eq!(truncate_to_width("a你b", 3), "a你");
+        assert_eq!(truncate_to_width("abc", 0), "");
+        // ANSI 序列不计宽、原样保留在结果里。
+        assert_eq!(
+            truncate_to_width("\u{1b}[2mabcdef\u{1b}[0m", 3),
+            "\u{1b}[2mabc"
+        );
+        assert_eq!(
+            truncate_to_width("\u{1b}[2mabcdef\u{1b}[0m", 6),
+            "\u{1b}[2mabcdef\u{1b}[0m",
+            "够宽时连结尾的 reset 一起原样返回"
+        );
+        // 够宽 / 空串 / 不折行宽度：原样返回。
+        assert_eq!(truncate_to_width("你好", 4), "你好");
+        assert_eq!(truncate_to_width("你好", 3), "你");
+        assert_eq!(truncate_to_width("", 5), "");
+        assert_eq!(truncate_to_width("你好", usize::MAX), "你好");
+        // 与 `char_width` 同口径：控制字符不占列。
+        assert_eq!(truncate_to_width("a\nb", 2), "a\nb");
+        // 不完整的转义序列在引子处收住：结果里不会出现半条序列。
+        assert_eq!(truncate_to_width("ab\u{1b}[", 9), "ab");
+        assert_eq!(truncate_to_width("ab\u{1b}", 9), "ab");
+
+        // 性质（纯文本语料）：结果一定是前缀、显示宽度不超上限，且截断点是「再放一个字符就超」。
+        let corpus = [
+            "你好abc",
+            "a你b",
+            "abc",
+            "你好世界",
+            "mixed 中 English",
+            "一行\n两行",
+            "",
+        ];
+        for text in corpus {
+            for width in 0..=10 {
+                let cut = truncate_to_width(text, width);
+                assert!(
+                    text.starts_with(cut),
+                    "{text:?} @ width={width} → {cut:?} 必须是前缀"
+                );
+                assert!(
+                    display_width(cut) <= width,
+                    "{text:?} @ width={width} → {cut:?} 超出上限"
+                );
+                if let Some(next) = text[cut.len()..].chars().next() {
+                    assert!(
+                        char_width(next) >= 1 && display_width(cut) + char_width(next) > width,
+                        "{text:?} @ width={width} → {cut:?} 不是最长前缀（{next:?} 还放得下）"
                     );
                 }
             }

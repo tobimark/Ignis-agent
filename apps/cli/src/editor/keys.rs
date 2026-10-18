@@ -132,6 +132,23 @@ impl Decoder {
         self.pasting
     }
 
+    /// 吃掉「一个孤零零的 ESC」并报 `true`（其余情况返回 `false` 且缓存原样不动）。
+    ///
+    /// TUI 每 tick 调它，把用户按的 Esc 从「可能是半条转义序列」里解救出来（Esc 消歧窗口 = 一个
+    /// tick）：裸 `ESC` 本来会一直等在 `pending` 里凑后续字节，这里把它当按键交付。两种情形**不**
+    /// 动缓存：
+    /// - 半条 CSI（`\x1b[`）：可能是方向键的前半截，得等终结字节；
+    /// - 粘贴区间里的 `\x1b`：可能是结束标记 `\x1b[201~` 的开头，吃掉就再也退不出粘贴了。
+    ///
+    /// 经典编辑器不调它，既有解码行为零变化。
+    pub fn take_lone_escape(&mut self) -> bool {
+        if self.pasting || self.pending.len() != 1 || self.pending[0] != ESC {
+            return false;
+        }
+        self.pending.clear();
+        true
+    }
+
     /// 从 `pending[from..]` 尝试解出一个按键；解不出来说明字节还不够，等下次 `feed`。
     fn step(&mut self, from: usize) -> Step {
         if from >= self.pending.len() {
@@ -749,5 +766,58 @@ mod tests {
             vec![Key::Char('a')],
             "越界丢弃之后缓存也干净"
         );
+    }
+
+    /// Esc 消歧：TUI 每 tick 调 [`Decoder::take_lone_escape`]，把用户按的 Esc 从「可能是半条转义
+    /// 序列」里解救出来；经典编辑器不调它，既有解码行为零变化。
+    #[test]
+    fn take_lone_escape_only_eats_a_lone_escape() {
+        // 孤零零的 ESC：吃掉并报 true，缓存随之清空。
+        let mut decoder = Decoder::new();
+        assert!(
+            decoder.feed(b"\x1b").is_empty(),
+            "裸 ESC 留在缓存里等后续字节"
+        );
+        assert!(decoder.take_lone_escape(), "孤零零的 ESC 被吃掉");
+        assert!(!decoder.take_lone_escape(), "吃过了：第二次返回 false");
+        assert_eq!(
+            decoder.feed(b"[A"),
+            vec![Key::Char('['), Key::Char('A')],
+            "缓存已清空（R7 的已知边界：被 tick 吃掉的 ESC 带走了半条序列的引子）"
+        );
+
+        // 半条 CSI 不是孤 ESC：缓存原样不动，拼上终结字节仍解成 Up。
+        let mut decoder = Decoder::new();
+        assert!(decoder.feed(b"\x1b[").is_empty(), "只有引子的 CSI 先留着");
+        assert!(
+            !decoder.take_lone_escape(),
+            "半条 CSI 不许被当成裸 ESC 吃掉"
+        );
+        assert_eq!(decoder.feed(b"A"), vec![Key::Up], "拼上终结字节仍是 Up");
+
+        // 缓存为空 / 别的尾巴：一律不动缓存。
+        let mut decoder = Decoder::new();
+        assert!(!decoder.take_lone_escape(), "空缓存无事发生");
+        assert!(decoder.feed(b"\x1b[2").is_empty(), "半条 CSI 参数先留着");
+        assert!(!decoder.take_lone_escape(), "半条 CSI 参数不许吃");
+        assert_eq!(
+            decoder.feed(b"00~"),
+            vec![Key::PasteStart],
+            "缓存原样：拼上后仍是 PasteStart"
+        );
+
+        // 粘贴区间里的裸 ESC 可能是结束标记（`\x1b[201~`）的开头：不许吃。
+        let mut decoder = Decoder::new();
+        assert_eq!(
+            decoder.feed(b"\x1b[200~x\x1b"),
+            vec![Key::PasteStart, Key::Char('x')],
+            "粘贴区间里的裸 ESC 是结束标记的前缀，留在缓存里"
+        );
+        assert!(!decoder.take_lone_escape(), "粘贴区间里不许吃 ESC");
+        assert_eq!(decoder.feed(b"[201~"), vec![Key::PasteEnd]);
+
+        // 完整序列与「半条序列」的既有口径不受影响。
+        assert_eq!(decode(b"\x1b[A"), vec![Key::Up]);
+        assert!(decode(b"\x1b").is_empty(), "裸 ESC 单独喂仍是等后续字节");
     }
 }
