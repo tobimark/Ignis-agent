@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
 # ============================================================================
-# harness/acceptance.sh — Ignis v0.1 手动量化验收（真实模型；不进 CI）
+# harness/acceptance.sh — Ignis 手动量化验收（真实模型；不进 CI）
 #
 # demo.md §七定了三条内部验收门槛：
 #   1. 三个演示场景各连续成功 3 次（`demos 3`）
 #   2. 20 次常见任务端到端成功率 ≥80%（`tasks 20`，清单在 harness/tasks.md）
 #   3. 10 次服务重启不出现任务重复执行或记录丢失（`restarts 10`）
 # 本脚本是这三条的执行器：连真实 OpenAI 兼容端点、跑真二进制、核对真数据库行与真 JSONL 日志。
+#
+# v0.2 **沿用这三条门槛**（定义、判定与退出码口径一字不变，没有新增门槛、没有放宽成功率）；
+# v0.2 的两条新指标不进本脚本，落在自动化用例上（离线、hermetic，随 `cargo test` 跑）：
+#   - 会话启停 10 次、恢复后有效历史逐条相等 → `apps/cli/tests/sessions.rs`
+#     （`session_restore_keeps_the_canonical_history_across_ten_cycles`）；
+#   - 流式 100 次（随机分片不丢不重） → `apps/cli/src/render/markdown.rs` 与
+#     `packages/runtime/src/think.rs` 的属性测试（各 100 轮随机切分）。
+# 验收的唯一事实来源是 `docs/acceptance.md` 的「v0.2 验收」段：本脚本的真机结果由它记录。
 #
 # 设计约束：
 #   - 手动、可选、不进 CI（CI 不依赖网络与模型）；
