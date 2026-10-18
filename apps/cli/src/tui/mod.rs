@@ -11,6 +11,8 @@
 //!   [`app::TuiApp::drive`] 在忙碌期驱动借用会话的 future）；
 //! - [`approval`]：通道式审批（[`approval::TuiApproval`] 把请求交给 UI 循环、按键由
 //!   [`app::TuiApp::approval_key`] 收）——提示文案与经典 REPL 同源（`crate::approval`）；
+//! - [`confirm`]：通道式确认面（[`confirm::tui_confirm`] 把 `/learn` 的确认请求交给 UI 循环、
+//!   按键由 [`app::TuiApp::confirm_key`] 收）——头行/预览与经典 REPL 同源（`commands::learn`）；
 //! - 本文件：可用性判定（[`tui_unavailable_reason`]）、降级 note（[`fallback_note`]）、帧用的
 //!   会话事实快照（[`refresh_facts`]）、提交分类（[`classify`]）与主循环（[`run`]）。
 //!
@@ -20,6 +22,7 @@
 pub mod app;
 pub mod approval;
 pub mod capture;
+pub mod confirm;
 pub mod input;
 pub mod term;
 pub mod view;
@@ -97,11 +100,6 @@ use crate::tui::view::{Scrollback, ViewFacts, compose};
 /// 提交回显的首行标记（与输入区、编辑器同一对标记）。
 const ECHO_MARK: &str = "❯ ";
 
-/// `/learn` 在 TUI 里的临时错误行（T3 的过渡支线：确认面要等 T5 的接缝，**T5 删掉这一行与它的
-/// 用例**）。
-const LEARN_TEMP_LINE: &str =
-    "error: /learn is not wired in the TUI yet (needs the inline confirmation)";
-
 /// 会用到的会话事实快照（只用既有/本任务新增的 `pub` 访问器）。
 pub fn refresh_facts(session: &Session) -> ViewFacts {
     // 非 UTF-8 的取值照样算「已设置」：转换与经典路径共用 `no_color_value`
@@ -144,7 +142,7 @@ pub enum Submitted {
     Sessions,
     /// `/compact`：需要模型往返，在忙碌子循环里执行。
     Compact,
-    /// `/learn [task-id]`：需要模型往返与确认面（确认面在 T5）。
+    /// `/learn [task-id]`：需要模型往返与内联确认（忙碌子循环里的 `learn_turn`）。
     Learn(Option<String>),
     /// 其余同步命令：外层借用会话走一遍 `slash::dispatch`。
     Command(slash::Slash, Vec<String>),
@@ -294,8 +292,8 @@ async fn submit_line(
         Submitted::Sessions => exit = sync_command(session, app, Slash::Sessions, &[]),
         // `/compact` 需要模型往返：忙碌子循环里驱动（成功逐行进滚动区、错误进 `error: {…}` 行）
         Submitted::Compact => compact_turn(session, app, facts, term).await,
-        // T3 过渡：确认面要等 T5 的接缝（这一支与它的用例在 T5 被替换/删除）
-        Submitted::Learn(_) => app.push_lines([LEARN_TEMP_LINE.to_string()]),
+        // `/learn` 需要模型往返 + 内联确认：同一个忙碌子循环里驱动（确认面接进本轮）
+        Submitted::Learn(arg) => learn_turn(session, app, facts, term, arg).await,
         Submitted::Command(command, args) => {
             exit = sync_command(session, app, command, &args);
         }
@@ -349,6 +347,35 @@ async fn compact_turn(
     }
 }
 
+/// `/learn [task-id]`：忙碌子循环里驱动草稿生成 + 内联确认（接缝是 [`Session::learn_with`]；
+/// 头行/预览/提示词与经典 `/learn` 同一份文案，确认键由 [`TuiApp::confirm_key`] 收）。
+///
+/// 确认面每轮现接：`confirm::channel()` 的接收端交给应用，发送端经 [`confirm::tui_confirm`] 交给
+/// `learn_with`——请求与草稿的 future 在 `drive` 的同一个 `select!` 里推进（不「UI 等 UI」）。
+/// 成功逐行进滚动区、错误进 `error: {…}` 行；`end_busy()` 无条件收尾（确认回信只回到忙碌态）。
+async fn learn_turn(
+    session: &mut Session,
+    app: &mut TuiApp,
+    facts: &ViewFacts,
+    term: Option<&mut TerminalGuard>,
+    arg: Option<String>,
+) {
+    app.begin_busy(Busy::Learn);
+    let cancel = CancellationToken::new();
+    let (tx, confirms) = confirm::channel();
+    app.attach_confirms(confirms);
+    let learn = session.learn_with(arg.as_deref(), cancel.clone(), confirm::tui_confirm(tx));
+    let result = match term {
+        Some(term) => app.drive(term, facts, learn, Some(cancel)).await,
+        None => app.drive_headless(facts, learn, Some(cancel)).await,
+    };
+    app.end_busy();
+    match result {
+        Ok(lines) => app.push_lines(lines),
+        Err(error) => app.push_lines([format!("error: {error}")]),
+    }
+}
+
 /// 一轮任务：忙碌子循环里驱动 `run_task_with_out`（渲染输出、结束行与错误行都落进同一个捕获面）。
 ///
 /// 取消令牌给 `None`：任务轮次的 Ctrl-C 由 `run_task_with_out` 自己的 watcher 收，经典语义不变。
@@ -390,14 +417,18 @@ async fn task_turn(
 mod tests {
     use std::ffi::OsStr;
     use std::process::ExitCode;
+    use std::time::Duration;
 
     use ignis_core::config::{ColorChoice, Config, UiConfig};
+    use ignis_core::task::TaskKind;
+    use ignis_runtime::test_support::{ScriptStep, ScriptedModel};
+    use tokio::sync::mpsc;
 
     use crate::commands::Session;
     use crate::commands::fixtures::{session_fixture, session_fixture_with_config};
     use crate::commands::slash::{self, Slash};
     use crate::editor::history::History;
-    use crate::tui::app::TuiApp;
+    use crate::tui::app::{InputChunk, TuiApp};
     use crate::tui::capture::CaptureSink;
     use crate::tui::view::{Scrollback, ViewFacts};
 
@@ -405,6 +436,10 @@ mod tests {
         MIN_COLS, MIN_ROWS, Size, Submitted, classify, fallback_note, refresh_facts,
         refresh_facts_with, tui_unavailable_reason,
     };
+
+    /// `/learn` 用例的固定草稿（与 pty / `commands` 的用例同一形状）：合法 frontmatter + 一段正文。
+    const DRAFT_MD: &str =
+        "---\nname: demo-skill\ndescription: Demo draft.\n---\n# 步骤\n1. 做事\n";
 
     /// 「够大」的常规终端：表驱动用例的可用基线。
     fn ok_size() -> Size {
@@ -709,10 +744,10 @@ mod tests {
         );
     }
 
-    /// T3 过渡：`/learn` 只落一行临时错误（确认面等 T5 的接缝；**T5 删掉这条用例**）。
+    /// `/learn` 现在走确认接缝（T3 的临时错误行已删）：空会话给经典的人话错误，轮次结束回到空闲态。
     #[tokio::test]
-    async fn learn_command_reports_the_temp_line_until_the_confirm_lands() {
-        let (_dir, mut session) = session_fixture("tui-learn", "native");
+    async fn learn_is_driven_in_the_busy_loop_and_reports_the_classic_error() {
+        let (_dir, mut session) = session_fixture("tui-learn-error", "native");
         let mut app = headless_app();
         let mut facts = refresh_facts(&session);
 
@@ -720,14 +755,86 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(code, None);
+        assert_eq!(app.busy(), None, "轮次结束必须回到空闲态");
 
         let lines = viewport(&app, &facts);
         assert!(
-            lines.contains(
-                &"error: /learn is not wired in the TUI yet (needs the inline confirmation)"
-                    .to_string()
-            ),
+            lines.contains(&"error: learn: no completed task to learn from".to_string()),
             "{lines:?}"
         );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("not wired in the TUI yet")),
+            "T3 的临时错误行必须已被接缝替换：{lines:?}"
+        );
+    }
+
+    /// `/learn` 的完整往返（脚本化模型 + 内联确认）：草稿生成 → 确认态（头行/预览进滚动区）→ `s`
+    /// 落盘 → 滚动区里两行回显、文件在盘上；轮次结束回到空闲态。
+    #[tokio::test]
+    async fn learn_turn_confirms_inline_and_saves_the_draft() {
+        let model = ScriptedModel::start(vec![
+            ScriptStep::Text("答复一".into()),
+            ScriptStep::Text(DRAFT_MD.into()),
+        ]);
+        let config = Config {
+            api_key: Some("test-key".into()),
+            model: ignis_runtime::ModelConfig {
+                base_url: model.base_url(),
+                model: "test-model".into(),
+                ..ignis_runtime::ModelConfig::default()
+            },
+            ..Config::default()
+        };
+        let (dir, mut session) = session_fixture_with_config("tui-learn-confirm", "native", config);
+        session
+            .run_task("你好".into(), TaskKind::Repl)
+            .await
+            .expect("先跑一轮成功任务（`/learn` 的目标）");
+
+        let mut app = headless_app();
+        let (chunks_tx, chunks) = mpsc::unbounded_channel();
+        app.attach_chunks(chunks);
+        let mut facts = refresh_facts(&session);
+
+        // 确认键重试发送：草稿生成完成之前到达的 `s` 会被忙碌期丢掉（输入禁用），落在确认态上的
+        // 那一次才会被收下——不依赖具体时序，也不会把按键误当提交（确认态自成一个按键盘面）。
+        let bytes = chunks_tx.clone();
+        let sender = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                if bytes.send(InputChunk::Bytes(b"s".to_vec())).is_err() {
+                    return;
+                }
+            }
+        });
+
+        let code = tokio::time::timeout(
+            Duration::from_secs(10),
+            submit(&mut session, &mut app, &mut facts, "/learn"),
+        )
+        .await
+        .expect("确认面必须在一个合理的时限内落定")
+        .unwrap();
+        sender.abort();
+        assert_eq!(code, None);
+        assert_eq!(app.busy(), None, "确认 + 落盘 + reload 之后回到空闲态");
+
+        let lines = viewport(&app, &facts);
+        assert!(
+            lines.contains(&"saved skill demo-skill".to_string()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&"reloaded skills (4)".to_string()),
+            "{lines:?}"
+        );
+        let path = dir
+            .path()
+            .join("skills")
+            .join("demo-skill")
+            .join("SKILL.md");
+        assert!(path.is_file(), "{}", path.display());
     }
 }

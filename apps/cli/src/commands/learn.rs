@@ -97,12 +97,13 @@ pub(crate) fn answer_from_lines(
     asks_save(lines.next().as_deref())
 }
 
+/// 与 [`confirm_save`] 同一份行为，但名字先取成 `String`：确认面要的是 `'static` 的未来
+/// （`learn_with` 的闭包先把名字从草稿里取出来，正文本来就是 `to_skill_md()` 的新字符串）。
+///
 /// 真 stdin/stdout 的包装：`spawn_blocking` + [`crate::input::lossy_lines`]（`approval.rs` 的同一
 /// 手法；非法 UTF-8 按替换字符读出，读取失败与 EOF 都结束迭代）；阻塞任务 panic 或被取消时按
 /// **放弃**收束——生产路径永远不会「没读到答案就落盘」。
-pub(crate) async fn confirm_save(name: &str, skill_md: &str) -> bool {
-    let name = name.to_string();
-    let skill_md = skill_md.to_string();
+pub(crate) async fn confirm_save_owned(name: String, skill_md: String) -> bool {
     tokio::task::spawn_blocking(move || {
         let stdin = std::io::stdin();
         let mut out = std::io::stdout();
@@ -113,11 +114,23 @@ pub(crate) async fn confirm_save(name: &str, skill_md: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// 经典 REPL 的确认面（引用版）：把参数变成拥有者后交给 [`confirm_save_owned`]，行为逐字不变。
+///
+/// `pub`（而不是 `pub(crate)`）：经典路径现在经 `Session::learn` → [`confirm_save_owned`] 走，
+/// 这个引用版眼下没有生产调用点，`pub(crate)` 会在 `-D warnings` 下报 `dead_code`（与 T4 的
+/// `TuiApp::attach_approvals` 同一处理）；接缝的拥有者版是 [`confirm_save_owned`]，本项只是它
+/// 的引用形状。
+pub async fn confirm_save(name: &str, skill_md: String) -> bool {
+    confirm_save_owned(name.to_string(), skill_md).await
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::commands::ConfirmLearn;
+
     use super::{
         LEARN_PREVIEW_BYTES, LEARN_PREVIEW_LINES, LEARN_PREVIEW_MARKER, LEARN_PROMPT,
-        answer_from_lines, asks_save, draft_header, preview_lines,
+        answer_from_lines, asks_save, confirm_save_owned, draft_header, preview_lines,
     };
 
     /// 预览的双上限：行数先切（前 120 行 + 标记 = 121 行）、字节上限再切（按字符边界，不切坏
@@ -231,5 +244,26 @@ mod tests {
             text.lines().any(|line| line == LEARN_PREVIEW_MARKER),
             "{text}"
         );
+    }
+
+    /// `confirm_save_owned` 与经典 `confirm_save` 是同一份行为：拥有者版接 `(String, String)`、交
+    /// [`ConfirmLearn`]（`learn_with` 的确认面要的 `'static` 形状），引用版是给它包的一层薄壳。
+    /// 提示词、头行、预览与答案归一都在 [`answer_from_lines`] 这一份实现里——上一条用例（本任务
+    /// 未改）继续逐字钉住它们。
+    #[test]
+    fn confirm_save_owned_matches_the_classic_prompt() {
+        // 经典委托体的取参形状（`learn` 里那一句的编译期检查；不执行——真执行会去读 stdin）：
+        // `Box::pin(confirm_save_owned(..))` 就是 `ConfirmLearn`。
+        let _classic_delegation: fn(String, String) -> ConfirmLearn =
+            |name, skill_md| Box::pin(confirm_save_owned(name, skill_md));
+
+        // 两个入口共用同一份提示词与答案归一（经典路径的逐字断言在上一条用例里）
+        assert_eq!(LEARN_PROMPT, "save this skill draft? [s]ave [d]iscard> ");
+        for answer in [Some("s"), Some(" S "), Some("S")] {
+            assert!(asks_save(answer), "只有 `s` 保存：{answer:?}");
+        }
+        for answer in [None, Some("d"), Some(""), Some("save")] {
+            assert!(!asks_save(answer), "其它输入一律放弃：{answer:?}");
+        }
     }
 }

@@ -13,6 +13,9 @@
 //! 审批（T4）是叠在忙碌期上的一态：`drive` 的同一个 `select!` 里收 [`ApprovalJob`]（请求与任务
 //! future 一起推进，不「UI 等 UI」），4 行提示进滚动区、输入区首行换成经典的 `choice> `，按键由
 //! [`TuiApp::approval_key`] 收——**绝不进编辑器**。
+//!
+//! `/learn` 的确认（T5）与审批同形：`ConfirmJob` 在同一个 `select!` 里收，头行/预览进滚动区、
+//! 输入区首行是经典的确认提示词，按键由 [`TuiApp::confirm_key`] 收（同样绝不进编辑器）。
 
 use std::future::Future;
 use std::io::Read;
@@ -25,6 +28,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::approval::{Choice, MAX_UNKNOWN_INPUTS, details_json, parse_choice, prompt_lines};
+use crate::commands::learn::{LEARN_PROMPT, asks_save, draft_header, preview_lines};
 use crate::editor::history::History;
 use crate::editor::keys::Key;
 use crate::editor::reader::INVALID_WARNING;
@@ -32,6 +36,7 @@ use crate::render::width::display_width;
 use crate::tui::Size;
 use crate::tui::approval::ApprovalJob;
 use crate::tui::capture::{self, CaptureSink};
+use crate::tui::confirm::ConfirmJob;
 use crate::tui::input::InputState;
 use crate::tui::term;
 use crate::tui::view::{
@@ -56,6 +61,9 @@ const CHOICE_PROMPT: &str = "choice> ";
 
 /// 审批态输入区第 3 行的提示（四个可选按键；`d` 先看明细再问一轮）。
 const APPROVAL_HINT: &str = "a/s/r/d";
+
+/// 确认态输入区第 3 行的提示（只有 `s` 保存；其余按键与 `d` 一样放弃）。
+const CONFIRM_HINT: &str = "s/d";
 
 /// 进入主循环前的默认面板尺寸（守卫探到尺寸之前用；与 `term` 的回退 80×24 同值）。
 const INITIAL_SIZE: Size = Size { cols: 80, rows: 24 };
@@ -84,12 +92,12 @@ pub enum Busy {
     Task,
     /// `/compact`：摘要往返。
     Compact,
-    /// `/learn`：草稿生成（确认面在 T5）。
+    /// `/learn`：草稿生成 + 内联确认。
     Learn,
 }
 
 /// 输入模式：T3 只有编辑器与忙碌两态；T4/T5/T6 各自**追加**一个变体（`Approval`/`Confirm`/
-/// `Selector`）。审批态带 [`oneshot::Sender`]，所以这里只派生 `Debug`（不再有 `Clone`/`Eq`）。
+/// `Selector`）。审批/确认态带 [`oneshot::Sender`]，所以这里只派生 `Debug`（不再有 `Clone`/`Eq`）。
 #[derive(Debug)]
 pub enum InputMode {
     /// 编辑器：按键进 [`InputState`]。
@@ -106,6 +114,15 @@ pub enum InputMode {
         unknown: usize,
         /// 进入审批时记下的忙碌态：回信后恢复它——审批叠在忙碌期上（任务的 future 还在跑），
         /// 回信**不是**回编辑器的理由。
+        resume: Busy,
+    },
+    /// 确认：`/learn` 的头行与预览已进滚动区，输入区首行是经典提示词，按键由
+    /// [`TuiApp::confirm_key`] 收（**不进编辑器**）。
+    Confirm {
+        /// 回信口（`None` = 已经回信）。
+        reply: Option<oneshot::Sender<bool>>,
+        /// 进入确认时记下的忙碌态：回信后恢复它——确认叠在 `/learn` 的忙碌期上（草稿的 future
+        /// 还在跑），回信**不是**回编辑器的理由。
         resume: Busy,
     },
 }
@@ -126,6 +143,8 @@ pub struct TuiApp {
     chunks: Option<mpsc::UnboundedReceiver<InputChunk>>,
     /// 审批处理器交回的请求（`drive` 的审批分支从这里收；主循环进入时接上）。
     approvals: Option<mpsc::UnboundedReceiver<ApprovalJob>>,
+    /// `/learn` 确认面交回的请求（`drive` 的确认分支从这里收；每轮 `/learn` 接上一次）。
+    confirms: Option<mpsc::UnboundedReceiver<ConfirmJob>>,
     /// 本轮的取消令牌（`drive` 进入时挂上、退出时摘掉）：审批态的 `Ctrl+C` 字节与 SIGINT 同义，
     /// 靠它取消本轮任务（`/compact` `/learn` 的令牌；任务轮次给 `None`，取消在 `run_task` 内部）。
     cancel: Option<CancellationToken>,
@@ -146,6 +165,7 @@ impl TuiApp {
             size: INITIAL_SIZE,
             chunks: None,
             approvals: None,
+            confirms: None,
             cancel: None,
             sigint: None,
             sigwinch: None,
@@ -163,6 +183,12 @@ impl TuiApp {
         self.approvals = Some(approvals);
     }
 
+    /// 接上 `/learn` 确认面交回请求的接收端（每轮 `/learn` 接一次；没接上时 `drive` 的确认分支
+    /// 永远挂起——不走 `/learn` 的轮次不受影响）。
+    pub fn attach_confirms(&mut self, confirms: mpsc::UnboundedReceiver<ConfirmJob>) {
+        self.confirms = Some(confirms);
+    }
+
     /// 面板尺寸（主循环进入时与 SIGWINCH 之后刷新）。
     pub(crate) fn set_size(&mut self, size: Size) {
         self.size = size;
@@ -176,10 +202,14 @@ impl TuiApp {
     /// 喂一段原始字节；返回要外层执行的动作。
     ///
     /// 忙碌期一律没有动作（输入禁用）：字节照吃（别留给空闲期），缓冲一个字符都不进。
-    /// 审批期的按键走 [`TuiApp::approval_key`]（**绝不进编辑器**）。
+    /// 审批/确认期的按键分别走 [`TuiApp::approval_key`] / [`TuiApp::confirm_key`]（**绝不进
+    /// 编辑器**）。
     pub fn on_bytes(&mut self, bytes: &[u8]) -> Vec<Action> {
         if matches!(self.mode, InputMode::Approval { .. }) {
             return self.approval_bytes(bytes);
+        }
+        if matches!(self.mode, InputMode::Confirm { .. }) {
+            return self.confirm_bytes(bytes);
         }
         if !matches!(self.mode, InputMode::Editor) {
             return Vec::new();
@@ -204,6 +234,26 @@ impl TuiApp {
             redraw |= self.approval_key(key).is_some();
             if !matches!(self.mode, InputMode::Approval { .. }) {
                 // 回信即结束审批：界面回到审批记下的忙碌态（要重绘一帧），剩下的按键随这一批丢掉
+                redraw = true;
+                break;
+            }
+        }
+        if redraw {
+            vec![Action::Redraw]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// 确认态的一批字节：解码成按键逐个交给 [`TuiApp::confirm_key`]。回信之后这一批剩下的按键
+    /// 丢掉（与 `Submit`/`Exit` 之后忽略剩余按键同一条规则）——确认按键因此绝不落进编辑器。
+    fn confirm_bytes(&mut self, bytes: &[u8]) -> Vec<Action> {
+        let keys = self.input.keys(bytes);
+        let mut redraw = false;
+        for key in keys {
+            redraw |= self.confirm_key(key).is_some();
+            if !matches!(self.mode, InputMode::Confirm { .. }) {
+                // 回信即结束确认：界面回到确认记下的忙碌态（要重绘一帧），剩下的按键随这一批丢掉
                 redraw = true;
                 break;
             }
@@ -346,18 +396,81 @@ impl TuiApp {
         }
     }
 
+    /// 收到一次 `/learn` 确认请求：头行（[`draft_header`]）与预览（[`preview_lines`]）逐行进
+    /// 滚动区——与经典 REPL 同一份纯函数与常量（预览的截断口径只有那一处）；输入态切到确认，
+    /// 并记下**当时的忙碌态**（[`TuiApp::busy`]）：回信之后恢复到它，而不是回到编辑器——草稿的
+    /// future 还在跑，输入必须继续禁用。
+    ///
+    /// 返回落地的那些行（调用方据此重绘一帧；滚动区已经写好了）。`/learn` 一次只会有一个待答的
+    /// 确认请求；真撞上第二个时前一个随替换丢掉——它的回信端掉落，那次确认因此按放弃收束
+    /// （与 [`crate::tui::confirm::tui_confirm`] 同一口径）。
+    pub fn begin_confirm(&mut self, job: ConfirmJob) -> Vec<String> {
+        // 确认叠在 `/learn` 的忙碌期上：记下当时的忙碌态。真从空闲态被驱动（只在用例里可能）时
+        // 按学习档恢复——确认面只在 `/learn` 里出现，也保证这里不 panic。
+        let resume = self.busy().unwrap_or(Busy::Learn);
+        let mut lines = vec![draft_header(&job.name)];
+        lines.extend(preview_lines(&job.skill_md));
+        self.push_lines(lines.clone());
+        self.mode = InputMode::Confirm {
+            reply: Some(job.reply),
+            resume,
+        };
+        lines
+    }
+
+    /// 确认按键：只有 `s`（trim + 大小写归一，与经典 [`crate::commands::learn::asks_save`] 同一
+    /// 口径）回 `true`；其它任何按键、EOF（`Ctrl+D`）都回 `false`；`Ctrl+C` 的字节与 SIGINT 同义
+    /// ——回 `false` 并取消本轮令牌（与 [`TuiApp::approval_key`] 同一条口径）。
+    ///
+    /// 回信只送一次（回信口随即取走）；不在确认态时什么都不做。返回 `Some(结论)` = 这一次按键
+    /// 回答了本次确认。
+    pub fn confirm_key(&mut self, key: Key) -> Option<bool> {
+        if !matches!(self.mode, InputMode::Confirm { .. }) {
+            return None;
+        }
+        // 与经典同一份答案归一：单字符也过 `asks_save`（trim + 大小写）
+        let save = match key {
+            Key::Char(ch) => asks_save(Some(&ch.to_string())),
+            _ => false,
+        };
+        // `Ctrl+C` 字节（终端没开 ISIG 时它就是那个信号）：与 SIGINT 同义，顺手取消本轮令牌
+        if key == Key::CtrlC
+            && let Some(token) = self.cancel.as_ref()
+        {
+            token.cancel();
+        }
+        self.end_confirm(save);
+        Some(save)
+    }
+
+    /// 收下确认态：回信（回信端已经没了就算了）并恢复确认开始时记下的忙碌态——确认叠在
+    /// `/learn` 的忙碌期上（草稿的 future 还在跑），**绝不**直接回编辑器；回编辑器只有
+    /// [`TuiApp::end_busy`] 一条路。
+    fn end_confirm(&mut self, save: bool) {
+        let InputMode::Confirm { reply, resume } = &mut self.mode else {
+            return; // 不在确认态：什么都不做（只有确认按键会走到这里）
+        };
+        // 先把回信口与恢复态取出来：换态之后请求不再可见
+        let reply = reply.take();
+        let resume = *resume;
+        self.mode = InputMode::Busy(resume);
+        if let Some(reply) = reply {
+            let _ = reply.send(save);
+        }
+    }
+
     /// 离开忙碌态：回到编辑器（缓冲是空的，光标在段首）——这是回编辑器的**唯一**一条路
-    /// （审批回信只回到它记下的忙碌态，见 [`TuiApp::end_approval`]）。
+    /// （审批/确认回信只回到它记下的忙碌态，见 [`TuiApp::end_approval`] / [`TuiApp::end_confirm`]）。
     pub fn end_busy(&mut self) {
         self.mode = InputMode::Editor;
     }
 
-    /// 当前是不是忙碌态（`None` = 空闲）：审批叠在忙碌期上，返回它记下的那一档（`resume`）——
-    /// 回信前后对调用方都是「还在忙」。
+    /// 当前是不是忙碌态（`None` = 空闲）：审批/确认叠在忙碌期上，返回它们记下的那一档（`resume`）
+    /// ——回信前后对调用方都是「还在忙」。
     pub fn busy(&self) -> Option<Busy> {
         match self.mode {
             InputMode::Busy(busy) => Some(busy),
-            InputMode::Approval { resume, .. } => Some(resume),
+            InputMode::Approval { resume, .. } | InputMode::Confirm { resume, .. } => Some(resume),
             InputMode::Editor => None,
         }
     }
@@ -382,6 +495,18 @@ impl TuiApp {
                         APPROVAL_HINT.to_string(),
                     ],
                     cursor: Some((0, display_width(CHOICE_PROMPT))),
+                },
+                BUSY_HINT,
+            ),
+            // 确认：头行/预览在滚动区，输入区首行就是经典的完整提示词（光标停在它后面）
+            InputMode::Confirm { .. } => (
+                InputBlock {
+                    lines: [
+                        LEARN_PROMPT.to_string(),
+                        String::new(),
+                        CONFIRM_HINT.to_string(),
+                    ],
+                    cursor: Some((0, display_width(LEARN_PROMPT))),
                 },
                 BUSY_HINT,
             ),
@@ -473,6 +598,7 @@ impl TuiApp {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut chunks = self.chunks.take();
         let mut approvals = self.approvals.take();
+        let mut confirms = self.confirms.take();
         let mut sigint = self.sigint.take();
         let mut sigwinch = self.sigwinch.take();
         // 本轮令牌挂进应用：审批态的 `Ctrl+C` 字节靠它取消本轮任务（见 `TuiApp::approval_key`）
@@ -508,9 +634,17 @@ impl TuiApp {
                         self.draw(term.as_deref_mut(), facts);
                     }
                 }
+                job = next_confirm(&mut confirms) => {
+                    // 收到 `/learn` 确认请求：头行/预览进滚动区、输入态切到确认，然后重绘一帧；
+                    // 草稿的 future 继续推进（等回信）
+                    if let Some(job) = job {
+                        let _ = self.begin_confirm(job);
+                        self.draw(term.as_deref_mut(), facts);
+                    }
+                }
                 chunk = next_chunk(&mut chunks) => {
-                    // 忙碌期输入禁用：字节照收（别留给空闲期），动作一律丢掉；审批态的按键由
-                    // `on_bytes` 路由到审批面，真改了界面（明细/回信）就立刻重绘一帧，不等心跳
+                    // 忙碌期输入禁用：字节照收（别留给空闲期），动作一律丢掉；审批/确认态的按键由
+                    // `on_bytes` 路由到各自的按键面，真改了界面（明细/回信）就立刻重绘一帧，不等心跳
                     if let Some(InputChunk::Bytes(bytes)) = chunk
                         && !self.on_bytes(&bytes).is_empty()
                     {
@@ -521,6 +655,7 @@ impl TuiApp {
         };
         self.chunks = chunks;
         self.approvals = approvals;
+        self.confirms = confirms;
         self.sigint = sigint;
         self.sigwinch = sigwinch;
         // 本轮结束：摘掉令牌（审批态的按键不该动下一轮的取消）
@@ -646,6 +781,26 @@ async fn next_approval(
     None
 }
 
+/// 等下一次 `/learn` 确认请求；没接上（不走 `/learn` 的轮次）时永远挂起。
+///
+/// 发送端全消失（那一轮 `/learn` 的确认闭包连同 future 一起掉了）时清掉槽位并返回 `None`：此后
+/// `recv()` 会立刻返回 `None`，不清掉就是空转。
+async fn next_confirm(
+    slot: &mut Option<mpsc::UnboundedReceiver<ConfirmJob>>,
+) -> Option<ConfirmJob> {
+    let closed = match slot.as_mut() {
+        Some(rx) => match rx.recv().await {
+            Some(job) => return Some(job),
+            None => true,
+        },
+        None => std::future::pending().await,
+    };
+    if closed {
+        *slot = None;
+    }
+    None
+}
+
 /// 审批态一次按键的语义（纯函数：归一与经典 [`parse_choice`] 同一份）。
 enum ApprovalStep {
     /// 回信并恢复审批开始时记下的忙碌态（不是编辑器）。
@@ -686,6 +841,9 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use crate::approval::{MAX_UNKNOWN_INPUTS, format_prompt, prompt_lines};
+    use crate::commands::learn::{
+        LEARN_PREVIEW_LINES, LEARN_PREVIEW_MARKER, LEARN_PROMPT, draft_header, preview_lines,
+    };
     use crate::editor::history::History;
     use crate::editor::keys::Key;
     use crate::editor::raw::RawMode;
@@ -693,6 +851,7 @@ mod tests {
     use crate::tui::Size;
     use crate::tui::approval::{ApprovalJob, TuiApproval};
     use crate::tui::capture::CaptureSink;
+    use crate::tui::confirm::{self, ConfirmJob};
     use crate::tui::term::TerminalGuard;
     use crate::tui::view::{Scrollback, ViewFacts, compose, status_line, top_line};
 
@@ -1338,6 +1497,245 @@ mod tests {
             "输入区首行还是忙碌行（不是 `❯ `）"
         );
         assert_eq!(app.input.text(), "", "回信之后的按键一个字符都不进缓冲");
+
+        // 只有 `end_busy()`（future 结束）回编辑器
+        app.end_busy();
+        assert_eq!(app.busy(), None);
+        assert_eq!(app.view(&facts).input.lines[0], "❯ ");
+    }
+
+    // ---- 内联确认（T5） ----
+
+    /// 一次确认请求 + 回信口的收端（用例在这一侧观察回信）。
+    fn confirm_job(name: &str, skill_md: &str) -> (ConfirmJob, oneshot::Receiver<bool>) {
+        let (reply, rx) = oneshot::channel();
+        (
+            ConfirmJob {
+                name: name.to_string(),
+                skill_md: skill_md.to_string(),
+                reply,
+            },
+            rx,
+        )
+    }
+
+    /// 内联确认的版式与键位：头行 + 预览逐行进滚动区（共用文案，不另写截断）、输入区第 1 行恰好是
+    /// 经典的 `LEARN_PROMPT`；只有 `s`（trim + 大小写归一）回 `true`，`d`/`q`/`Ctrl+D` 都回
+    /// `false`；回信只送一次；`Ctrl+C` 回 `false` 且取消本轮令牌。
+    #[tokio::test]
+    async fn tui_confirm_pushes_the_header_and_preview_and_awaits_s() {
+        let (mut app, _buffer) = app();
+        let facts = facts();
+        let skill_md = "---\nname: demo-skill\ndescription: Demo draft.\n---\n# 步骤\n1. 做事\n";
+
+        // 版式：头行 + 预览行逐字进滚动区，输入区首行是经典的确认提示词
+        app.begin_busy(Busy::Learn);
+        let (job, mut rx) = confirm_job("demo-skill", skill_md);
+        let landed = app.begin_confirm(job);
+        let mut want = vec![
+            "draft skill demo-skill: untested, not deployed or executed automatically".to_string(),
+        ];
+        want.extend(preview_lines(skill_md));
+        assert_eq!(landed, want, "落地的就是共用文案（头行 + 预览）");
+        assert_eq!(
+            landed.first().unwrap(),
+            &draft_header("demo-skill"),
+            "头行来自共用函数"
+        );
+        assert_eq!(app.view(&facts).viewport, want, "滚动区逐字收到");
+        let block = app.view(&facts).input;
+        assert_eq!(block.lines[0], LEARN_PROMPT, "输入区第 1 行就是经典提示词");
+        assert_eq!(block.lines[0], "save this skill draft? [s]ave [d]iscard> ");
+        assert_eq!(block.lines[2], "s/d", "提示行");
+        assert!(rx.try_recv().is_err(), "还没按键：没有回信");
+        assert_eq!(app.busy(), Some(Busy::Learn), "确认叠在忙碌期上");
+        assert_eq!(app.view(&facts).status, status_line(&facts, BUSY_HINT));
+
+        // `s`：回信 `true`，输入态回到记下的忙碌态（不是编辑器）；回信只有一次
+        assert_eq!(app.on_bytes(b"s"), [super::Action::Redraw]);
+        assert_eq!(rx.try_recv(), Ok(true));
+        assert_eq!(app.busy(), Some(Busy::Learn), "回信后仍是忙碌态");
+        assert_eq!(app.view(&facts).input.lines[0], "working…", "不是回编辑器");
+        assert!(rx.try_recv().is_err(), "只有一次回信");
+        assert_eq!(
+            app.confirm_key(Key::Char('s')),
+            None,
+            "回信之后不再受理按键"
+        );
+
+        // `S`（大小写归一）也保存；`d`/`q` 与 EOF（`Ctrl+D`）都放弃，且都留在忙碌态
+        for (key, want) in [("S", true), ("d", false), ("q", false), ("\u{4}", false)] {
+            let (job, mut rx) = confirm_job("demo-skill", skill_md);
+            app.begin_confirm(job);
+            app.on_bytes(key.as_bytes());
+            assert_eq!(rx.try_recv(), Ok(want), "{key:?}");
+            assert_eq!(app.busy(), Some(Busy::Learn), "{key:?}");
+        }
+
+        // 裸按键入口：`Ctrl+D`（EOF）也是放弃
+        let (job, mut rx) = confirm_job("demo-skill", skill_md);
+        app.begin_confirm(job);
+        assert_eq!(app.confirm_key(Key::CtrlD), Some(false));
+        assert_eq!(rx.try_recv(), Ok(false));
+
+        // `Ctrl+C` 的字节与 SIGINT 同义：回 `false` 并取消 TUI 持有的本轮令牌
+        let cancel = CancellationToken::new();
+        app.cancel = Some(cancel.clone());
+        let (job, mut rx) = confirm_job("demo-skill", skill_md);
+        app.begin_confirm(job);
+        assert_eq!(app.confirm_key(Key::CtrlC), Some(false));
+        assert!(cancel.is_cancelled(), "`Ctrl+C` 必须取消本轮令牌");
+        assert_eq!(rx.try_recv(), Ok(false));
+        app.cancel = None;
+
+        // 确认按键绝不落进编辑器：喂 `"abc"`（`a` 是「其它按键」→ 放弃），缓冲一个字符都不进
+        let (job, mut rx) = confirm_job("demo-skill", skill_md);
+        app.begin_confirm(job);
+        assert_eq!(app.on_bytes(b"abc"), [super::Action::Redraw]);
+        assert_eq!(rx.try_recv(), Ok(false));
+        assert_eq!(app.input.text(), "", "确认按键一个字符都不进缓冲");
+        assert!(rx.try_recv().is_err(), "只有一次回信");
+    }
+
+    /// 预览的截断只来自 `commands::learn` 的共享常量（不另写一份）：130 行的 skill_md 给出
+    /// `LEARN_PREVIEW_LINES + 1` 行预览、末行是截断标记。
+    #[tokio::test]
+    async fn confirm_preview_caps_come_from_the_shared_constants() {
+        let (mut app, _buffer) = app();
+        let facts = facts();
+        let long = (0..130)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        app.begin_busy(Busy::Learn);
+        let (job, _rx) = confirm_job("demo-skill", &long);
+        let landed = app.begin_confirm(job);
+
+        // 头行 + 预览；预览完全来自共享函数（行数上限 + 标记）
+        assert_eq!(landed.len(), LEARN_PREVIEW_LINES + 2, "头行 + 预览 + 标记");
+        assert_eq!(landed[0], draft_header("demo-skill"));
+        assert_eq!(landed[1..], preview_lines(&long), "预览就是共享函数的产物");
+        assert_eq!(landed[1..].len(), LEARN_PREVIEW_LINES + 1);
+        assert_eq!(landed.last().unwrap(), LEARN_PREVIEW_MARKER);
+        // 滚动区的视口里出现截断标记（视口就是最近 `rows` 行，即落地那批行的尾巴）
+        let viewport = app.view(&facts).viewport;
+        assert_eq!(
+            viewport,
+            landed[landed.len() - viewport.len()..],
+            "视口就是最近落地的那些行"
+        );
+        assert_eq!(viewport.last().unwrap(), LEARN_PREVIEW_MARKER);
+        assert_eq!(
+            viewport
+                .iter()
+                .filter(|line| *line == LEARN_PREVIEW_MARKER)
+                .count(),
+            1,
+            "截断标记只出现一次：{viewport:?}"
+        );
+    }
+
+    /// 确认回信之后草稿的 future 还在跑（T4 裁定的同一形状）：`end_confirm` 恢复确认开始时记下的
+    /// 忙碌态、**不是**编辑器；输入区首行仍是 `working…`、提示行与底部状态行也回到忙碌那一句，
+    /// 喂键产不出动作、编辑器缓冲一个字符都不进；只有 `end_busy()`（future 结束）才回编辑器。
+    #[tokio::test]
+    async fn confirm_reply_restores_the_busy_state_instead_of_the_editor() {
+        let (mut app, _buffer) = app();
+        let facts = facts();
+
+        app.begin_busy(Busy::Learn);
+        let (job, mut rx) = confirm_job("demo-skill", "---\nname: demo-skill\n---\n");
+        app.begin_confirm(job);
+        assert_eq!(
+            app.busy(),
+            Some(Busy::Learn),
+            "确认叠在忙碌期上：忙碌态照旧"
+        );
+        assert_eq!(
+            app.view(&facts).input.lines[0],
+            LEARN_PROMPT,
+            "确认态是经典提示词"
+        );
+
+        assert_eq!(app.on_bytes(b"s"), [super::Action::Redraw]);
+        assert_eq!(rx.try_recv(), Ok(true));
+        assert_eq!(app.busy(), Some(Busy::Learn), "回信后恢复记下的忙碌态");
+        let block = app.view(&facts).input;
+        assert_eq!(block.lines[0], "working…", "输入区首行是忙碌行，不是 `❯ `");
+        assert_eq!(block.lines[2], BUSY_HINT, "提示行也回到忙碌那一句");
+        assert_eq!(block.cursor, None, "忙碌期藏起光标");
+        assert_eq!(
+            app.view(&facts).status,
+            status_line(&facts, BUSY_HINT),
+            "底部状态行也是忙碌那一句（不是 `PgUp/PgDn scroll`）"
+        );
+
+        // future 还在跑：`x\r` 一个动作都产不出来（更没有 `Submit`），缓冲一个字符都不进
+        let actions = app.on_bytes(b"x\r");
+        assert!(actions.is_empty(), "忙碌期输入禁用：{actions:?}");
+        assert_eq!(app.input.text(), "", "缓冲一个字符都不进");
+
+        // 只有 `end_busy()`（future 结束）才回编辑器：这之后按键才进缓冲、Enter 才提交
+        app.end_busy();
+        assert_eq!(app.busy(), None);
+        assert_eq!(app.view(&facts).input.lines[0], "❯ ");
+        assert_eq!(
+            app.on_bytes(b"x\r"),
+            [
+                super::Action::Redraw,
+                super::Action::Submit("x".to_string())
+            ]
+        );
+    }
+
+    /// 循环级：确认请求由 `drive` 的接收分支收下（与草稿的 future 同一个 `select!`），`s` 的字节
+    /// 回信 `true`；界面在 future 结束前留在忙碌态，`end_busy()` 之后才回编辑器。请求在进循环前
+    /// 就已入队（与生产同序：`begin_busy` → 接上确认面 → 收下请求 → `drive`），按键的先后由 50ms
+    /// 的等待保证——没有时序竞态。
+    #[tokio::test]
+    async fn drive_receives_confirms_and_stays_busy_until_the_future_ends() {
+        let (mut app, _buffer) = app();
+        let facts = facts();
+        let (chunks_tx, chunks) = mpsc::unbounded_channel();
+        app.attach_chunks(chunks);
+        let (tx, confirms) = confirm::channel();
+        app.attach_confirms(confirms);
+        app.begin_busy(Busy::Learn);
+
+        // 请求先入队：第一轮 select 收下它、输入态切到确认；回信由 `s` 的字节给出
+        let (reply, answered) = oneshot::channel();
+        tx.send(ConfirmJob {
+            name: "demo-skill".to_string(),
+            skill_md: "---\nname: demo-skill\n---\n".to_string(),
+            reply,
+        })
+        .expect("确认通道还在");
+        let bytes = chunks_tx.clone();
+        let sender = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = bytes.send(InputChunk::Bytes(b"s".to_vec()));
+        });
+
+        let outcome = app
+            .drive_headless(&facts, async move { answered.await.unwrap_or(false) }, None)
+            .await;
+
+        sender.await.expect("送字节的任务应结束");
+        assert!(outcome, "`s` 的字节回了 `true`");
+        assert!(
+            app.view(&facts)
+                .viewport
+                .contains(&draft_header("demo-skill")),
+            "确认请求被 UI 收下并画进滚动区（与 future 同一个 select，没有死锁）：{:?}",
+            app.view(&facts).viewport
+        );
+        assert_eq!(app.busy(), Some(Busy::Learn), "future 结束前一直在忙碌态");
+        assert_eq!(
+            app.view(&facts).input.lines[0],
+            "working…",
+            "输入区首行还是忙碌行（不是 `❯ `）"
+        );
 
         // 只有 `end_busy()`（future 结束）回编辑器
         app.end_busy();

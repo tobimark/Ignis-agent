@@ -15,8 +15,10 @@ pub mod slash;
 pub mod task;
 
 use std::ffi::{OsStr, OsString};
+use std::future::Future;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,6 +60,10 @@ const SESSIONS_LIMIT: usize = 10;
 /// `/learn` 选不到可学任务时的错误：默认目标没有成功任务、显式 id 命中但不是成功状态共用这一句
 /// （逐字钉住；与 `task not found` 分家是刻意的——任务在不在与任务能不能学是两回事）。
 const NO_COMPLETED_TASK: &str = "learn: no completed task to learn from";
+
+/// 确认面的未来：`BoxFuture<'static, bool>` 的口径。CLI crate 不依赖 `futures`，用 std 拼同一个类型
+/// （零新增依赖）。
+pub type ConfirmLearn = Pin<Box<dyn Future<Output = bool> + Send + 'static>>;
 
 /// 一次 CLI 会话的共享依赖：`run` 与 REPL 都从这里取当前内核与工作区。
 pub struct Session {
@@ -545,22 +551,45 @@ impl Session {
         Ok(slash::compact_lines(older.len(), summary.chars().count()))
     }
 
-    /// `/learn [task-id]`：生成草稿 → 预览 + 确认（真 stdin）→ 落盘 + reload / `discarded`。
+    /// `/learn [task-id]`：生成草稿 → 确认（由调用方给确认面）→ 落盘 + reload / `discarded`。
     ///
-    /// 确认面在 [`self::learn::confirm_save`]：头行 + 预览（截断按 120 行 / 8 KiB）+ 提示词**先**
-    /// 打到 stdout，再从 stdin 读一行；只有 `s`（trim + 大小写归一）才落盘，EOF、`d`、其它输入与
-    /// 读取失败一律交回 `["discarded"]`（磁盘零变化）。成功时刷新会话里的技能目录快照，下一轮任务
-    /// 的系统提示立即带上新技能；运行中的轮次仍持自己那一份旧快照。命令本身不新建任务行、不动会话。
+    /// `confirm` 收到草稿与 `draft.to_skill_md()`（头行/预览与落盘取的是同一份文本）；闭包要
+    /// `'static`（[`ConfirmLearn`]），所以名字得先从草稿里取出来。确认回 `true` 才落盘：成功返回
+    /// `["saved skill {name}", "reloaded skills ({n})"]` 并刷新会话里的技能目录快照，下一轮任务的
+    /// 系统提示立即带上新技能（运行中的轮次仍持自己那一份旧快照）；回 `false` 一律
+    /// `["discarded"]`（磁盘零变化）。生成阶段的检查顺序与错误文案见
+    /// [`Session::draft_for_learn`]；命令本身不新建任务行、不动会话。
+    pub async fn learn_with<F>(
+        &mut self,
+        arg: Option<&str>,
+        cancel: CancellationToken,
+        confirm: F,
+    ) -> Result<Vec<String>, String>
+    where
+        F: FnOnce(&SkillDraft, String) -> ConfirmLearn,
+    {
+        let draft = self.draft_for_learn(arg, cancel).await?;
+        if !confirm(&draft, draft.to_skill_md()).await {
+            return Ok(vec!["discarded".to_string()]);
+        }
+        self.commit_draft(&draft)
+    }
+
+    /// 经典 REPL 的 `/learn`：确认面是真 stdin（行为逐字不变）。
+    ///
+    /// 确认面在 [`self::learn::confirm_save_owned`]：头行 + 预览（截断按 120 行 / 8 KiB）+ 提示词
+    /// **先**打到 stdout，再从 stdin 读一行；只有 `s`（trim + 大小写归一）才落盘，EOF、`d`、其它
+    /// 输入与读取失败一律交回 `["discarded"]`（磁盘零变化）。
     pub async fn learn(
         &mut self,
         arg: Option<&str>,
         cancel: CancellationToken,
     ) -> Result<Vec<String>, String> {
-        let draft = self.draft_for_learn(arg, cancel).await?;
-        if !self::learn::confirm_save(&draft.name, &draft.to_skill_md()).await {
-            return Ok(vec!["discarded".to_string()]);
-        }
-        self.commit_draft(&draft)
+        self.learn_with(arg, cancel, |draft, skill_md| {
+            let name = draft.name.clone();
+            Box::pin(self::learn::confirm_save_owned(name, skill_md))
+        })
+        .await
     }
 
     /// 生成草稿（不落盘、不打预览）：检查顺序 = 凭据 → 目标任务 → 转录 → 一次无工具请求 → 校验；
@@ -2546,6 +2575,119 @@ mod tests {
             .unwrap();
         let error = session
             .draft_for_learn(None, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(error.starts_with("learn: generation failed: "), "{error}");
+    }
+
+    /// `/learn` 的确认接缝：草稿生成之后才调确认面，`(草稿, to_skill_md)` 就是它收到的两个入参；
+    /// 只有回 `true` 才落盘（0600、内容就是确认面收到的那一份、reload 后目录里看得见），回
+    /// `false` 只交回 `["discarded"]` 且技能目录一个子项都不多。
+    #[tokio::test]
+    async fn learn_with_calls_the_injected_confirm_and_saves_only_on_true() {
+        let model = ScriptedModel::start(vec![
+            ScriptStep::Text("答复一".into()),
+            ScriptStep::Text(draft_text()),
+            ScriptStep::Text(draft_text()),
+        ]);
+        let (dir, mut session) =
+            session_fixture_with_config("learn-with-confirm", "native", scripted_config(&model));
+        session
+            .run_task("你好".into(), TaskKind::Repl)
+            .await
+            .expect("先跑一轮成功任务（`/learn` 的目标）");
+
+        // 确认面收到 `(草稿, SKILL.md)`，回 `true`：落盘 + reload
+        let seen: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&seen);
+        let lines = session
+            .learn_with(None, CancellationToken::new(), move |draft, skill_md| {
+                *captured.lock().expect("记录锁不该中毒") =
+                    Some((draft.name.clone(), skill_md.clone()));
+                Box::pin(std::future::ready(true))
+            })
+            .await
+            .expect("确认后应落盘");
+        assert_eq!(lines, ["saved skill demo-skill", "reloaded skills (4)"]);
+        let (name, previewed) = seen
+            .lock()
+            .expect("记录锁不该中毒")
+            .clone()
+            .expect("确认面收到了草稿与正文");
+        assert_eq!(name, "demo-skill");
+
+        let path = dir
+            .path()
+            .join("skills")
+            .join("demo-skill")
+            .join("SKILL.md");
+        assert!(path.is_file(), "{}", path.display());
+        assert_eq!(
+            fs::read_to_string(&path).expect("落盘文件应可读"),
+            previewed,
+            "落盘内容与确认面收到的正文是同一份"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", path.display());
+        }
+        assert!(
+            session
+                .skills()
+                .metas()
+                .iter()
+                .any(|meta| meta.name == "demo-skill"),
+            "reload 后会话目录里应看得见新技能"
+        );
+
+        // 同一夹具再走一次：确认面回 `false` → 只有 `discarded`，技能目录一个子项都不多
+        let skills_dir = dir.path().join("skills");
+        let snapshot = || {
+            let mut names: Vec<_> = fs::read_dir(&skills_dir)
+                .expect("技能目录应可读")
+                .map(|entry| entry.expect("目录项应可读").file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = snapshot();
+        let called = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&called);
+        let lines = session
+            .learn_with(None, CancellationToken::new(), move |_draft, _skill_md| {
+                flag.store(true, Ordering::SeqCst);
+                Box::pin(std::future::ready(false))
+            })
+            .await
+            .expect("放弃不是错误");
+        assert!(called.load(Ordering::SeqCst), "确认面必须被调用");
+        assert_eq!(lines, ["discarded"]);
+        assert_eq!(snapshot(), before, "放弃一个目录都不该新建");
+    }
+
+    /// 生成失败走经典文案（确认面一次都不调）：`Err` 以 `learn: generation failed: ` 开头。
+    #[tokio::test]
+    async fn learn_with_reports_the_generation_failure_through_the_classic_copy() {
+        let model = ScriptedModel::start(vec![
+            ScriptStep::Text("答复一".into()),
+            ScriptStep::Error {
+                status: 401,
+                body: r#"{"error":"bad key"}"#.into(),
+            },
+        ]);
+        let (_dir, mut session) =
+            session_fixture_with_config("learn-with-failure", "native", scripted_config(&model));
+        session
+            .run_task("你好".into(), TaskKind::Repl)
+            .await
+            .expect("先跑一轮成功任务（`/learn` 的目标）");
+
+        let error = session
+            .learn_with(None, CancellationToken::new(), |_draft, _skill_md| {
+                unreachable!("生成失败不该走到确认面")
+            })
             .await
             .unwrap_err();
         assert!(error.starts_with("learn: generation failed: "), "{error}");
