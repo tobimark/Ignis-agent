@@ -60,17 +60,27 @@ impl InputState {
     /// `Submit`/`Exit` 之后这一批的剩余按键忽略：回车提交之后跟着的字节（快速输入、粘贴后紧跟
     /// 回车）不许落到已经清空的缓冲里——与忙碌期禁用输入是同一条规则。
     pub fn on_bytes(&mut self, bytes: &[u8]) -> Vec<Action> {
+        self.on_bytes_with_keys(bytes)
+            .into_iter()
+            .map(|(_, action)| action)
+            .collect()
+    }
+
+    /// 与 [`InputState::on_bytes`] 同一套处理，但把 `(按键, 动作)` 成对交回：TUI 的编辑器态要靠
+    /// 它认出翻页键——`PageUp`/`PageDown` 在状态机里是空操作（`leave_browse` + `Idle`），而翻页
+    /// 的落点（滚动区）只有应用层认识。
+    pub(crate) fn on_bytes_with_keys(&mut self, bytes: &[u8]) -> Vec<(Key, Action)> {
         let keys = self.keys(bytes);
-        let mut actions = Vec::new();
+        let mut steps = Vec::new();
         for key in keys {
             let action = self.on_key(key);
             let stop = matches!(action, Action::Submit(_) | Action::Exit);
-            actions.push(action);
+            steps.push((key, action));
             if stop {
                 break;
             }
         }
-        actions
+        steps
     }
 
     /// 缓冲文本（补全、提交都读它）。

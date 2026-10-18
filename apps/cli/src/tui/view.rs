@@ -3,7 +3,8 @@
 //! 分工：[`Scrollback`] 是捕获文本的落点（按行摄入、上限 [`SCROLLBACK_LINES`]、记着滚动位置）；
 //! 一帧的全部输入是 [`TuiView`]（它不认识会话与终端）；[`compose`] 把它拼成整帧字节；顶部/底部
 //! 状态行的文案由 [`top_line`]/[`status_line`] 从 [`ViewFacts`] 快照里拼出，宽度截断统一交给
-//! [`compose`]（文案函数只逐字拼，用例才好逐字断言）。
+//! [`compose`]（文案函数只逐字拼，用例才好逐字断言）。帧里的每一条内容行在截断之前都过一遍
+//! [`capture::sanitize`]（幂等）：帧里的 ESC 只来自帧协议本身与调色板白名单的那六个 SGR。
 //!
 //! 帧协议（逐字钉住，金帧用例锁死）：
 //!
@@ -37,6 +38,7 @@ use crate::render::width::{char_width, display_width, truncate_to_width};
 use crate::render::{Palette, palette};
 
 use super::Size;
+use super::capture;
 use super::term::{CURSOR_HOME, HIDE_CURSOR, SHOW_CURSOR};
 
 /// 滚动区上限（设计 §2.2：不做无界 scrollback）。
@@ -52,7 +54,10 @@ const HINT_ROW: usize = INPUT_ROWS - 1;
 const INPUT_MARK: &str = "❯ ";
 
 /// 版式里的固定行数：顶部状态行 1 + 输入区 3 + 底部状态行 1。
-const FIXED_ROWS: usize = 1 + INPUT_ROWS + 1;
+///
+/// `pub(crate)`：应用层用它算「视口里有几行」（`rows - FIXED_ROWS`）——PgUp/PgDn 的步长与
+/// 选择器开窗的高度都按它来，口径与 [`layout`] 只有这一处。
+pub(crate) const FIXED_ROWS: usize = 1 + INPUT_ROWS + 1;
 
 /// 每行结尾的清行序列（清到行尾：截断留下的旧内容不留残影）。
 const CLEAR_TO_EOL: &str = "\x1b[K";
@@ -325,9 +330,13 @@ pub fn selector_lines(
 }
 
 /// 合成整帧字节（纯函数，逐字节可断言）；每一行都过 [`truncate_to_width`]。
+///
+/// 内容行在**截断之前**统一过一遍 [`capture::sanitize`]（幂等）：帧的内容（viewport/top/input/
+/// status）各有各的来源（模型输出、命令输出、会话名），清屏/改标题之类的序列绝不能借帧抵达
+/// 终端；chrome 自己的 SGR 正是白名单里的那几个，上色路径与金帧因此一字不变。
 pub fn compose(view: &TuiView) -> String {
     let palette = palette(view.theme);
-    let rows = layout(view);
+    let rows = sanitized(layout(view));
     let mut frame = String::from(HIDE_CURSOR);
     frame.push_str(CURSOR_HOME);
     for (index, (slot, text)) in rows.iter().enumerate() {
@@ -347,6 +356,16 @@ pub fn compose(view: &TuiView) -> String {
         frame.push_str(SHOW_CURSOR);
     }
     frame
+}
+
+/// 版式里的每一条内容行过一遍净化（[`capture::sanitize`] 幂等：白名单 SGR 与普通文本原样保留）。
+///
+/// 在截断之前做：截断之后的行已经是显示层的一部分，内容边界不再可辨。光标列也从净化后的行算
+/// （[`cursor`]），内容里的转义因此既进不了帧、也不会把光标位置算歪。
+fn sanitized(rows: Vec<(Slot, String)>) -> Vec<(Slot, String)> {
+    rows.into_iter()
+        .map(|(slot, text)| (slot, capture::sanitize(text.as_bytes())))
+        .collect()
 }
 
 /// 一行在版式里的位置：决定这一行套哪一档 chrome（行内容本身是普通文本，颜色由 [`paint`] 加）。

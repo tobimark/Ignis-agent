@@ -18,8 +18,9 @@
 //!   末尾、草稿丢弃——「召回之后接着打字 = 接在末尾」。
 //! - **只在内容变化时 `Redraw`**：空操作（行首退格、末尾删除、到头的光标移动、已经是空的
 //!   `Ctrl+U`）一律 `Idle`，读取层因此不会白写一帧。
-//! - `Tab`/粘贴标记/`CtrlC`/`Other` 都是 `Idle`：Tab 由读取层走补全（本模块不认识候选），
-//!   粘贴标记只是区间记号，空闲 Ctrl+C 的退出语义在 REPL 侧。
+//! - `Tab`/粘贴标记/`CtrlC`/`Other`/`PageUp`/`PageDown` 都是 `Idle`：Tab 由读取层走补全（本模块
+//!   不认识候选），粘贴标记只是区间记号，空闲 Ctrl+C 的退出语义在 REPL 侧；`PageUp`/`PageDown`
+//!   在 TUI 里由应用层接手（翻滚动区），经典路径与它们此前当 `Other` 时逐字一致。
 
 use super::history::History;
 use super::keys::Key;
@@ -99,7 +100,17 @@ impl EditorState {
             Key::CtrlU => self.clear(),
             // 都不改内容，所以是 Idle；但它们同样算「非导航键」，一样脱离浏览。
             // `Esc` 只由 TUI 的 Esc 消歧合成（解码器不产生它）：状态机忽略，语义归选择器那一层。
-            Key::Tab | Key::PasteStart | Key::PasteEnd | Key::CtrlC | Key::Esc | Key::Other => {
+            // `PageUp`/`PageDown`（`\x1b[5~`/`\x1b[6~`）在经典路径里与 `Other` 逐字同一条处理：
+            // 它们此前就是 `Other`（增量新增只给变体起了名字），字节级行为一字不改；翻页的落点
+            // 只有 TUI 的编辑器态认识（`TuiApp::on_bytes`），状态机这里仍是空操作。
+            Key::Tab
+            | Key::PasteStart
+            | Key::PasteEnd
+            | Key::CtrlC
+            | Key::Esc
+            | Key::PageUp
+            | Key::PageDown
+            | Key::Other => {
                 self.leave_browse();
                 Event::Idle
             }
@@ -255,7 +266,7 @@ impl EditorState {
 #[cfg(test)]
 mod tests {
     use crate::editor::history::History;
-    use crate::editor::keys::Key;
+    use crate::editor::keys::{Decoder, Key};
 
     use super::{EditorState, Event};
 
@@ -535,6 +546,8 @@ mod tests {
             Key::PasteStart,
             Key::PasteEnd,
             Key::CtrlC,
+            Key::PageUp,
+            Key::PageDown,
             Key::Other,
         ] {
             assert_eq!(state.handle(key), Event::Idle, "{key:?} 不该触发重绘");
@@ -558,6 +571,34 @@ mod tests {
             Event::Idle,
             "草稿随脱离一起丢弃"
         );
+    }
+
+    /// F2（终审修复波）：`\x1b[5~`/`\x1b[6~` 在经典路径上逐字节不变——解码成 `PageUp`/`PageDown`
+    /// 之后仍是 `Idle`（与它们此前当 `Key::Other` 时同一条处理），缓冲与光标一个字节都不动；
+    /// 它们同样算「非导航键」，一样脱离浏览。
+    #[test]
+    fn page_keys_stay_no_ops_on_the_classic_path() {
+        let mut state = editor();
+        assert_eq!(
+            submit(&mut state, "第一条"),
+            Event::Submit("第一条".to_string())
+        );
+        type_text(&mut state, "草稿");
+        assert_eq!(state.handle(Key::Up), Event::Redraw, "先召回历史");
+        assert_eq!(state.text(), "第一条");
+
+        let mut decoder = Decoder::new();
+        for bytes in [b"\x1b[5~".as_slice(), b"\x1b[6~".as_slice()] {
+            for key in decoder.feed(bytes) {
+                assert_eq!(
+                    state.handle(key),
+                    Event::Idle,
+                    "{bytes:?} 在经典路径上是空操作"
+                );
+            }
+            assert_eq!(state.text(), "第一条", "缓冲一个字节都不动");
+        }
+        assert_eq!(state.handle(Key::Down), Event::Idle, "草稿随脱离一起丢弃");
     }
 
     #[test]

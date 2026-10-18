@@ -41,7 +41,8 @@ use crate::tui::confirm::ConfirmJob;
 use crate::tui::input::InputState;
 use crate::tui::term;
 use crate::tui::view::{
-    InputBlock, Scrollback, TuiView, ViewFacts, compose, selector_lines, status_line, top_line,
+    FIXED_ROWS, InputBlock, Scrollback, TuiView, ViewFacts, compose, selector_lines, status_line,
+    top_line,
 };
 
 /// 100ms 的心跳：忙碌期每 tick 排空一次捕获（流式输出落进滚动区），空闲期用它做 Esc 消歧。
@@ -143,6 +144,28 @@ pub enum InputMode {
     },
 }
 
+/// 进终端守卫之前就注册好的两个信号流（F4）。
+///
+/// 注册只该有这一次：`TerminalGuard::enter()` 与主循环之间还夹着建会话、`-c` 装载与起输入线程，
+/// 这一段启动窗口里的 Ctrl+C 必须由主循环接住，而不是按默认处置把进程带走（备用屏与 raw mode
+/// 会留在那里）；流本身由 [`TuiApp::attach_signals`] 接进应用。
+pub struct Signals {
+    /// SIGINT 流（注册失败 = `None`：按永不触发的信号源挂起，不 panic）。
+    pub sigint: Option<Signal>,
+    /// SIGWINCH 流（注册失败同上）。
+    pub sigwinch: Option<Signal>,
+}
+
+impl Signals {
+    /// 注册 SIGINT 与 SIGWINCH：调用方必须在 [`term::TerminalGuard::enter`] **之前**调它。
+    pub fn install() -> Self {
+        Self {
+            sigint: signal(SignalKind::interrupt()).ok(),
+            sigwinch: signal(SignalKind::window_change()).ok(),
+        }
+    }
+}
+
 /// TUI 的应用状态：不持有会话（future 借用 `&mut Session` 期间的借用冲突规避）。
 pub struct TuiApp {
     /// 有界滚动区：捕获文本的落点。
@@ -164,10 +187,10 @@ pub struct TuiApp {
     /// 本轮的取消令牌（`drive` 进入时挂上、退出时摘掉）：审批态的 `Ctrl+C` 字节与 SIGINT 同义，
     /// 靠它取消本轮任务（`/compact` `/learn` 的令牌；任务轮次给 `None`，取消在 `run_task` 内部）。
     cancel: Option<CancellationToken>,
-    /// SIGINT 信号流（第一次用到时装上；装不上就永远挂起）。
-    sigint: Option<Signal>,
-    /// SIGWINCH 信号流（同上）。
-    sigwinch: Option<Signal>,
+    /// 信号流（SIGINT/SIGWINCH）：生产路径由 `tui::start_with` 在进守卫**之前**注册并接上
+    /// （[`TuiApp::attach_signals`]）；没接上的应用（用例的 headless 夹具）在第一次用到时现场装
+    /// 一份——`Some` 之后绝不再注册第二份。
+    signals: Option<Signals>,
 }
 
 impl TuiApp {
@@ -183,9 +206,13 @@ impl TuiApp {
             approvals: None,
             confirms: None,
             cancel: None,
-            sigint: None,
-            sigwinch: None,
+            signals: None,
         }
+    }
+
+    /// 接上启动时（进守卫之前）注册好的信号流：这是生产路径唯一的一次注册（F4）。
+    pub(crate) fn attach_signals(&mut self, signals: Signals) {
+        self.signals = Some(signals);
     }
 
     /// 接上输入读取线程的接收端（主循环进入时调一次）。
@@ -220,6 +247,10 @@ impl TuiApp {
     /// 忙碌期一律没有动作（输入禁用）：字节照吃（别留给空闲期），缓冲一个字符都不进。
     /// 审批/确认/选择器期的按键分别走 [`TuiApp::approval_key`] / [`TuiApp::confirm_key`] /
     /// [`TuiApp::selector_key`]（**绝不进**编辑器）。
+    ///
+    /// 编辑器态里 `PageUp`/`PageDown` 额外翻一屏滚动区（步长 = 可视视口行数，见
+    /// [`content_rows`]）：编辑器状态机对它们是空操作（经典口径），滚动因此要在这里落地并补一次
+    /// 重绘。
     pub fn on_bytes(&mut self, bytes: &[u8]) -> Vec<Action> {
         if matches!(self.mode, InputMode::Approval { .. }) {
             return self.approval_bytes(bytes);
@@ -233,7 +264,26 @@ impl TuiApp {
         if !matches!(self.mode, InputMode::Editor) {
             return Vec::new();
         }
-        let mut actions = self.input.on_bytes(bytes);
+        let step = content_rows(self.size);
+        let mut actions = Vec::new();
+        for (key, action) in self.input.on_bytes_with_keys(bytes) {
+            let scrolled = match key {
+                Key::PageUp => {
+                    self.scrollback.scroll_up(step);
+                    true
+                }
+                Key::PageDown => {
+                    self.scrollback.scroll_down(step);
+                    true
+                }
+                _ => false,
+            };
+            // 编辑器对翻页键是空操作（`Idle`）：滚动本身要一帧才看得见
+            actions.push(match (scrolled, action) {
+                (true, Action::None) => Action::Redraw,
+                (_, action) => action,
+            });
+        }
         // 非法 UTF-8：与经典共用同一份文案的一行告警进滚动区，并请求一次重绘
         if self.input.take_invalid() {
             self.push_lines([INVALID_WARNING.to_string()]);
@@ -335,11 +385,14 @@ impl TuiApp {
 
     /// 一批完整的行进滚动区（命令输出、错误行、提交回显都走它）。
     ///
-    /// 先把捕获里没换行的尾巴落地：这些行必须各占一行（不与半行粘在一起）。
+    /// 每一行先过 [`capture::sanitize`] 再入区（F1）：这条路口子上的行也可能带着命令输出或会话
+    /// 标题里的控制字节，滚动区里因此**不再存控制字节**（`compose` 那一层是同一函数的第二道
+    /// 保险）。先把捕获里没换行的尾巴落地：这些行必须各占一行（不与半行粘在一起）。
     pub fn push_lines(&mut self, lines: impl IntoIterator<Item = String>) {
         self.scrollback.flush_pending();
         for line in lines {
-            self.scrollback.push_text(&line);
+            self.scrollback
+                .push_text(&capture::sanitize(line.as_bytes()));
             self.scrollback.push_text("\n");
         }
     }
@@ -626,7 +679,12 @@ impl TuiApp {
                     rows,
                     cursor,
                     current,
-                } => selector_lines(rows, current.as_deref(), *cursor),
+                } => {
+                    // 列表围绕光标开窗（F3）：切给可视高度那么多行，选中行（列表里第 `1 + cursor`
+                    // 行，第 0 行是表头）始终在窗口里，窗口随光标移动
+                    let lines = selector_lines(rows, current.as_deref(), *cursor);
+                    selector_window(lines, 1 + *cursor, content_rows(self.size))
+                }
                 _ => self.scrollback.viewport(self.size.rows),
             },
             input,
@@ -638,8 +696,7 @@ impl TuiApp {
     pub(crate) async fn wait_idle(&mut self) -> Wake {
         self.install_signals();
         let mut chunks = self.chunks.take();
-        let mut sigint = self.sigint.take();
-        let mut sigwinch = self.sigwinch.take();
+        let (mut sigint, mut sigwinch) = self.take_signals();
         // 用 `sleep` 而不是 `interval`：每次等待重新计时，等到的永远是「安静 100ms 之后」的
         // 那一次心跳（首个 tick 不会立刻返回，也就不会空转）
         let wake = tokio::select! {
@@ -653,8 +710,7 @@ impl TuiApp {
             _ = tokio::time::sleep(TICK) => Wake::Tick,
         };
         self.chunks = chunks;
-        self.sigint = sigint;
-        self.sigwinch = sigwinch;
+        self.put_signals(sigint, sigwinch);
         wake
     }
 
@@ -709,8 +765,7 @@ impl TuiApp {
         let mut chunks = self.chunks.take();
         let mut approvals = self.approvals.take();
         let mut confirms = self.confirms.take();
-        let mut sigint = self.sigint.take();
-        let mut sigwinch = self.sigwinch.take();
+        let (mut sigint, mut sigwinch) = self.take_signals();
         // 本轮令牌挂进应用：审批态的 `Ctrl+C` 字节靠它取消本轮任务（见 `TuiApp::approval_key`）
         self.cancel = cancel.clone();
 
@@ -766,8 +821,7 @@ impl TuiApp {
         self.chunks = chunks;
         self.approvals = approvals;
         self.confirms = confirms;
-        self.sigint = sigint;
-        self.sigwinch = sigwinch;
+        self.put_signals(sigint, sigwinch);
         // 本轮结束：摘掉令牌（审批态的按键不该动下一轮的取消）
         self.cancel = None;
         // 收尾：把捕获里剩下的字节排空、半行落地（本轮输出必须完整落进滚动区）
@@ -776,12 +830,30 @@ impl TuiApp {
     }
 
     /// 第一次用到时装上信号流（装不上——不支持的平台——就永远挂起，不 panic）。
+    ///
+    /// 已经接上（生产路径在进守卫之前装的，见 [`TuiApp::attach_signals`]）或已经现场装过一次的
+    /// （`Some` 就是「装过」）什么都不做：**一份就够，绝不重复注册**——重复注册会让同一路信号多
+    /// 出一条没人读的流。
     fn install_signals(&mut self) {
-        if self.sigint.is_none() {
-            self.sigint = signal(SignalKind::interrupt()).ok();
+        if self.signals.is_none() {
+            self.signals = Some(Signals::install());
         }
-        if self.sigwinch.is_none() {
-            self.sigwinch = signal(SignalKind::window_change()).ok();
+    }
+
+    /// 把两个信号流取出来（`select!` 的借用比 `&mut self` 活得久）：取出与放回必须成对
+    /// （[`TuiApp::put_signals`]）；槽位本身留着——它就是「已经装过」的判据。
+    fn take_signals(&mut self) -> (Option<Signal>, Option<Signal>) {
+        match self.signals.as_mut() {
+            Some(signals) => (signals.sigint.take(), signals.sigwinch.take()),
+            None => (None, None),
+        }
+    }
+
+    /// 把 [`TuiApp::take_signals`] 取出来的两个流放回去（下一轮等待接着用同一份）。
+    fn put_signals(&mut self, sigint: Option<Signal>, sigwinch: Option<Signal>) {
+        if let Some(signals) = self.signals.as_mut() {
+            signals.sigint = sigint;
+            signals.sigwinch = sigwinch;
         }
     }
 
@@ -794,6 +866,29 @@ impl TuiApp {
         // 写失败（EPIPE 等）忽略：画不出帧不该带走一场会话
         let _ = guard.write(compose(&view).as_bytes());
     }
+}
+
+/// 内容区（消息视口 / 选择器列表）的可视行数：`rows` 减去版式的固定行（顶部状态行 1 + 输入区 3 +
+/// 底部状态行 1），至少 1 行——极小窗口里也是「看得见一行」而不是零行。
+///
+/// 这一个口径就是 PgUp/PgDn 的步长（F2）与选择器开窗的高度（F3），与帧的版式同源
+/// （[`FIXED_ROWS`]）。
+fn content_rows(size: Size) -> usize {
+    size.rows.saturating_sub(FIXED_ROWS).max(1)
+}
+
+/// 选择器列表的开窗：取包含 `selected` 行的连续 `visible` 行（窗口贴住列表两端，绝不越界）。
+///
+/// `selector_lines` 的产物只是被切了一段——表头与列宽都不重排；列表不长于 `visible` 时原样返回
+/// （既有断言因此逐字不变）。`visible` 至少取 1 行。
+fn selector_window(lines: Vec<String>, selected: usize, visible: usize) -> Vec<String> {
+    let visible = visible.max(1);
+    if lines.len() <= visible {
+        return lines;
+    }
+    let last_start = lines.len() - visible;
+    let start = selected.saturating_sub(visible - 1).min(last_start);
+    lines[start..start + visible].to_vec()
 }
 
 /// 空闲期等到的一件事（主循环按它分派）。
@@ -966,7 +1061,10 @@ mod tests {
     use crate::tui::term::TerminalGuard;
     use crate::tui::view::{Scrollback, ViewFacts, compose, selector_lines, status_line, top_line};
 
-    use super::{Action, BUSY_HINT, Busy, IDLE_HINT, InputChunk, InputMode, SELECTOR_HINT, TuiApp};
+    use super::{
+        Action, BUSY_HINT, Busy, IDLE_HINT, InputChunk, InputMode, SELECTOR_HINT, Signals, TuiApp,
+        Wake,
+    };
 
     /// 事实快照：顶/底状态行只关心拼法（与 T2 的用例同形）。
     fn facts() -> ViewFacts {
@@ -1099,6 +1197,174 @@ mod tests {
         assert!(
             lines.iter().all(|line| !line.contains('\u{1b}')),
             "滚动区里不许有 ESC：{lines:?}"
+        );
+    }
+
+    /// 帧协议自身的序列（藏/显光标、归位、清行）。
+    const FRAME_SEQUENCES: [&str; 4] = ["\x1b[?25l", "\x1b[?25h", "\x1b[H", "\x1b[K"];
+
+    /// 调色板的六个 SGR（`capture` 的净化白名单）：chrome 与渲染器输出的正当上色。
+    const PALETTE_SGR: [&str; 6] = [
+        "\x1b[0m", "\x1b[1m", "\x1b[2m", "\x1b[31m", "\x1b[36m", "\x1b[90m",
+    ];
+
+    /// 帧里第一条「既不属于帧协议、也不属于调色板白名单」的转义段（`None` = 干净）。
+    ///
+    /// F1 的判据：内容行漏出来的转义（清屏 `\x1b[2J`、OSC 改标题、裸 ESC）两者都不是，一出现就
+    /// 会被这里抓住。
+    fn stray_escape(frame: &str) -> Option<String> {
+        let mut rest = frame;
+        while let Some(start) = rest.find('\u{1b}') {
+            let tail = &rest[start..];
+            if let Some(known) = FRAME_SEQUENCES
+                .iter()
+                .chain(PALETTE_SGR.iter())
+                .find(|sequence| tail.starts_with(**sequence))
+            {
+                rest = &tail[known.len()..];
+                continue;
+            }
+            // 光标绝对定位（`\x1b[{row};{col}H`）：参数只有数字与 `;`
+            if let Some(body) = tail.strip_prefix("\x1b[")
+                && let Some((params, _)) = body.split_once('H')
+                && !params.is_empty()
+                && params.chars().all(|ch| ch.is_ascii_digit() || ch == ';')
+            {
+                rest = &body[params.len() + 1..];
+                continue;
+            }
+            return Some(tail.chars().take(8).collect());
+        }
+        None
+    }
+
+    /// F1（终审修复波）：帧的内容来源全部净化——`push_lines` 的每一行先过 `capture::sanitize`
+    /// 再进滚动区，`compose` 在截断之前对每一条内容行（viewport/top/input/status）再过一遍同一
+    /// 函数。含清屏（`\x1b[2J`）与 OSC 改标题（`\x1b]0;x\x07`）的行既进不了滚动区、也进不了整帧：
+    /// 帧里除协议自身的序列与调色板白名单之外没有任何 ESC。
+    #[test]
+    fn escapes_never_reach_the_scrollback_or_the_frame() {
+        let (mut app, _buffer) = app();
+        let facts = facts();
+        app.set_size(Size { cols: 60, rows: 12 });
+        app.push_lines([
+            "打了花\u{1b}[2J还活着\u{1b}]0;标题\u{7}".to_string(),
+            "\u{1b}[2J整行都是控制字节".to_string(),
+        ]);
+
+        // 滚动区（命令输出/模型流式输出的落点）里一个 ESC 都没有，文本照留
+        let viewport = app.view(&facts).viewport;
+        assert_eq!(viewport, ["打了花还活着", "整行都是控制字节"]);
+        assert!(
+            viewport.iter().all(|line| !line.contains('\u{1b}')),
+            "{viewport:?}"
+        );
+
+        // top/status/输入区也塞进同类字节：合成器在截断之前净化（无色与上色两条路都过）
+        for color in [false, true] {
+            let mut view = app.view(&facts);
+            view.color = color;
+            view.top = "IGNIS\u{1b}[2J v0 · \u{1b}]0;top\u{7}".to_string();
+            view.input.lines[0] = "❯ \u{1b}[2J输入".to_string();
+            view.input.lines[1] = "\u{1b}]0;续行\u{7}x".to_string();
+            view.input.lines[2] = "\u{1b}[2m提示\u{1b}[2J".to_string();
+            view.status = "ctx 0\u{1b}[2J/1 chars · \u{1b}]0;s\u{7}".to_string();
+
+            let frame = compose(&view);
+            assert!(!frame.contains("\u{1b}[2J"), "清屏序列进了帧：{frame:?}");
+            assert!(!frame.contains("\u{1b}]"), "OSC 进了帧：{frame:?}");
+            assert!(!frame.contains('\u{7}'), "BEL 进了帧：{frame:?}");
+            assert_eq!(
+                stray_escape(&frame),
+                None,
+                "帧里除协议自身的序列与调色板之外不许有 ESC：{frame:?}"
+            );
+        }
+    }
+
+    /// F2（终审修复波）：编辑器态里的 PgUp/PgDn 真的翻滚动区——步长 = 可视视口行数
+    /// （`rows - 5`，至少 1），翻上去看得到旧行、PgDn 一路回到贴底；字节不进编辑器缓冲。
+    #[test]
+    fn page_keys_scroll_the_scrollback_and_return_to_the_bottom() {
+        let (mut app, _buffer) = app();
+        let facts = facts();
+        app.set_size(Size { cols: 80, rows: 12 });
+        let lines: Vec<String> = (1..=40).map(|index| format!("line {index}")).collect();
+        app.push_lines(lines.clone());
+        let visible = 12 - 5; // 步长与帧里的消息区行数是同一个口径
+
+        // 帧里真的画出来的那些行（每行以清行序列收尾；80 列装得下，不会截断）
+        let framed = |app: &TuiApp| -> Vec<String> {
+            let frame = compose(&app.view(&facts));
+            lines
+                .iter()
+                .filter(|line| frame.contains(&format!("{line}\u{1b}[K")))
+                .cloned()
+                .collect()
+        };
+
+        assert_eq!(framed(&app), lines[lines.len() - visible..], "一开始贴着底");
+
+        // PgUp：翻上去一屏，看到的是更旧的那一段（最新一行离开视口）
+        assert_eq!(app.on_bytes(b"\x1b[5~"), [Action::Redraw], "翻页要重绘一帧");
+        assert_eq!(
+            framed(&app),
+            lines[lines.len() - 2 * visible..lines.len() - visible],
+            "翻上去看得到旧行"
+        );
+
+        // 再翻一屏：更旧
+        assert_eq!(app.on_bytes(b"\x1b[5~"), [Action::Redraw]);
+        assert_eq!(
+            framed(&app),
+            lines[lines.len() - 3 * visible..lines.len() - 2 * visible]
+        );
+
+        // PgDn 一路回到底：逐字回到贴底那一段
+        assert_eq!(app.on_bytes(b"\x1b[6~"), [Action::Redraw]);
+        assert_eq!(
+            framed(&app),
+            lines[lines.len() - 2 * visible..lines.len() - visible]
+        );
+        assert_eq!(app.on_bytes(b"\x1b[6~"), [Action::Redraw]);
+        assert_eq!(
+            framed(&app),
+            lines[lines.len() - visible..],
+            "PgDn 回到贴底"
+        );
+        assert_eq!(app.input.text(), "", "翻页键一个字符都不进编辑器缓冲");
+
+        // 贴底之后再按 PgDn：offset 不越界（不 panic、内容照旧）
+        assert_eq!(app.on_bytes(b"\x1b[6~"), [Action::Redraw]);
+        assert_eq!(framed(&app), lines[lines.len() - visible..]);
+    }
+
+    /// F4（终审修复波）：启动时（进守卫之前）注册好的信号流被真正接进应用——`wait_idle` 从它上面
+    /// 收得到 SIGWINCH，且取出来等信号的两个流在等待结束后**还回去**（下一轮接着用同一份，
+    /// 应用绝不重复注册）。
+    #[tokio::test]
+    async fn attached_signals_drive_the_idle_loop() {
+        let (mut app, _buffer) = app();
+        app.attach_signals(Signals::install());
+        assert!(app.signals.is_some(), "接上之后应用手里就有一份信号流");
+
+        // 每 10ms 给自己发一次 SIGWINCH：注册生效的话它必然先于 100ms 的心跳到达
+        let raiser = tokio::spawn(async {
+            for _ in 0..20 {
+                // SAFETY: `raise` 只影响本进程，SIGWINCH 的默认处置本来就是「忽略」
+                unsafe { libc::raise(libc::SIGWINCH) };
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let wake = app.wait_idle().await;
+        raiser.abort();
+
+        assert_eq!(wake, Wake::Sigwinch, "接上的 SIGWINCH 流必须被主循环用上");
+        assert!(
+            app.signals
+                .as_ref()
+                .is_some_and(|signals| signals.sigint.is_some() && signals.sigwinch.is_some()),
+            "两个流都回到槽位里：下一轮接着用它们，不重复注册"
         );
     }
 
@@ -1999,7 +2265,15 @@ mod tests {
         let facts = facts();
 
         app.open_selector(rows.clone(), Some(id.to_string()));
-        for key in [Key::Char('a'), Key::Other, Key::Tab, Key::Backspace] {
+        for key in [
+            Key::Char('a'),
+            Key::Other,
+            Key::Tab,
+            Key::Backspace,
+            // F2 新增的两个变体在选择器里同样「其余忽略」（翻页只归编辑器态的滚动区）
+            Key::PageUp,
+            Key::PageDown,
+        ] {
             assert!(app.selector_key(key).is_empty(), "{key:?} 应被忽略");
             assert!(
                 app.on_bytes(b"a").is_empty(),
@@ -2020,6 +2294,80 @@ mod tests {
         assert_eq!(
             app.selector_key(Key::Enter),
             [Action::Resume(id.to_string())]
+        );
+    }
+
+    /// F3（终审修复波）：选择器列表围绕光标开窗——`rows = 8` 的终端给列表 `rows - 5` = 3 行，
+    /// 选中行（`> `）始终在窗口里，窗口随光标移动（贴头、随行、贴尾）。
+    #[test]
+    fn selector_window_keeps_the_cursor_row_visible_at_eight_rows() {
+        let rows: Vec<SessionSummary> = (0..6)
+            .map(|index| {
+                session_summary(
+                    &format!("019a1b2c-2222-7f00-8000-00000000000{index}"),
+                    &format!("会话 {index}"),
+                    100 + index,
+                    1,
+                )
+            })
+            .collect();
+        let (mut app, _buffer) = app();
+        let facts = facts();
+        app.set_size(Size { cols: 60, rows: 8 });
+        app.open_selector(rows.clone(), None);
+        let visible = 8 - 5;
+
+        // 游标在第 0 行：窗口贴着列表头（表头 + 第 1、2 行），选中行在窗口里
+        let viewport = app.view(&facts).viewport;
+        assert_eq!(viewport.len(), visible, "8 行终端给列表 3 行：{viewport:?}");
+        assert_eq!(
+            viewport,
+            selector_lines(&rows, None, 0)[..visible].to_vec(),
+            "贴头"
+        );
+        assert!(viewport[1].starts_with("> "), "{viewport:?}");
+
+        // ↓ 到第 4 行（下标 3）：窗口跟着移到第 2..5 行，`> ` 行仍在窗口里
+        for _ in 0..3 {
+            assert_eq!(app.selector_key(Key::Down), [Action::Redraw]);
+        }
+        let viewport = app.view(&facts).viewport;
+        assert_eq!(viewport.len(), visible);
+        assert_eq!(
+            viewport,
+            selector_lines(&rows, None, 3)[2..5].to_vec(),
+            "窗口随光标移动"
+        );
+        assert!(
+            viewport[2].starts_with("> "),
+            "> 行必须在窗口里：{viewport:?}"
+        );
+
+        // 再到最后一行（下标 5）：窗口贴着列表尾，`> ` 行还是看得见（表头滚出去了）
+        for _ in 0..2 {
+            assert_eq!(app.selector_key(Key::Down), [Action::Redraw]);
+        }
+        let viewport = app.view(&facts).viewport;
+        assert_eq!(
+            viewport,
+            selector_lines(&rows, None, 5)[4..7].to_vec(),
+            "到底时窗口贴着列表尾"
+        );
+        assert!(
+            viewport[2].starts_with("> "),
+            "最后一行也看得见：{viewport:?}"
+        );
+        assert!(
+            !viewport.iter().any(|line| line.starts_with("  ID")),
+            "表头随窗口滚出：{viewport:?}"
+        );
+
+        // 列表装得下时不开窗（既有断言的口径不变）：换一个短表
+        app.open_selector(rows[..1].to_vec(), None);
+        assert_eq!(
+            app.view(&facts).viewport,
+            selector_lines(&rows[..1], None, 0),
+            "短表原样全给"
         );
     }
 }

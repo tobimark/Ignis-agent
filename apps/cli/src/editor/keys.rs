@@ -71,6 +71,12 @@ pub enum Key {
     PasteStart,
     /// bracketed paste 结束（`\x1b[201~`）。
     PasteEnd,
+    /// PageUp（`\x1b[5~`）：**经典编辑器不绑定它**——状态机按 [`Key::Other`] 的既有处理
+    /// （`leave_browse` + `Idle`），字节级行为与新增这个变体之前逐字一致；TUI 的编辑器态用它
+    /// 翻一屏滚动区（落点只有应用层认识）。
+    PageUp,
+    /// PageDown（`\x1b[6~`）：与 [`Key::PageUp`] 同一条口径。
+    PageDown,
     /// 没有绑定的按键（未识别的转义序列、没有映射的控制字节）：状态机忽略。
     Other,
 }
@@ -292,6 +298,10 @@ fn csi_key(params: &[u8], final_byte: u8) -> Key {
         (b"1", b'~') => Key::Home,
         (b"3", b'~') => Key::Delete,
         (b"4", b'~') => Key::End,
+        // 增量新增：`5~`/`6~` 此前按未绑定 CSI 解成 `Key::Other`，经典路径的处理逐字不变
+        // （见 `editor::state` 的同一个 match 臂）；其余参数形状（`5;5~`、`15~` 之类）照旧 `Other`。
+        (b"5", b'~') => Key::PageUp,
+        (b"6", b'~') => Key::PageDown,
         (b"200", b'~') => Key::PasteStart,
         (b"201", b'~') => Key::PasteEnd,
         _ => Key::Other,
@@ -462,6 +472,26 @@ mod tests {
         assert_eq!(decode(b"\x1bOF"), vec![Key::End], "SS3 F");
         assert_eq!(decode(b"\x1b[4~"), vec![Key::End], "CSI 4~");
         assert_eq!(decode(b"\x1b[3~"), vec![Key::Delete], "CSI 3~");
+    }
+
+    /// F2（终审修复波）：PgUp/PgDn 是**增量新增**——`\x1b[5~`/`\x1b[6~` 此前解成 [`Key::Other`]，
+    /// 现在各成一个变体（`state.rs` 里与 `Other` 逐字同一条处理，经典行为不变）；其余参数形状
+    /// （带修饰的 `5;5~`、`15~` 之类）照旧是 `Other`。
+    #[test]
+    fn page_up_and_page_down_decode_from_csi_tilde() {
+        assert_eq!(decode(b"\x1b[5~"), vec![Key::PageUp], "CSI 5~");
+        assert_eq!(decode(b"\x1b[6~"), vec![Key::PageDown], "CSI 6~");
+        assert_eq!(
+            decode(b"\x1b[5;5~"),
+            vec![Key::Other],
+            "带修饰的 5~ 仍然未绑定（只做增量新增）"
+        );
+        assert_eq!(decode(b"\x1b[15~"), vec![Key::Other], "F5 之类照旧未绑定");
+
+        // 跨读取缓存照旧：`\x1b[` + `5~` 拼上才出按键。
+        let mut decoder = Decoder::new();
+        assert!(decoder.feed(b"\x1b[5").is_empty(), "参数只到一半，先留着");
+        assert_eq!(decoder.feed(b"~"), vec![Key::PageUp], "拼上后解成 PageUp");
     }
 
     #[test]

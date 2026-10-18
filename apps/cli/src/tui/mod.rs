@@ -34,6 +34,11 @@
 //!   （`color=false` 时零 SGR；光标定位与清行不是颜色，照常写——见 [`view::compose`]）；
 //! - **Esc 的消歧窗口是一个 100ms tick**：字节解码器无时钟（半条转义序列必须留在缓存里），裸 ESC
 //!   由 [`app::TuiApp::on_tick`] 合成，代价是 Alt+Enter 被切在两个 tick 之间时可能被当成 Enter；
+//! - **异常终止不做兜底（SIGTERM/SIGTSTP/SIGHUP）**：只有 SIGINT 与 SIGWINCH 有处理器（在进
+//!   [`term::TerminalGuard`] 之前注册，见 [`start_with`]）；被 `kill`、`Ctrl+Z` 挂起或终端断开时
+//!   进程直接走掉，备用屏与 raw mode 由终端自己收尾（回到 shell 可能看起来坏掉）——敲 `stty sane`
+//!   或 `reset` 恢复。正常退出（`/exit`、空缓冲 `Ctrl+D`、空闲 `Ctrl+C`、stdin 关闭）与 panic 都由
+//!   守卫的 `Drop` 还原；
 //! - **极端批次会丢回车之后的按键**：粘贴后紧跟回车的同一批字节里，回车（提交）之后的按键会被丢掉
 //!   ——与「忙碌期输入禁用」是同一条规则。
 
@@ -240,6 +245,10 @@ pub async fn start(cli: &Cli) -> Result<Option<ExitCode>> {
 /// 调用）→ `install_panic_hook()` → [`TerminalGuard::enter`]（io 错误 → 一行 note + `Ok(None)`；
 /// 成功之后任何早退都由守卫 `Drop` 还原备用屏与 termios）→ 会话 + `-c` + 开机行 → [`run`]。
 /// 生产入口 [`start`] 传的是进程现场与真实工厂，与用例走同一条路径。
+///
+/// **信号流在进守卫之前注册**（F4）：可用性判定之后、[`TerminalGuard::enter`] 之前调一次
+/// [`app::Signals::install`]，把两个流交给 [`run`] → [`app::TuiApp::attach_signals`]。启动窗口
+/// （建会话、`-c` 装载、起输入线程）里的 SIGINT 从此由主循环接住，而不是按默认处置把进程带走。
 async fn start_with<B>(
     cli: &Cli,
     stdin_tty: bool,
@@ -257,8 +266,9 @@ where
         return Ok(None);
     }
 
-    // 2. 终端守卫：raw mode 进不去时屏幕零改动（字节一个没写），同样只打一行 note；成功之后
-    //    **每一条**退出路径（`/exit`、`?` 早退、错误、panic）都靠它收尾
+    // 2. 信号流与 panic 兜底：两者都在进守卫**之前**做——守卫成功之后每一条退出路径都靠它们
+    //    收尾；这一份注册是唯一的一次（`TuiApp` 里绝不重复注册）
+    let signals = app::Signals::install();
     install_panic_hook();
     let (mut term, _) = match TerminalGuard::enter() {
         Ok(entered) => entered,
@@ -278,7 +288,7 @@ where
     // 4. 主循环：输入读取线程 + 块通道；退出码原样交回
     let (tx, chunks) = mpsc::unbounded_channel();
     app::spawn_input_reader(tx);
-    let code = run(&mut session, &mut term, chunks, approvals, startup).await?;
+    let code = run(&mut session, &mut term, chunks, approvals, startup, signals).await?;
     Ok(Some(code))
 }
 
@@ -303,13 +313,15 @@ fn startup_lines(session: &Session, resume_note: Option<&'static str>) -> Vec<St
 ///
 /// `approvals` 是 [`TuiApproval::channel`] 的回信端（内联审批画在忙碌循环的滚动区里）；
 /// `startup` 是 [`startup_lines`] 的开机行（`-c` note、内核能力提示、未读告警行），先落滚动区再画
-/// 第一帧。
+/// 第一帧；`signals` 是进守卫之前注册好的 SIGINT/SIGWINCH 流（F4），接进 [`TuiApp`] 之后由它持有
+/// ——应用自己绝不重复注册。
 pub async fn run(
     session: &mut Session,
     term: &mut TerminalGuard,
     chunks: mpsc::UnboundedReceiver<InputChunk>,
     approvals: mpsc::UnboundedReceiver<ApprovalJob>,
     startup: Vec<String>,
+    signals: app::Signals,
 ) -> Result<ExitCode> {
     // 捕获缓冲：渲染器与滚动区共持（每轮任务的 `CaptureSink` 由 `TuiApp::capture_sink` 现取）
     let (_, buffer) = CaptureSink::pair();
@@ -321,6 +333,8 @@ pub async fn run(
     );
     app.attach_chunks(chunks);
     app.attach_approvals(approvals);
+    // 信号流接上（进守卫之前注册的那一份）：启动窗口里的 SIGINT 由主循环接住
+    app.attach_signals(signals);
     app.set_size(term.size());
     // 开机行先落滚动区：第一帧就带着它们（与经典路径同一份文案）
     if !startup.is_empty() {
