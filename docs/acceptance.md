@@ -21,10 +21,7 @@
 > 原始证据（tmux pane 文本截图、pane 原始字节流、驱动脚本）留在
 > `.superpowers/sdd/2026-10-16-ignis-v0.2-p6-release/matrix-evidence/`（gitignore 目录，随本机留存）。
 
-**结论：验收不完整。** 三条真机门槛（`demos 3` / `tasks 20` / `restarts 10`）**本机没有真实模型凭据、
-未执行**；终端矩阵的「Ubuntu 默认终端（gnome-terminal/konsole）」「SSH」两行**本机没有可用的终端环境**；
-「浅色主题」的**主观可读性**没有可用的显示环境——三处 SKIP 各有原因（见下）。其余项（§8 九条里的
-自动化面、两条新指标、终端矩阵其余四行、全量回归）都已实际执行并逐条记录在案。
+**结论：验收不完整。** SKIP 项逐条如下（每项原因见下文对应行）：三条真机门槛（`demos 3` / `tasks 20` / `restarts 10`，**本机没有真实模型凭据**，未执行）；终端矩阵的「Ubuntu 默认终端（gnome-terminal/konsole）」与「SSH」两行（**本机没有可用的终端环境**）；终端矩阵的「浅色主题」主观可读性（**没有可用的显示环境**）；§8 第 4/5/6 条各自的**真机（真实模型）面**（第 4 条的「真实任务验证复述」、第 5/6 条的真机 harness 面）；§8「端到端演示（可重复）」的真机三启动（无凭据）。其余项（§8 九条里的自动化面、两条新指标、终端矩阵其余四行、全量回归）都已实际执行并逐条记录在案。
 
 ### 1. 两条新指标（v0.2 新增）
 
@@ -54,7 +51,7 @@
 | 1 | CLI 渲染：连续流式 100 次（随机分片 + e2e）无重复、丢字、布局错乱；无未处理的推理标记 | 属性测试 `apps/cli/src/render/markdown.rs::random_split_feeding_matches_whole_feeding_byte_for_byte`、`packages/runtime/src/think.rs::random_fragmentation_keeps_channel_semantics`；模式矩阵单测（`apps/cli/src/render/mod.rs`，含 `minimal_mode_hides_tool_lines_and_summarizes_thinking`）；e2e `apps/cli/tests/pty.rs::pty_submits_a_chinese_prompt_and_renders_the_answer`、`apps/cli/tests/render.rs::inline_reasoning_is_split_out_of_the_answer_channel` | PASS（`cargo test` 全绿）+ 矩阵 tmux / 80 列两行的实机观察 |
 | 2 | 输入编辑：多行、中文、长文本粘贴、历史导航、命令补全 | `apps/cli/tests/pty.rs`：`pty_ctrl_j_edits_a_multi_line_prompt_and_submits_once`、`pty_long_paste_does_not_submit_until_enter`、`pty_long_input_line_wraps_with_the_continuation_marker`、`pty_pasted_text_with_tabs_renders_expanded_and_submits_verbatim`、`pty_up_arrow_recalls_history_and_restores_the_draft`、`pty_tab_completes_a_unique_prefix_and_lists_candidates`；手动抽查：矩阵 tmux 行（`↑` 召回）与 80 列行（输入行折行） | PASS |
 | 3 | 会话恢复：≥10 次关闭/重启（`-c`），canonical 历史逐条完整 | `apps/cli/tests/sessions.rs::session_restore_keeps_the_canonical_history_across_ten_cycles`（本次新增）；旁证 `apps/cli/tests/pty.rs::pty_continue_restores_the_previous_turn_for_the_model` | **PASS**（见上「两条新指标」） |
-| 4 | Context 管理：`/context` 区分真实用量与无数据；`/compact` 后关键决策仍在 | `apps/cli/src/commands/slash.rs::context_lines_matrix`、`dispatch_context_reads_the_session_state`、`help_lines_carry_the_context_row`；`apps/cli/tests/pty.rs::pty_compact_summarizes_and_keeps_the_raw_rows` | PASS（离线面）；「用一个真实任务验证复述」需要真实模型 → 该子项不在本机执行 |
+| 4 | Context 管理：`/context` 区分真实用量与无数据；`/compact` 后关键决策仍在 | `apps/cli/src/commands/slash.rs::context_lines_matrix`、`dispatch_context_reads_the_session_state`、`help_lines_carry_the_context_row`；`apps/cli/tests/pty.rs::pty_compact_summarizes_and_keeps_the_raw_rows` | PASS（离线面）；「用一个真实任务验证复述」需要真实模型 → **SKIP**（无凭据） |
 | 5 | 长期记忆：保存 / 跨会话读取 / 编辑 / 删除全部通过；`remember` 确认行可见 | `apps/cli/tests/remember.rs::remember_success_prints_the_confirmation_line`、`remember_failure_prints_no_confirmation_line`；跨进程复用 `apps/cli/tests/demo_b.rs::demo_b_remembers_reuses_and_corrects_across_processes`；记忆 CRUD 单测在 `apps/cli/src/commands/memory.rs`；真机 harness Demo B → **SKIP**（无凭据；且本机无 `uv`） | PASS（离线面）；真机面 SKIP |
 | 6 | Skills：3 个内置技能可展示、加载、记录实际使用；`reload` 生效 | `apps/cli/tests/pty.rs::pty_skills_reload_picks_up_a_new_skill_file`、`pty_learn_saves_the_draft_after_confirmation`、`pty_learn_discard_and_refusal_leave_no_file`；`skills_used` 落库断言见 `apps/cli/tests/kernel.rs` 与 core 单测；真机 harness「技能目录」记录 → **SKIP**（无凭据） | PASS（离线面）；真机面 SKIP |
 | 7 | 工具观察与取消：进度 / 异常 / 取消状态一致；中断绝不报成成功 | 工具行配对与异常展示：`apps/cli/src/render/mod.rs::normal_mode_prints_the_exec_and_result_lines_of_a_paired_tool_call`、`tool_result_pairs_by_call_id_not_first_in_first_out`、`failed_tool_result_prints_the_first_line_of_its_output_on_a_second_line`、`apps/cli/tests/render.rs::tool_completion_line_pairs_with_the_exec_line_and_carries_the_elapsed`；取消：`packages/runtime/src/native/mod.rs::cancel_token_aborts_mid_stream`、`cancel_before_first_request_aborts`、`apps/cli/tests/tui.rs::pty_tui_ctrl_c_cancels_a_running_task_without_leaving`（`● Aborted`）；触限三处一致：`apps/cli/tests/limits.rs::max_steps_reaches_limit_and_stays_visible` | PASS |
