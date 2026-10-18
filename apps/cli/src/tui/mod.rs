@@ -74,27 +74,36 @@ pub fn tui_unavailable_reason(
 ///
 /// `reason` 来自 [`tui_unavailable_reason`] 或终端守卫的 io 错误；调用方把它整行打到经典路径
 /// 上（`--tui` 不可用时只多这一行，其余一切照旧）。
+///
+/// 文案的唯一定义在 [`crate::repl::tui_unavailable_note`]（`repl` 不按平台门控，非 unix 的降级
+/// 也要打同一句话）；这里只做转发，逐字不变。
 pub fn fallback_note(reason: &str) -> String {
-    format!("note: TUI unavailable ({reason}); falling back to the classic REPL")
+    crate::repl::tui_unavailable_note(reason)
 }
 
 // ---- 主循环接线（Task 3）：事实快照、提交分类、空闲/忙碌两个循环 ----
 
+use std::ffi::OsStr;
+use std::io::{self, IsTerminal};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anyhow::Result;
 use ignis_core::task::TaskKind;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::cli::Cli;
 use crate::commands::slash::{self, Dispatch, Parsed, Slash};
-use crate::commands::{Session, no_color_value};
+use crate::commands::{Session, kernel_note, no_color_value};
 use crate::editor::draw::CONTINUATION;
 use crate::editor::history::History;
 use crate::render::resolve_color;
+use crate::repl::{alerts_banner_line, resume_continue};
 use crate::tui::app::{Action, Busy, InputChunk, TuiApp, Wake};
+use crate::tui::approval::{ApprovalJob, TuiApproval};
 use crate::tui::capture::CaptureSink;
-use crate::tui::term::TerminalGuard;
+use crate::tui::term::{TerminalGuard, install_panic_hook};
 use crate::tui::view::{Scrollback, ViewFacts, compose};
 
 /// 提交回显的首行标记（与输入区、编辑器同一对标记）。
@@ -138,7 +147,7 @@ pub enum Submitted {
     Unknown(String),
     /// `/exit`。
     Exit,
-    /// `/sessions`（T3 过渡：先落经典表格，T6 换成选择器叠层）。
+    /// `/sessions`：开全屏选择器（空闲期的一态；Enter 交回 `Action::Resume`）。
     Sessions,
     /// `/compact`：需要模型往返，在忙碌子循环里执行。
     Compact,
@@ -186,15 +195,103 @@ fn draw_frame(term: &mut TerminalGuard, app: &TuiApp, facts: &ViewFacts) {
     let _ = term.write(compose(&app.view(facts)).as_bytes());
 }
 
+/// 启动 TUI：可用性判定 → 守卫 → 会话（含 `-c`）→ 主循环。
+///
+/// `Ok(None)` = 不可用（已往 stdout 打了一行 [`fallback_note`]），调用方落回经典 REPL。
+pub async fn start(cli: &Cli) -> Result<Option<ExitCode>> {
+    start_with(
+        cli,
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
+        std::env::var_os("TERM").as_deref(),
+        term::probe_size(libc::STDOUT_FILENO),
+        || {
+            // 审批走通道式（T4）：handler 交给会话，接收端交给主循环（`drive` 的审批分支）
+            let (handler, approvals) = TuiApproval::channel();
+            let session = Session::new_with_handler(cli, Arc::new(handler))?;
+            Ok((session, approvals))
+        },
+    )
+    .await
+}
+
+/// [`start`] 的注入变体：可用性探针与「会话工厂」都由调用方给（用例不造终端、不改进程环境、
+/// 也不碰真实 home）。
+///
+/// 顺序钉死（R4）：可用性判定（不通过 → 一行 note + `Ok(None)`，**不建会话**，工厂根本不会被
+/// 调用）→ `install_panic_hook()` → [`TerminalGuard::enter`]（io 错误 → 一行 note + `Ok(None)`；
+/// 成功之后任何早退都由守卫 `Drop` 还原备用屏与 termios）→ 会话 + `-c` + 开机行 → [`run`]。
+/// 生产入口 [`start`] 传的是进程现场与真实工厂，与用例走同一条路径。
+async fn start_with<B>(
+    cli: &Cli,
+    stdin_tty: bool,
+    stdout_tty: bool,
+    term: Option<&OsStr>,
+    size: Option<Size>,
+    build: B,
+) -> Result<Option<ExitCode>>
+where
+    B: FnOnce() -> Result<(Session, mpsc::UnboundedReceiver<ApprovalJob>)>,
+{
+    // 1. 可用性：tty / TERM / 尺寸三件事都探好后交给纯函数；一条不过就只打一行 note
+    if let Some(reason) = tui_unavailable_reason(stdin_tty, stdout_tty, term, size) {
+        println!("{}", fallback_note(&reason));
+        return Ok(None);
+    }
+
+    // 2. 终端守卫：raw mode 进不去时屏幕零改动（字节一个没写），同样只打一行 note；成功之后
+    //    **每一条**退出路径（`/exit`、`?` 早退、错误、panic）都靠它收尾
+    install_panic_hook();
+    let (mut term, _) = match TerminalGuard::enter() {
+        Ok(entered) => entered,
+        Err(error) => {
+            println!("{}", fallback_note(&error.to_string()));
+            return Ok(None);
+        }
+    };
+
+    // 3. 会话（含 `-c`）与开机行：`-c` 的装载、内核能力提示与未读告警行全部取自经典路径那几
+    //    个函数——TUI 不打印经典 banner（`● Ready` 不出现）
+    let (mut session, approvals) = build()?;
+    let resume_note =
+        resume_continue(&mut session, cli.continue_session).map_err(anyhow::Error::msg)?;
+    let startup = startup_lines(&session, resume_note);
+
+    // 4. 主循环：输入读取线程 + 块通道；退出码原样交回
+    let (tx, chunks) = mpsc::unbounded_channel();
+    app::spawn_input_reader(tx);
+    let code = run(&mut session, &mut term, chunks, approvals, startup).await?;
+    Ok(Some(code))
+}
+
+/// 开机行进滚动区的行（顺序即落地顺序）：`-c` 的 note（未命中才有）、内核能力提示（非 native
+/// 才有）、未读告警行（有才有）——三句都来自经典路径同一份函数/常量，TUI 不另写文案。
+fn startup_lines(session: &Session, resume_note: Option<&'static str>) -> Vec<String> {
+    let mut lines: Vec<String> = resume_note.map(str::to_string).into_iter().collect();
+    if let Some(note) = kernel_note(session.kernel()) {
+        lines.push(note);
+    }
+    if let Some(alert) = alerts_banner_line(session.unread_alerts()) {
+        lines.push(alert);
+    }
+    lines
+}
+
 /// TUI 主循环：空闲期读输入并执行动作，忙碌期驱动 future。返回进程退出码。
 ///
 /// 空闲循环 = 「等输入块/SIGINT/SIGWINCH/100ms tick → 处理动作 → 刷新事实 → 重绘」；忙碌循环在
 /// [`TuiApp::drive`] 里（future 借用会话期间这里只读事实快照）。每一条退出路径（`/exit`、空缓冲
 /// `Ctrl+D`、空闲 SIGINT、stdin 关闭）都靠调用方持有守卫的 `Drop` 还原终端。
+///
+/// `approvals` 是 [`TuiApproval::channel`] 的回信端（内联审批画在忙碌循环的滚动区里）；
+/// `startup` 是 [`startup_lines`] 的开机行（`-c` note、内核能力提示、未读告警行），先落滚动区再画
+/// 第一帧。
 pub async fn run(
     session: &mut Session,
     term: &mut TerminalGuard,
     chunks: mpsc::UnboundedReceiver<InputChunk>,
+    approvals: mpsc::UnboundedReceiver<ApprovalJob>,
+    startup: Vec<String>,
 ) -> Result<ExitCode> {
     // 捕获缓冲：渲染器与滚动区共持（每轮任务的 `CaptureSink` 由 `TuiApp::capture_sink` 现取）
     let (_, buffer) = CaptureSink::pair();
@@ -205,7 +302,12 @@ pub async fn run(
         buffer,
     );
     app.attach_chunks(chunks);
+    app.attach_approvals(approvals);
     app.set_size(term.size());
+    // 开机行先落滚动区：第一帧就带着它们（与经典路径同一份文案）
+    if !startup.is_empty() {
+        app.push_lines(startup);
+    }
     let mut facts = refresh_facts(session);
     draw_frame(term, &app, &facts);
 
@@ -260,6 +362,16 @@ async fn handle_actions(
                     return Ok(Some(code));
                 }
             }
+            // 选择器选中一条会话：装载它的历史（与经典 `/resume` 同一条路：整条 id）。成功回
+            // `slash::resume_lines` 一行、失败回 `error: {e}` 一行（选择器此前已关闭），随后刷新
+            // 事实快照（会话标签与会话历史都换了）
+            Action::Resume(id) => {
+                match session.resume_session(&id) {
+                    Ok(messages) => app.push_lines(slash::resume_lines(&id, messages)),
+                    Err(error) => app.push_lines([format!("error: {error}")]),
+                }
+                *facts = refresh_facts(session);
+            }
         }
     }
     Ok(None)
@@ -288,8 +400,12 @@ async fn submit_line(
         // 未知命令：本地报错行，绝不送模型
         Submitted::Unknown(name) => app.push_lines([slash::unknown_command_line(&name)]),
         Submitted::Exit => exit = true,
-        // T3 过渡：`/sessions` 先走经典的同步命令（T6 换成选择器叠层）
-        Submitted::Sessions => exit = sync_command(session, app, Slash::Sessions, &[]),
+        // `/sessions`：开全屏选择器（游标在第一条、当前会话带 `*`；Enter 由空闲循环那条
+        // `Action::Resume` 执行）。空表也开（内容是 `(no sessions)`）；读库失败与经典同形一行
+        Submitted::Sessions => match session.sessions() {
+            Ok(rows) => app.open_selector(rows, session.current_session().map(str::to_string)),
+            Err(error) => app.push_lines([format!("error: {error}")]),
+        },
         // `/compact` 需要模型往返：忙碌子循环里驱动（成功逐行进滚动区、错误进 `error: {…}` 行）
         Submitted::Compact => compact_turn(session, app, facts, term).await,
         // `/learn` 需要模型往返 + 内联确认：同一个忙碌子循环里驱动（确认面接进本轮）
@@ -419,22 +535,31 @@ mod tests {
     use std::process::ExitCode;
     use std::time::Duration;
 
+    use clap::Parser;
     use ignis_core::config::{ColorChoice, Config, UiConfig};
     use ignis_core::task::TaskKind;
     use ignis_runtime::test_support::{ScriptStep, ScriptedModel};
+    use ignis_storage::NewAlert;
     use tokio::sync::mpsc;
 
+    use crate::cli::Cli;
     use crate::commands::Session;
-    use crate::commands::fixtures::{session_fixture, session_fixture_with_config};
+    use crate::commands::fixtures::{
+        session_at_home, session_fixture, session_fixture_with_config,
+    };
+    use crate::commands::kernel::fixtures::TempDir;
+    use crate::commands::kernel_note;
     use crate::commands::slash::{self, Slash};
     use crate::editor::history::History;
-    use crate::tui::app::{InputChunk, TuiApp};
+    use crate::repl::{alerts_banner_line, no_session_note};
+    use crate::tui::app::{InputChunk, SELECTOR_HINT, TuiApp};
+    use crate::tui::approval::ApprovalJob;
     use crate::tui::capture::CaptureSink;
-    use crate::tui::view::{Scrollback, ViewFacts};
+    use crate::tui::view::{InputBlock, Scrollback, ViewFacts, compose};
 
     use super::{
         MIN_COLS, MIN_ROWS, Size, Submitted, classify, fallback_note, refresh_facts,
-        refresh_facts_with, tui_unavailable_reason,
+        refresh_facts_with, start_with, startup_lines, tui_unavailable_reason,
     };
 
     /// `/learn` 用例的固定草稿（与 pty / `commands` 的用例同一形状）：合法 frontmatter + 一段正文。
@@ -637,6 +762,34 @@ mod tests {
         );
         assert!(refresh_facts_with(&always, None).color);
         assert!(!refresh_facts_with(&always, Some("1")).color);
+
+        // `ui.color = never`：tty + 没有 NO_COLOR 也恒无色 → 帧里零 SGR
+        let (_dir, never) = session_fixture_with_config(
+            "tui-facts-never",
+            "native",
+            Config {
+                ui: UiConfig {
+                    color: ColorChoice::Never,
+                    ..UiConfig::default()
+                },
+                ..Config::default()
+            },
+        );
+        let plain = refresh_facts_with(&never, None);
+        assert!(!plain.color, "`never` 恒无色");
+        let mut app = headless_app();
+        app.push_lines(["答复一".to_string()]);
+        let frame = compose(&app.view(&plain));
+        for sgr in ["\u{1b}[0m", "\u{1b}[1m", "\u{1b}[2m", "\u{1b}[90m"] {
+            assert!(!frame.contains(sgr), "无色帧里不许有 {sgr:?}：{frame:?}");
+        }
+        // 同一屏上色时确实带 SGR：证明上面那条判据不是空转
+        let colored = compose(&app.view(&ViewFacts {
+            color: true,
+            ..plain
+        }));
+        assert!(colored.contains("\u{1b}[2m"), "{colored:?}");
+
         // 不带注入的入口读进程环境（这里只钉它不 panic、且与注入变体同形）
         assert_eq!(refresh_facts(&session).version, env!("CARGO_PKG_VERSION"));
     }
@@ -699,14 +852,19 @@ mod tests {
         assert_eq!(code, Some(ExitCode::SUCCESS));
     }
 
-    /// T3 过渡：`/sessions` 先落经典表格（T6 换成选择器叠层，这条用例随之改写）。
+    /// `/sessions` 现在开全屏选择器（T3 的经典表格分支已删）：输入态是选择器、视口逐行是
+    /// `slash::sessions_lines` 的内容加 `> `/`  ` 前缀，滚动区里**不再**追一行表格。
     #[tokio::test]
-    async fn sessions_command_still_lands_the_classic_table_in_this_task() {
+    async fn sessions_command_opens_the_selector_instead_of_printing_the_table() {
         let (_dir, mut session) = session_fixture("tui-sessions", "native");
-        // 先造一条会话行：表格才有表头之外的内容
+        // 先造两条会话行：选择器里才有表头之外的内容
         session
             .store()
             .create_session(session.workspace(), "native", None, "第一句")
+            .unwrap();
+        session
+            .store()
+            .create_session(session.workspace(), "native", None, "第二句")
             .unwrap();
         let mut app = headless_app();
         let mut facts = refresh_facts(&session);
@@ -715,13 +873,41 @@ mod tests {
             .await
             .unwrap();
 
+        // 输入态是选择器：没有光标、提示行换那一句
+        let view = app.view(&facts);
+        assert_eq!(
+            view.input,
+            InputBlock {
+                lines: [String::new(), String::new(), SELECTOR_HINT.to_string()],
+                cursor: None,
+            },
+            "选择器不落光标、提示行是选择器那一句"
+        );
+
+        // 视口逐行是 `sessions_lines` 的内容加 `> `/`  ` 前缀（当前会话还没绑：没有 `*`）
+        let rows = session.sessions().unwrap();
+        let table = slash::sessions_lines(&rows, session.current_session());
+        assert_eq!(view.viewport.len(), table.len(), "选择器列表就是那张表");
+        assert!(view.viewport[0].starts_with("  ID"), "{:?}", view.viewport);
+        for (line, base) in view.viewport.iter().zip(&table) {
+            assert!(
+                line == &format!("  {base}") || line == &format!("> {base}"),
+                "{line:?} 不是前缀化的 {base:?}"
+            );
+        }
+
+        // 关掉选择器：滚动区里只有提交回显，**没有**追进来的表格
+        assert!(
+            app.on_bytes(b"\x1b").is_empty(),
+            "裸 ESC 先留在解码器缓存里"
+        );
+        assert!(app.on_tick(), "tick 上的裸 ESC 关掉选择器");
         let lines = viewport(&app, &facts);
-        let table = slash::sessions_lines(&session.sessions().unwrap(), session.current_session());
-        let header = lines
-            .iter()
-            .find(|line| line.contains("ID") && line.contains("MESSAGES"))
-            .unwrap_or_else(|| panic!("表格表头那一行必须落地：{lines:?}"));
-        assert_eq!(header, &table[0], "与经典的同一份文案");
+        assert!(lines.contains(&"❯ /sessions".to_string()), "{lines:?}");
+        assert!(
+            !lines.iter().any(|line| line.contains("MESSAGES")),
+            "不再往滚动区追一行表格：{lines:?}"
+        );
     }
 
     /// `/compact` 在忙碌子循环里被驱动（T3 就完整支持）：空会话给一行 `error: …`，回到空闲态。
@@ -836,5 +1022,99 @@ mod tests {
             .join("demo-skill")
             .join("SKILL.md");
         assert!(path.is_file(), "{}", path.display());
+    }
+
+    // ---- 入口与降级（T6） ----
+
+    /// `--tui` 不可用：一行 note + `Ok(None)`，且**不建会话**（临时 home 上不会出现 `ignis.db`）。
+    ///
+    /// 可用性探针与会话工厂都是注入的（生产入口 [`super::start`] 传的是进程现场与真实工厂，与
+    /// 这条用例走同一条路径）：工厂一旦被调用，会话就在临时 home 上建出来——判据文件会现身。
+    #[tokio::test]
+    async fn start_falls_back_without_touching_the_session() {
+        let dir = TempDir::new("tui-start-fallback");
+        let cli = Cli::try_parse_from(["ignis", "--tui"]).expect("--tui 应可解析");
+
+        for (stdin_tty, stdout_tty, term, size) in [
+            // 四条硬条件各来一遍：一条不过就 `Ok(None)`，后面的不再看
+            (true, true, Some(OsStr::new("dumb")), Some(ok_size())),
+            (false, true, ok_term(), Some(ok_size())),
+            (true, false, ok_term(), Some(ok_size())),
+            (true, true, ok_term(), Some(Size { cols: 10, rows: 4 })),
+        ] {
+            let build = || -> anyhow::Result<(Session, mpsc::UnboundedReceiver<ApprovalJob>)> {
+                let approvals = mpsc::unbounded_channel().1;
+                Ok((
+                    session_at_home(
+                        dir.path(),
+                        "native",
+                        Config {
+                            api_key: Some("test-key".into()),
+                            ..Config::default()
+                        },
+                    ),
+                    approvals,
+                ))
+            };
+            let outcome = start_with(&cli, stdin_tty, stdout_tty, term, size, build).await;
+            assert_eq!(
+                outcome.expect("不可用不是错误"),
+                None,
+                "{stdin_tty}/{stdout_tty}/{term:?}/{size:?}：不可用 = Ok(None)，调用方落回经典路径"
+            );
+        }
+
+        assert!(
+            !dir.path().join("ignis.db").exists(),
+            "不可用时不建会话：home 下没有新建 ignis.db"
+        );
+    }
+
+    /// 开机行（进滚动区）就是经典路径那几句：`-c` 的 note、内核能力提示（非 native 才有）、
+    /// 未读告警行（有才有）——TUI 不打印经典 banner（`● Ready` 不在这条路上）。
+    #[test]
+    fn tui_startup_lines_are_the_classic_copies() {
+        // 非 native：内核能力提示就是 `kernel_note` 那一句；`-c` 未命中的 note 取 `no_session_note`
+        let (_dir, codex) = session_fixture("tui-startup", "codex");
+        let lines = startup_lines(&codex, Some(no_session_note()));
+        assert_eq!(
+            lines,
+            [
+                no_session_note().to_string(),
+                kernel_note("codex").expect("非 native 有能力提示"),
+            ]
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("unread")),
+            "0 条未读：没有告警行：{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line == "● Ready"),
+            "经典 banner 不进 TUI：{lines:?}"
+        );
+
+        // 未读告警：告警行就是 `alerts_banner_line` 那一份（排在最后）
+        let (_dir, alerting) = session_fixture("tui-startup-alerts", "native");
+        for index in 0..2 {
+            alerting
+                .db()
+                .insert_alert(&NewAlert {
+                    severity: "info".into(),
+                    title: format!("告警 {index}"),
+                    body: None,
+                    source_job_id: None,
+                    source_task_id: None,
+                    dedup_key: format!("tui-startup-{index}"),
+                })
+                .expect("造两条未读告警");
+        }
+        assert_eq!(
+            startup_lines(&alerting, None),
+            [alerts_banner_line(Some(2)).expect("有未读就有告警行")]
+        );
+
+        // native 且 `-c` 命中：三行都不出现
+        let (_dir, native) = session_fixture("tui-startup-native", "native");
+        assert_eq!(startup_lines(&native, None), Vec::<String>::new());
     }
 }

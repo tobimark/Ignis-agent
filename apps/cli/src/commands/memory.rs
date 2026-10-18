@@ -210,6 +210,7 @@ mod tests {
             yes: false,
             unsafe_ops: false,
             continue_session: false,
+            tui: false,
             command: None,
         }
     }

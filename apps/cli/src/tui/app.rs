@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ignis_runtime::{ApprovalDecision, ApprovalRequest};
+use ignis_storage::SessionSummary;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -40,7 +41,7 @@ use crate::tui::confirm::ConfirmJob;
 use crate::tui::input::InputState;
 use crate::tui::term;
 use crate::tui::view::{
-    InputBlock, Scrollback, TuiView, ViewFacts, compose, status_line, top_line,
+    InputBlock, Scrollback, TuiView, ViewFacts, compose, selector_lines, status_line, top_line,
 };
 
 /// 100ms 的心跳：忙碌期每 tick 排空一次捕获（流式输出落进滚动区），空闲期用它做 Esc 消歧。
@@ -65,6 +66,9 @@ const APPROVAL_HINT: &str = "a/s/r/d";
 /// 确认态输入区第 3 行的提示（只有 `s` 保存；其余按键与 `d` 一样放弃）。
 const CONFIRM_HINT: &str = "s/d";
 
+/// 选择器输入区第 3 行与底部状态行的提示（↑↓ 移动、Enter 装载、Esc 关闭）。
+pub(crate) const SELECTOR_HINT: &str = "↑↓ / Enter / Esc";
+
 /// 进入主循环前的默认面板尺寸（守卫探到尺寸之前用；与 `term` 的回退 80×24 同值）。
 const INITIAL_SIZE: Size = Size { cols: 80, rows: 24 };
 
@@ -81,6 +85,8 @@ pub enum Action {
     Redraw,
     /// 提交：整段文本（内部换行保留），缓冲已清空。
     Submit(String),
+    /// 选择器选中一条会话：整条 id 交回外层执行（`Session::resume_session`），选择器已关闭。
+    Resume(String),
     /// 退出：空缓冲 `Ctrl+D`、`Ctrl+C` 字节与空闲期 SIGINT 都走这条。
     Exit,
 }
@@ -124,6 +130,16 @@ pub enum InputMode {
         /// 进入确认时记下的忙碌态：回信后恢复它——确认叠在 `/learn` 的忙碌期上（草稿的 future
         /// 还在跑），回信**不是**回编辑器的理由。
         resume: Busy,
+    },
+    /// 选择器（`/sessions`）：列表进视口、按键由 [`TuiApp::selector_key`] 收（**不进编辑器**）。
+    /// 只在空闲期开（忙碌期输入禁用，根本到不了这一步），所以没有「回哪个忙碌态」的问题。
+    Selector {
+        /// 本工作区的会话行（新近在前；与 `/sessions` 同一份）。
+        rows: Vec<SessionSummary>,
+        /// 选中行在 `rows` 里的 0 基下标（空表时是 0，没有可选项）。
+        cursor: usize,
+        /// 当前会话的整条 id（列表里带 `*`）。
+        current: Option<String>,
     },
 }
 
@@ -202,14 +218,17 @@ impl TuiApp {
     /// 喂一段原始字节；返回要外层执行的动作。
     ///
     /// 忙碌期一律没有动作（输入禁用）：字节照吃（别留给空闲期），缓冲一个字符都不进。
-    /// 审批/确认期的按键分别走 [`TuiApp::approval_key`] / [`TuiApp::confirm_key`]（**绝不进
-    /// 编辑器**）。
+    /// 审批/确认/选择器期的按键分别走 [`TuiApp::approval_key`] / [`TuiApp::confirm_key`] /
+    /// [`TuiApp::selector_key`]（**绝不进**编辑器）。
     pub fn on_bytes(&mut self, bytes: &[u8]) -> Vec<Action> {
         if matches!(self.mode, InputMode::Approval { .. }) {
             return self.approval_bytes(bytes);
         }
         if matches!(self.mode, InputMode::Confirm { .. }) {
             return self.confirm_bytes(bytes);
+        }
+        if matches!(self.mode, InputMode::Selector { .. }) {
+            return self.selector_bytes(bytes);
         }
         if !matches!(self.mode, InputMode::Editor) {
             return Vec::new();
@@ -265,11 +284,31 @@ impl TuiApp {
         }
     }
 
+    /// 选择器态的一批字节：解码成按键逐个交给 [`TuiApp::selector_key`]。选择器关闭（Enter/Esc/
+    /// Ctrl+D）之后这一批剩下的按键丢掉（与「提交之后忽略剩余按键」同一条规则）——选择器的按键
+    /// 因此绝不落进编辑器。
+    fn selector_bytes(&mut self, bytes: &[u8]) -> Vec<Action> {
+        let keys = self.input.keys(bytes);
+        let mut actions = Vec::new();
+        for key in keys {
+            actions.extend(self.selector_key(key));
+            if !matches!(self.mode, InputMode::Selector { .. }) {
+                break;
+            }
+        }
+        actions
+    }
+
     /// 每 tick：排空捕获缓冲、消化「一个裸 ESC」；返回是否需要重绘。
+    ///
+    /// Esc 消歧窗口 = 一个 tick（[`crate::editor::keys::Decoder::take_lone_escape`]）：吃到裸 ESC
+    /// 就**合成一次 Esc 按键**交给选择器——只有它认这个键（关闭），其余输入态忽略（T3 起就是
+    /// 「吃掉即可」）。Esc 之外的按键一律由字节那条路进选择器。
     pub fn on_tick(&mut self) -> bool {
-        // Esc 的消歧窗口 = 一个 tick：T3 没有 Esc 语义（选择器在 T6），吃掉即可
-        let _ = self.input.take_lone_escape();
-        self.ingest()
+        let escaped = self.input.take_lone_escape();
+        let routed = escaped && !self.selector_key(Key::Esc).is_empty();
+        let ingested = self.ingest();
+        routed || ingested
     }
 
     /// 排空捕获缓冲 → 滚动区（净化解出的是 `\n` 分隔文本，半行留在滚动区里等下一次）。
@@ -465,13 +504,68 @@ impl TuiApp {
         self.mode = InputMode::Editor;
     }
 
+    /// 打开 `/sessions` 选择器（只在空闲期；空表也开，内容是 `(no sessions)`）。
+    ///
+    /// 列表就是 `/sessions` 那张表（[`selector_lines`] 只加选择前缀），游标从第一行起；
+    /// `current` 是当前会话的整条 id（列表里带 `*`），还没有当前会话时给 `None`。
+    pub fn open_selector(&mut self, rows: Vec<SessionSummary>, current: Option<String>) {
+        self.mode = InputMode::Selector {
+            rows,
+            cursor: 0,
+            current,
+        };
+    }
+
+    /// 选择器按键：↑↓ 移动（到边界不动）、Enter 交回 [`Action::Resume`]（整条会话 id）并关闭、
+    /// Esc 关闭、Ctrl+D 关闭、其余忽略。
+    ///
+    /// 关闭都是回编辑器（选择器只在空闲期开）；空表没有可选项，Enter 不动作（用 Esc/Ctrl+D 关）。
+    /// 不在选择器态时什么都不做（Esc 的合成路由因此只有选择器认它）。
+    pub fn selector_key(&mut self, key: Key) -> Vec<Action> {
+        if !matches!(self.mode, InputMode::Selector { .. }) {
+            return Vec::new();
+        }
+        match key {
+            Key::Up | Key::Down => {
+                let InputMode::Selector { rows, cursor, .. } = &mut self.mode else {
+                    return Vec::new();
+                };
+                // 空表：0 就是唯一的位置（上下都是它）
+                let last = rows.len().saturating_sub(1);
+                *cursor = match key {
+                    Key::Up => cursor.saturating_sub(1),
+                    _ => (*cursor + 1).min(last),
+                };
+                vec![Action::Redraw]
+            }
+            Key::Enter => {
+                let id = match &self.mode {
+                    InputMode::Selector { rows, cursor, .. } => {
+                        rows.get(*cursor).map(|row| row.session.id.clone())
+                    }
+                    _ => None,
+                };
+                let Some(id) = id else {
+                    return Vec::new(); // 空表：没有可选项
+                };
+                self.mode = InputMode::Editor;
+                vec![Action::Resume(id)]
+            }
+            Key::Esc | Key::CtrlD => {
+                self.mode = InputMode::Editor;
+                vec![Action::Redraw]
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// 当前是不是忙碌态（`None` = 空闲）：审批/确认叠在忙碌期上，返回它们记下的那一档（`resume`）
-    /// ——回信前后对调用方都是「还在忙」。
+    /// ——回信前后对调用方都是「还在忙」；选择器是空闲期的一态，也给 `None`。
     pub fn busy(&self) -> Option<Busy> {
         match self.mode {
             InputMode::Busy(busy) => Some(busy),
             InputMode::Approval { resume, .. } | InputMode::Confirm { resume, .. } => Some(resume),
-            InputMode::Editor => None,
+            InputMode::Editor | InputMode::Selector { .. } => None,
         }
     }
 
@@ -510,6 +604,14 @@ impl TuiApp {
                 },
                 BUSY_HINT,
             ),
+            // 选择器：列表整块进视口（下面按同一份行拼），输入区只留提示行、没有光标
+            InputMode::Selector { .. } => (
+                InputBlock {
+                    lines: [String::new(), String::new(), SELECTOR_HINT.to_string()],
+                    cursor: None,
+                },
+                SELECTOR_HINT,
+            ),
             InputMode::Editor => (self.input.block(), IDLE_HINT),
         };
         TuiView {
@@ -517,8 +619,16 @@ impl TuiApp {
             color: facts.color,
             theme: facts.theme,
             top: top_line(facts),
-            // 视口就是「最近 rows 行」：版式切到该显示的那一段是合成器的事
-            viewport: self.scrollback.viewport(self.size.rows),
+            // 视口就是「最近 rows 行」：版式切到该显示的那一段是合成器的事。选择器开着时视口整块
+            // 让给它（那一份列表就是用户此刻要看的东西）
+            viewport: match &self.mode {
+                InputMode::Selector {
+                    rows,
+                    cursor,
+                    current,
+                } => selector_lines(rows, current.as_deref(), *cursor),
+                _ => self.scrollback.viewport(self.size.rows),
+            },
             input,
             status: status_line(facts, hint),
         }
@@ -836,6 +946,7 @@ mod tests {
 
     use ignis_core::config::{OutputMode, Theme};
     use ignis_runtime::{ApprovalDecision, ApprovalHandler, ApprovalRequest, RiskLevel};
+    use ignis_storage::{SessionRecord, SessionSummary};
     use serde_json::json;
     use tokio::sync::{mpsc, oneshot};
     use tokio_util::sync::CancellationToken;
@@ -853,9 +964,9 @@ mod tests {
     use crate::tui::capture::CaptureSink;
     use crate::tui::confirm::{self, ConfirmJob};
     use crate::tui::term::TerminalGuard;
-    use crate::tui::view::{Scrollback, ViewFacts, compose, status_line, top_line};
+    use crate::tui::view::{Scrollback, ViewFacts, compose, selector_lines, status_line, top_line};
 
-    use super::{BUSY_HINT, Busy, IDLE_HINT, InputChunk, TuiApp};
+    use super::{Action, BUSY_HINT, Busy, IDLE_HINT, InputChunk, InputMode, SELECTOR_HINT, TuiApp};
 
     /// 事实快照：顶/底状态行只关心拼法（与 T2 的用例同形）。
     fn facts() -> ViewFacts {
@@ -1741,5 +1852,174 @@ mod tests {
         app.end_busy();
         assert_eq!(app.busy(), None);
         assert_eq!(app.view(&facts).input.lines[0], "❯ ");
+    }
+
+    // ---- 选择器（T6） ----
+
+    /// 一条会话行（与 `/sessions` 读到的同一形状）。
+    fn session_summary(
+        id: &str,
+        title: &str,
+        updated_at: i64,
+        message_count: usize,
+    ) -> SessionSummary {
+        SessionSummary {
+            session: SessionRecord {
+                id: id.to_string(),
+                title: title.to_string(),
+                workspace: "/tmp/ws".into(),
+                kernel: "native".into(),
+                model: None,
+                created_at: updated_at,
+                updated_at,
+            },
+            message_count,
+        }
+    }
+
+    /// 选择器：三行 + 当前会话 → `open_selector` 后视口就是带前缀的表格；↑↓ 移动、Enter 交回整条
+    /// id 并关闭、Esc/Ctrl+D 关闭且不交回动作；空表也能开（内容是 `(no sessions)`，Enter 不动作）；
+    /// `on_tick` 上的裸 ESC 合成一次 Esc 路由——选择器认它（关闭），编辑器忽略。
+    #[test]
+    fn selector_moves_and_resumes() {
+        let newest = "019a1b2c-3333-7f00-8000-000000000003";
+        let middle = "019a1b2c-2222-7f00-8000-000000000002";
+        let oldest = "019a1b2c-1111-7f00-8000-000000000001";
+        let rows = vec![
+            session_summary(newest, "最新一条", 300, 4),
+            session_summary(middle, "中间一条", 200, 3),
+            session_summary(oldest, "最旧一条", 100, 2),
+        ];
+        let (mut app, _buffer) = app();
+        let facts = facts();
+
+        // 打开：输入态是选择器（没有光标、提示行是选择器那一句），视口是 `selector_lines` 的产物
+        app.open_selector(rows.clone(), Some(middle.to_string()));
+        assert!(matches!(app.mode, InputMode::Selector { .. }));
+        assert_eq!(app.busy(), None, "选择器是空闲期的一态，不是忙碌");
+        let view = app.view(&facts);
+        assert_eq!(view.input.cursor, None, "选择器不落光标");
+        assert_eq!(
+            view.input.lines[2], SELECTOR_HINT,
+            "输入区提示行换选择器那一句"
+        );
+        assert_eq!(view.viewport, selector_lines(&rows, Some(middle), 0));
+        assert!(
+            view.viewport[1].starts_with("> "),
+            "第一条是选中行：{:?}",
+            view.viewport
+        );
+        assert!(
+            view.viewport[2].contains(&format!("*{}", &middle[..13])),
+            "当前会话带 `*`：{:?}",
+            view.viewport
+        );
+
+        // ↑ 在第一条上不动（不越界）；↓ 到第二条
+        assert_eq!(app.selector_key(Key::Up), [Action::Redraw]);
+        assert_eq!(
+            app.view(&facts).viewport,
+            selector_lines(&rows, Some(middle), 0)
+        );
+        assert_eq!(app.selector_key(Key::Down), [Action::Redraw]);
+        assert_eq!(
+            app.view(&facts).viewport,
+            selector_lines(&rows, Some(middle), 1)
+        );
+        assert!(
+            app.view(&facts).viewport[2].starts_with("> "),
+            "第二条是选中行：{:?}",
+            app.view(&facts).viewport
+        );
+
+        // Enter：交回第二条的整条 id 并关闭选择器（回到编辑器）
+        assert_eq!(
+            app.selector_key(Key::Enter),
+            [Action::Resume(middle.to_string())]
+        );
+        assert!(matches!(app.mode, InputMode::Editor), "交回即关闭");
+        assert_eq!(app.view(&facts).input.lines[0], "❯ ", "回到编辑器");
+
+        // Esc 与 Ctrl+D 都关闭、都不交回动作；关闭之后按键回到编辑器
+        for key in [Key::Esc, Key::CtrlD] {
+            app.open_selector(rows.clone(), None);
+            let actions = app.selector_key(key);
+            assert!(
+                !actions
+                    .iter()
+                    .any(|action| matches!(action, Action::Resume(_))),
+                "{key:?}: {actions:?}"
+            );
+            assert!(matches!(app.mode, InputMode::Editor), "{key:?} 关闭选择器");
+            assert_eq!(
+                app.on_bytes(b"a"),
+                [Action::Redraw],
+                "{key:?} 之后按键回编辑器"
+            );
+            assert_eq!(app.input.text(), "a");
+            app.on_bytes(b"\x15"); // 清空：下一次循环从空缓冲开始
+        }
+
+        // `on_tick` 的 Esc 消歧：裸 ESC 合成一次 Esc 路由——选择器认它（关闭），其余输入态忽略
+        app.open_selector(rows, None);
+        assert!(
+            app.on_bytes(b"\x1b").is_empty(),
+            "裸 ESC 先留在解码器缓存里"
+        );
+        assert!(app.on_tick(), "tick 上吃到裸 ESC：选择器关闭，要重绘");
+        assert!(matches!(app.mode, InputMode::Editor), "Esc 关闭选择器");
+        assert!(app.on_bytes(b"\x1b").is_empty());
+        assert!(!app.on_tick(), "编辑器不认 Esc：没有变化");
+
+        // 空表也开：内容就是 `(no sessions)`；Enter 没有可选项（不动作、也不关）
+        app.open_selector(Vec::new(), None);
+        assert_eq!(app.view(&facts).viewport, ["(no sessions)"]);
+        assert_eq!(
+            app.selector_key(Key::Down),
+            [Action::Redraw],
+            "空表上移动不越界"
+        );
+        assert!(
+            app.selector_key(Key::Enter).is_empty(),
+            "空表上 Enter 不动作"
+        );
+        assert!(
+            matches!(app.mode, InputMode::Selector { .. }),
+            "空表上 Enter 不关选择器（Esc/Ctrl+D 才关）"
+        );
+    }
+
+    /// 其余按键一律忽略：普通字符/未绑定键/Tab/退格都不产动作、不关选择器、绝不落进编辑器缓冲；
+    /// 忽略之后选择器照常工作。
+    #[test]
+    fn selector_key_ignores_other_keys() {
+        let id = "019a1b2c-2222-7f00-8000-000000000002";
+        let rows = vec![session_summary(id, "一条会话", 100, 2)];
+        let (mut app, _buffer) = app();
+        let facts = facts();
+
+        app.open_selector(rows.clone(), Some(id.to_string()));
+        for key in [Key::Char('a'), Key::Other, Key::Tab, Key::Backspace] {
+            assert!(app.selector_key(key).is_empty(), "{key:?} 应被忽略");
+            assert!(
+                app.on_bytes(b"a").is_empty(),
+                "{key:?} 之后也没有编辑器的动作"
+            );
+        }
+        assert!(
+            matches!(app.mode, InputMode::Selector { .. }),
+            "忽略的按键不该关掉选择器"
+        );
+        assert_eq!(app.input.text(), "", "选择器的按键一个字符都不进编辑器缓冲");
+        assert_eq!(
+            app.view(&facts).viewport,
+            selector_lines(&rows, Some(id), 0)
+        );
+
+        // 忽略这些按键之后选择器照常工作
+        assert_eq!(
+            app.selector_key(Key::Enter),
+            [Action::Resume(id.to_string())]
+        );
     }
 }

@@ -98,7 +98,8 @@ impl EditorState {
             Key::CtrlD => self.ctrl_d(),
             Key::CtrlU => self.clear(),
             // 都不改内容，所以是 Idle；但它们同样算「非导航键」，一样脱离浏览。
-            Key::Tab | Key::PasteStart | Key::PasteEnd | Key::CtrlC | Key::Other => {
+            // `Esc` 只由 TUI 的 Esc 消歧合成（解码器不产生它）：状态机忽略，语义归选择器那一层。
+            Key::Tab | Key::PasteStart | Key::PasteEnd | Key::CtrlC | Key::Esc | Key::Other => {
                 self.leave_browse();
                 Event::Idle
             }

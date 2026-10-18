@@ -81,10 +81,43 @@ pub fn banner_lines(
         format!("Runtime: {kernel} · Skills: {skills} · Memory: {memory} facts"),
         format!("Session: {}", slash::session_label(session)),
     ];
-    if let Some(count) = unread_alerts.filter(|count| *count > 0) {
-        lines.push(format!("⚠ {count} unread alerts — run `ignis alerts`"));
+    if let Some(line) = alerts_banner_line(unread_alerts) {
+        lines.push(line);
     }
     lines
+}
+
+/// banner 的未读告警行（`Some(n>0)` 才有值）；[`banner_lines`] 改调它，逐字不变。
+///
+/// `None`（计数读失败，调用方已打警告）与 `Some(0)` 都给 `None`——那一行只在真有未读时出现。
+/// TUI 的开机行也从这里取（同一个文案来源，两处不会分家）。
+pub fn alerts_banner_line(unread: Option<usize>) -> Option<String> {
+    unread
+        .filter(|count| *count > 0)
+        .map(|count| format!("⚠ {count} unread alerts — run `ignis alerts`"))
+}
+
+/// `-c` 的装载（两条入口共用）：未命中返回 `Some(no_session_note())`，由调用方决定打到哪
+/// （经典 REPL 是 stdout，TUI 是滚动区）；`flag` 为假时什么都不做、返回 `None`。
+///
+/// 命中时把本工作区最近一次会话设成当前会话并装载有效历史（banner 的 Session 行会带短 id，
+/// 不另打一行）。读取失败是硬错误——用户点名要恢复，静默起步新会话会让人以为历史还在。
+pub fn resume_continue(session: &mut Session, flag: bool) -> Result<Option<&'static str>, String> {
+    if !flag {
+        return Ok(None);
+    }
+    match session.resume_latest()? {
+        Some(_) => Ok(None),
+        None => Ok(Some(no_session_note())),
+    }
+}
+
+/// `--tui` 不可用时的一行 note（逐字，英文 chrome）。
+///
+/// 唯一定义放在这里（`repl` 不按平台门控）：unix 侧 [`crate::tui::fallback_note`] 只是转发到它，
+/// 非 unix 侧的降级（理由逐字 `unsupported platform`）打同一句话——两边不可能分家。
+pub fn tui_unavailable_note(reason: &str) -> String {
+    format!("note: TUI unavailable ({reason}); falling back to the classic REPL")
 }
 
 /// `-c` 未命中「本工作区最近一次会话」时的提示行（英文 chrome，逐字钉住）。
@@ -148,16 +181,30 @@ pub async fn run(cli: &Cli) -> Result<ExitCode> {
         bail!("交互模式需要 TTY；请用 ignis run");
     }
 
+    // `--tui`：先试全屏界面。不可用时 `tui::start` 只多打一行 note（`Ok(None)`），下面的一切
+    // 照旧——banner、`-c` 与读取层选择都走**原路径**（R4：降级不改变经典 REPL 的任何字节）
+    if cli.tui {
+        #[cfg(unix)]
+        {
+            if let Some(code) = crate::tui::start(cli).await? {
+                return Ok(code);
+            }
+        }
+        // 非 unix：信号流与 termios 都是 unix 的，`tui` 模块整块不在——`--tui` 等价于可用性判定
+        // 失败，理由逐字 `unsupported platform`，note 与降级路径不变
+        #[cfg(not(unix))]
+        {
+            println!("{}", tui_unavailable_note("unsupported platform"));
+        }
+    }
+
     let mut session = Session::new(cli)?;
-    // `-c`：装载本工作区最近一次会话。命中时 banner 的 Session 行带短 id（不另打一行）；
-    // 没有会话打一行 note。读取失败是硬错误——用户点名要恢复，静默起步新会话会让人以为历史还在。
-    if cli.continue_session
-        && session
-            .resume_latest()
-            .map_err(anyhow::Error::msg)?
-            .is_none()
+    // `-c`：装载本工作区最近一次会话（命中时 banner 的 Session 行带短 id；没有会话打一行 note）。
+    // 装载规则与 TUI 入口共用一份（[`resume_continue`]）。
+    if let Some(note) =
+        resume_continue(&mut session, cli.continue_session).map_err(anyhow::Error::msg)?
     {
-        println!("{}", no_session_note());
+        println!("{note}");
     }
     // 计数来自会话里那份存储/技能目录（与运行器同一份），读库失败只退回 0 facts
     // 与「不打未读行」（各自已打一行警告）
@@ -302,6 +349,11 @@ mod tests {
     use std::io;
     use std::path::Path;
 
+    use ignis_core::config::Config;
+    use ignis_runtime::test_support::{ScriptStep, ScriptedModel};
+
+    use crate::commands::fixtures::{session_at_home, session_fixture_with_config};
+
     use super::*;
 
     /// 回退时的一行说明逐字钉住（英文 chrome，理由来自选读取层的判定）。
@@ -444,5 +496,90 @@ mod tests {
         // 计数读失败（`None`，调用方已打警告）：跳过那一行，banner 形状不变
         let failed = banner_lines(Path::new("/tmp/ws"), "native", 3, 2, None, None);
         assert_eq!(failed, quiet, "读失败与「没有未读」对用户是同一屏");
+    }
+
+    /// 未读告警行逐字（`Some(n>0)` 才有值）：经典 banner 与 TUI 的开机行共用这一份。
+    #[test]
+    fn alerts_banner_line_is_the_classic_alert_copy() {
+        assert_eq!(
+            alerts_banner_line(Some(4)).as_deref(),
+            Some("⚠ 4 unread alerts — run `ignis alerts`")
+        );
+        assert_eq!(
+            alerts_banner_line(Some(1)).as_deref(),
+            Some("⚠ 1 unread alerts — run `ignis alerts`"),
+            "单数也照原样：文案不按数量变形"
+        );
+        assert_eq!(alerts_banner_line(Some(0)), None, "没有未读就没有那一行");
+        assert_eq!(
+            alerts_banner_line(None),
+            None,
+            "计数读失败（调用方已打警告）也跳过"
+        );
+        // banner 的第 6 行就是它（既有 5/6 行断言不动）
+        assert_eq!(
+            banner_lines(Path::new("/tmp/ws"), "native", 3, 2, None, Some(4))[5],
+            alerts_banner_line(Some(4)).unwrap()
+        );
+    }
+
+    /// `-c` 的装载抽出来给两条入口共用（经典 stdout / TUI 滚动区）：flag 为假什么都不做；
+    /// 未命中给 [`no_session_note`]；命中给 `None` 且历史真的装载。
+    #[tokio::test]
+    async fn resume_continue_returns_the_note_only_when_asked_and_missing() {
+        let model = ScriptedModel::start(vec![ScriptStep::Text("答复一".into())]);
+        let config = Config {
+            api_key: Some("test-key".into()),
+            model: ignis_runtime::ModelConfig {
+                base_url: model.base_url(),
+                model: "test-model".into(),
+                ..ignis_runtime::ModelConfig::default()
+            },
+            ..Config::default()
+        };
+        let (dir, mut session) =
+            session_fixture_with_config("repl-resume-continue", "native", config.clone());
+
+        // flag 为假：什么都不做（不装历史、没有 note）
+        assert_eq!(resume_continue(&mut session, false), Ok(None));
+        assert_eq!(session.current_session(), None);
+        assert!(session.history().is_empty());
+
+        // flag 为真 + 空 home：未命中 → 一行 note（打到 stdout 还是滚动区由调用方决定）
+        assert_eq!(
+            resume_continue(&mut session, true),
+            Ok(Some(no_session_note()))
+        );
+        assert_eq!(session.current_session(), None, "未命中什么都不改");
+
+        // 先跑一轮把会话落库，再从「新进程」的角度恢复：命中 → 没有 note，历史装载
+        session
+            .run_task("你好".into(), TaskKind::Repl)
+            .await
+            .expect("先跑一轮把会话落库");
+        let mut restarted = session_at_home(dir.path(), "native", config);
+        assert_eq!(restarted.current_session(), None, "恢复前还没有会话");
+        assert_eq!(resume_continue(&mut restarted, true), Ok(None));
+        assert!(restarted.current_session().is_some(), "命中后设了当前会话");
+        assert_eq!(
+            restarted.history().len(),
+            2,
+            "有效历史装载（user + assistant）"
+        );
+    }
+
+    /// 非 unix 的降级理由逐字 `unsupported platform`：note 与 unix 侧同一句话（文案只有一处）。
+    #[test]
+    fn tui_unavailable_note_is_the_single_copy() {
+        assert_eq!(
+            tui_unavailable_note("unsupported platform"),
+            "note: TUI unavailable (unsupported platform); falling back to the classic REPL"
+        );
+        // unix 侧 `tui::fallback_note` 就是它（同一个实现，逐字不可能分家）
+        #[cfg(unix)]
+        assert_eq!(
+            tui_unavailable_note("TERM is dumb"),
+            crate::tui::fallback_note("TERM is dumb")
+        );
     }
 }

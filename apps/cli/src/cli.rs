@@ -42,6 +42,10 @@ pub struct Cli {
     #[arg(short = 'c', long = "continue", global = true)]
     pub continue_session: bool,
 
+    /// 全屏 TUI（Beta；仅交互式 REPL）——与 `-c` 一样是 REPL 专属开关
+    #[arg(long, global = true)]
+    pub tui: bool,
+
     /// 无子命令时进入 REPL
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -245,6 +249,15 @@ pub fn reject_continue_with_subcommand(
     Ok(())
 }
 
+/// `--tui` 与任何子命令同用是用法错误（与 [`reject_continue_with_subcommand`] 同形）：它和 `-c`
+/// 一样是 REPL 专属开关，混用只会让人以为全屏界面也管那条命令。
+pub fn reject_tui_with_subcommand(command: Option<&Command>, tui: bool) -> Result<(), String> {
+    if tui && command.is_some() {
+        return Err("--tui only applies to the interactive REPL".to_string());
+    }
+    Ok(())
+}
+
 /// 解析参数后分发：错误一律经 `anyhow::Result` 上抛给 `main`。
 ///
 /// `--kernel` 的值域由 clap 把关、配置里的 `default_kernel` 由 [`commands::kernel::resolve_kernel`]
@@ -253,6 +266,7 @@ pub async fn dispatch(cli: &Cli) -> Result<ExitCode> {
     // 用法错误在任何子命令与 REPL 之前拦下（解析期 clap 管不了跨字段的约定）
     reject_continue_with_subcommand(cli.command.as_ref(), cli.continue_session)
         .map_err(anyhow::Error::msg)?;
+    reject_tui_with_subcommand(cli.command.as_ref(), cli.tui).map_err(anyhow::Error::msg)?;
     match &cli.command {
         Some(Command::Run { task }) => commands::run::run(cli, task).await,
         Some(Command::Task { command }) => commands::task::run(command),
@@ -353,5 +367,47 @@ mod tests {
         assert!(
             reject_continue_with_subcommand(plain.command.as_ref(), plain.continue_session).is_ok()
         );
+    }
+
+    /// `--tui` 与 `-c` 同形：单独用（以及和别的 REPL 开关组合）进 REPL；与任何子命令同用是
+    /// 用法错误（文案逐字钉住，`main` 会打 `error:` 前缀并给退出码 1）。
+    #[test]
+    fn tui_flag_only_applies_to_the_repl() {
+        // 单独用：无子命令 → REPL；守卫放行
+        let repl = Cli::try_parse_from(["ignis", "--tui"]).expect("--tui 单独用应可解析");
+        assert!(repl.tui);
+        assert!(repl.command.is_none(), "无子命令才进 REPL");
+        assert!(reject_tui_with_subcommand(repl.command.as_ref(), repl.tui).is_ok());
+
+        // 与另外几个 REPL 开关同用：都放行且仍进 REPL（预授权/内核/恢复都照常）
+        for args in [
+            &["ignis", "--tui", "-c"][..],
+            &["ignis", "--tui", "--yes"][..],
+            &["ignis", "--tui", "--kernel", "codex"][..],
+            &["ignis", "--tui", "--unsafe", "--workspace", "/tmp/ws"][..],
+        ] {
+            let combined = Cli::try_parse_from(args).expect("REPL 开关可组合");
+            assert!(combined.tui, "{args:?}");
+            assert!(combined.command.is_none(), "{args:?}");
+            assert!(
+                reject_tui_with_subcommand(combined.command.as_ref(), combined.tui).is_ok(),
+                "{args:?}"
+            );
+        }
+
+        // 与子命令同用：解析照常通过（守卫在分发期），守卫给出人话错误
+        let mixed =
+            Cli::try_parse_from(["ignis", "--tui", "run", "x"]).expect("--tui 与子命令应可解析");
+        assert!(mixed.tui);
+        assert!(mixed.command.is_some());
+        assert_eq!(
+            reject_tui_with_subcommand(mixed.command.as_ref(), mixed.tui).unwrap_err(),
+            "--tui only applies to the interactive REPL"
+        );
+
+        // 不带旗标的子命令：守卫放行
+        let plain = Cli::try_parse_from(["ignis", "run", "x"]).expect("普通调用应可解析");
+        assert!(!plain.tui);
+        assert!(reject_tui_with_subcommand(plain.command.as_ref(), plain.tui).is_ok());
     }
 }

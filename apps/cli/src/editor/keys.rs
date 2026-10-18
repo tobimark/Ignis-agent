@@ -63,6 +63,10 @@ pub enum Key {
     CtrlC,
     /// Tab（0x09；粘贴区间里不产生它，那里按字面出 `Char('\t')`）。
     Tab,
+    /// Esc：**解码器不产生它**——裸 `ESC` 留在 `pending` 里等半条转义序列，由
+    /// [`Decoder::take_lone_escape`] 在 tick 上交付（TUI 的 Esc 消歧），那里合成这一个按键。
+    /// 经典编辑器走不到它。
+    Esc,
     /// bracketed paste 开始（`\x1b[200~`）。
     PasteStart,
     /// bracketed paste 结束（`\x1b[201~`）。
