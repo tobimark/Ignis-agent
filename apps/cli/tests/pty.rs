@@ -52,7 +52,7 @@ const LEARN_PROMPT: &str = "save this skill draft? [s]ave [d]iscard> ";
 ///
 /// 返回值都要活到用例结束：`TempDir` 管目录、句柄管服务线程、`Pty` 管子进程。
 fn spawn_repl(label: &str, script: Vec<ScriptStep>) -> (Pty, TempDir, ScriptedModelHandle) {
-    spawn_repl_with_env(label, script, &[])
+    spawn_repl_with(label, script, &[], &[], None)
 }
 
 /// [`spawn_repl`] 的可覆盖环境变体：`env` 逐项盖掉夹具的默认取值（本套里给 `TERM=dumb` 用）。
@@ -61,9 +61,38 @@ fn spawn_repl_with_env(
     script: Vec<ScriptStep>,
     env: &[(&str, &str)],
 ) -> (Pty, TempDir, ScriptedModelHandle) {
+    spawn_repl_with(label, script, &[], env, None)
+}
+
+/// [`spawn_repl`] 的完整形态：`args` 原样交给 CLI（`--no-banner` 这类启动开关），`env` 逐项盖掉
+/// 夹具的默认取值，`window` 覆盖从端的列数/行数（启动屏档位由列数决定）。
+///
+/// 启动屏那六条用例把三样都用到了：档位靠窗口、配色靠环境、`--no-banner` 靠参数——合成一个装配
+/// 函数，免得为每种组合再抄一份（`spawn_repl` / `spawn_repl_with_env` / `spawn_repl_with_window`
+/// 都是它的薄包装）。
+fn spawn_repl_with(
+    label: &str,
+    script: Vec<ScriptStep>,
+    args: &[&str],
+    env: &[(&str, &str)],
+    window: Option<(u16, u16)>,
+) -> (Pty, TempDir, ScriptedModelHandle) {
     let model = ScriptedModel::start(script);
     let dir = TempDir::new(label);
-    let pty = spawn_repl_in_with_env(&dir, &model, &[], env);
+    let home = dir.join("home");
+    let workspace = dir.join("workspace");
+    // home 由 CLI 自己建（0700），工作区必须预先存在：CLI 启动时会校验它是目录
+    fs::create_dir_all(&workspace).expect("工作区应可创建");
+
+    let pty = Pty::spawn(&PtyOptions {
+        home: &home,
+        workspace: &workspace,
+        base_url: &model.base_url(),
+        args,
+        // 默认环境（模型地址、密钥、NO_COLOR、TERM）由夹具注入
+        env,
+        window,
+    });
     (pty, dir, model)
 }
 
@@ -101,28 +130,14 @@ fn spawn_repl_in_with_env(
     })
 }
 
-/// [`spawn_repl`] 的窗口尺寸变体：从端按用例给的列数/行数开（窄终端里的折行用例要它）。
+/// [`spawn_repl`] 的窗口尺寸变体：从端按用例给的列数/行数开（窄终端里的折行用例与启动屏的
+/// 三档宽度用例要它）。
 fn spawn_repl_with_window(
     label: &str,
     script: Vec<ScriptStep>,
     window: (u16, u16),
 ) -> (Pty, TempDir, ScriptedModelHandle) {
-    let model = ScriptedModel::start(script);
-    let dir = TempDir::new(label);
-    let home = dir.join("home");
-    let workspace = dir.join("workspace");
-    // 工作区必须预先存在（CLI 启动时会校验它是目录），home 由 CLI 自己建
-    fs::create_dir_all(&workspace).expect("工作区应可创建");
-
-    let pty = Pty::spawn(&PtyOptions {
-        home: &home,
-        workspace: &workspace,
-        base_url: &model.base_url(),
-        args: &[],
-        env: &[],
-        window: Some(window),
-    });
-    (pty, dir, model)
+    spawn_repl_with(label, script, &[], &[], Some(window))
 }
 
 /// 技能文件的落点：`{IGNIS_HOME}/skills/{name}/SKILL.md`（`spawn_repl*` 建出来的 home 就是
@@ -263,6 +278,206 @@ fn wait_for_requests(model: &ScriptedModelHandle, count: usize) -> Vec<Value> {
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// 启动屏区段：CLI 把终端交给编辑器（或交给按行输入的提示符）之前写出的全部字节。
+///
+/// 切点是「编辑器接管终端的第一个字节」：raw mode 的 bracketed paste 开启序列
+/// （`\x1b[?2004h`，见 `editor::raw`），或者更早出现的首个 `❯ `——`TERM=dumb` 的回退路径不进
+/// raw mode，提示符自己就是边界。
+///
+/// 为什么不直接切在首个 `❯ `：编辑器接管时会先写控制字节再画提示符——`choose_reader` 的往返
+/// 探针留下 `\x1b[?2004h\x1b[?2004l`、读取区间再开一次，第一帧自己还带 `\r\x1b[J`。把它们算进
+/// 「启动屏」会让「启动屏零转义」这条断言恒假；那条断言要钉的是**启动屏自己**不写转义，不是
+/// 编辑器不写。
+///
+/// 调用前先 `expect("❯ ")`：提示符出现 = 启动屏已经整段写完（逐行 `println!` 到 tty）。
+fn startup_screen(pty: &Pty) -> String {
+    let text = pty.output();
+    let cut = [text.find("\u{1b}[?2004h"), text.find("❯ ")]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(text.len());
+    text[..cut].to_string()
+}
+
+/// 启动屏的 Full 档（≥100 列）：火焰字模 + 字标 + 标语，状态块跟在后面。
+///
+/// 夹具默认 `NO_COLOR=1`：整段启动屏一个转义都不写（字模走剪影、状态块纯文本）。
+#[test]
+fn pty_banner_full_tier_shows_the_flame_and_tagline() {
+    let (mut pty, _dir, _model) = spawn_repl_with_window("pty-banner-full", Vec::new(), (120, 30));
+
+    pty.expect("❯ ");
+    let banner = startup_screen(&pty);
+    assert!(banner.contains("IGNIS v"), "字标那一行：{banner}");
+    assert!(
+        banner.contains('█') || banner.contains('▀'),
+        "Full 档必须画出火焰字模：{banner}"
+    );
+    assert!(
+        banner.contains("Your Personal Autonomous Agent"),
+        "Full 档带标语：{banner}"
+    );
+    assert!(
+        banner.contains("Session: "),
+        "状态块照常跟在品牌块之后：{banner}"
+    );
+    assert!(
+        !banner.contains('\x1b'),
+        "NO_COLOR=1 下启动屏零转义：{banner:?}"
+    );
+
+    pty.send("\x04");
+    assert_eq!(pty.wait(), 0, "Ctrl-D 应以 0 退出：\n{}", pty.output());
+}
+
+/// 启动屏的 Compact 档（60–99 列，含设计稿点名的 80 列）：火焰字模 + 字标，标语收掉；状态块照旧。
+#[test]
+fn pty_banner_compact_tier_drops_the_tagline() {
+    let (mut pty, _dir, _model) =
+        spawn_repl_with_window("pty-banner-compact", Vec::new(), (80, 24));
+
+    pty.expect("❯ ");
+    let banner = startup_screen(&pty);
+    assert!(banner.contains("IGNIS v"), "字标那一行：{banner}");
+    assert!(
+        banner.contains('█') || banner.contains('▀'),
+        "Compact 档仍画火焰字模：{banner}"
+    );
+    assert!(
+        !banner.contains("Your Personal Autonomous Agent"),
+        "Compact 档没有标语：{banner}"
+    );
+    assert!(
+        banner.contains("● Ready"),
+        "状态块与档位无关（Compact 照常输出）：{banner}"
+    );
+
+    pty.send("\x04");
+    assert_eq!(pty.wait(), 0, "Ctrl-D 应以 0 退出：\n{}", pty.output());
+}
+
+/// 启动屏的 Minimal 档（<60 列）：品牌块只剩单行字标，**状态块照常输出**——档位降级只降品牌块
+/// （设计钉死的口径），下游仍可按 `● Ready` / `Session: ` 这些锚点 grep。
+#[test]
+fn pty_banner_minimal_tier_is_a_single_line() {
+    let (mut pty, _dir, _model) =
+        spawn_repl_with_window("pty-banner-minimal", Vec::new(), (50, 24));
+
+    pty.expect("❯ ");
+    let banner = startup_screen(&pty);
+    assert_eq!(
+        banner.lines().next(),
+        Some(format!("IGNIS v{}", env!("CARGO_PKG_VERSION")).as_str()),
+        "品牌块就是这一行字标（没有字模、没有标语）：{banner}"
+    );
+    for glyph in ['█', '▀', '▄'] {
+        assert!(
+            !banner.contains(glyph),
+            "Minimal 档不画字模（{glyph:?}）：{banner}"
+        );
+    }
+    assert!(
+        banner.contains("● Ready"),
+        "档位降级只降品牌块：状态块照常：{banner}"
+    );
+    assert!(banner.contains("Session: "), "状态块的会话行也在：{banner}");
+
+    pty.send("\x04");
+    assert_eq!(pty.wait(), 0, "Ctrl-D 应以 0 退出：\n{}", pty.output());
+}
+
+/// 上色现场（真彩）：品牌槽（`#F78340`）落在字模与字标上，`● Ready` 整体绿；结束行锚点不受影响。
+///
+/// `NO_COLOR` 置空串（按 NO_COLOR 的约定 = 未设置）盖掉夹具的 `NO_COLOR=1`，`COLORTERM` 指到
+/// 真彩——色阶判定因此走 `ColorDepth::True`，品牌色就是 `38;2;247;131;64`。
+#[test]
+fn pty_banner_truecolor_wraps_the_brand_sgr() {
+    let (mut pty, _dir, _model) = spawn_repl_with(
+        "pty-banner-truecolor",
+        vec![ScriptStep::Text("答复一".to_string())],
+        &[],
+        &[("NO_COLOR", ""), ("COLORTERM", "truecolor")],
+        Some((120, 30)),
+    );
+
+    pty.expect("❯ ");
+    let banner = startup_screen(&pty);
+    assert!(
+        banner.contains("\u{1b}[38;2;247;131;64m"),
+        "字标/字模必须带品牌橙：{banner:?}"
+    );
+    assert!(
+        banner.contains("\u{1b}[32m● Ready\u{1b}[0m"),
+        "`● Ready` 整体绿（整段包一层）：{banner:?}"
+    );
+    assert!(
+        banner.contains('█') || banner.contains('▀'),
+        "上色档照样画出字模：{banner:?}"
+    );
+
+    // 顺带跑一轮既有 round-trip：结束行锚点仍是连续的 `● Done`（着色只包整段，不把锚点夹成两段），
+    // 状态点按终态取绿（`ok` 槽）——上色现场把结束行也一起收进回归面
+    pty.send("你好\r");
+    pty.expect("答复一");
+    pty.expect("● Done");
+    assert!(
+        pty.output().contains("\u{1b}[32m● Done\u{1b}[0m"),
+        "结束行的 `● Done` 应整段带终态色（绿）：\n{}",
+        pty.output()
+    );
+    wait_for_prompt_after(&pty, "● Done");
+    pty.send("\x04");
+    assert_eq!(pty.wait(), 0, "Ctrl-D 应以 0 退出：\n{}", pty.output());
+}
+
+/// `--no-banner`：经典路径的两块启动屏一起收掉——提示符之前一个字都不打，REPL 本身照旧可用。
+#[test]
+fn pty_no_banner_suppresses_the_startup_screen() {
+    let (mut pty, _dir, _model) =
+        spawn_repl_with("pty-no-banner", Vec::new(), &["--no-banner"], &[], None);
+
+    pty.expect("❯ ");
+    let banner = startup_screen(&pty);
+    assert!(!banner.contains("IGNIS v"), "没有品牌块：{banner:?}");
+    assert!(!banner.contains("● Ready"), "没有状态块：{banner:?}");
+    assert!(
+        !banner.contains("Your Personal Autonomous Agent"),
+        "也没有标语：{banner:?}"
+    );
+
+    pty.send("\x04");
+    assert_eq!(pty.wait(), 0, "Ctrl-D 应以 0 退出：\n{}", pty.output());
+}
+
+/// 哑终端（`TERM=dumb`）：启动屏恒 Minimal 且零 SGR，经典路径回退按行输入的那句 note 仍在。
+///
+/// 这条路径根本不进 raw mode（`choose_reader` 直接给 `StdinReader`），所以提示符之前一个转义
+/// 字节都不该有——比「零 SGR」更强，哑终端上连光标控制都不许出现。
+#[test]
+fn pty_dumb_terminal_banner_is_minimal_and_colorless() {
+    let (mut pty, _dir, _model) =
+        spawn_repl_with_env("pty-banner-dumb", Vec::new(), &[("TERM", "dumb")]);
+
+    pty.expect("❯ ");
+    let banner = startup_screen(&pty);
+    assert!(banner.contains("IGNIS v"), "字标照旧：{banner}");
+    for glyph in ['█', '▀', '▄'] {
+        assert!(
+            !banner.contains(glyph),
+            "哑终端不画字模（{glyph:?}）：{banner}"
+        );
+    }
+    assert!(!banner.contains('\x1b'), "哑终端启动屏零转义：{banner:?}");
+    assert!(
+        banner.contains("note: line editing unavailable (TERM is dumb); using plain line input"),
+        "回退按行输入的 note 仍在：{banner}"
+    );
+
+    pty.send("\x04");
+    assert_eq!(pty.wait(), 0, "Ctrl-D 应以 0 退出：\n{}", pty.output());
 }
 
 /// 中文提示词提交一次：输入行原样留在屏幕上、答复与结束行都渲染到同一个终端，

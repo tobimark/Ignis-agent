@@ -1,5 +1,5 @@
-//! TUI 的 pty 端到端用例（四条）：备用屏 + 流式答复 + `/exit` 还原、任务运行中的 Ctrl+C 取消、
-//! `TERM=dumb` 与过小终端两条降级。
+//! TUI 的 pty 端到端用例（五条）：备用屏 + 流式答复 + `/exit` 还原、任务运行中的 Ctrl+C 取消、
+//! 开机品牌块（含 `--no-banner` 收掉它）、`TERM=dumb` 与过小终端两条降级。
 //!
 //! 与 `pty.rs` 同一条纪律（助手在本套里自持一份，不借用那边的任何符号）：
 //!
@@ -10,6 +10,8 @@
 //!   而不是行规范下的「插换行」）；两条降级是经典 REPL，canonical 下由终端自己缓冲与回显；
 //! - **`NO_COLOR=1` 由夹具注入**：TUI 的帧里零 SGR（`color=false`），断言一律按纯文本找；备用屏
 //!   与光标定位不是颜色，照常出现在流里（`\x1b[?1049h`/`\x1b[?1049l` 正是两条判据）；
+//! - **开机品牌块只进滚动区**：字模字形（`█▀▄`）出现在帧里就是「品牌块已经落进滚动区」的证据；
+//!   经典**状态块**不进 TUI（`● Ready` 是那条判据的反面），`--no-banner` 收掉的是品牌块本身；
 //! - **位置敏感的断言看「标记之后」**：`Pty::expect` 每次从流头重扫，而每一帧都会把同一块滚动区
 //!   重画一遍——取消后的空闲输入区只认 `● Aborted` **之后**新写出的字节（[`expect_after`]）；
 //! - **假模型句柄与 `TempDir` 都持有到用例结束**：`ScriptedModelHandle::drop` 停服务，
@@ -119,7 +121,8 @@ fn wait_for_requests(model: &ScriptedModelHandle, count: usize) -> Vec<Value> {
     }
 }
 
-/// `--tui`：进备用屏、流式答复、`/exit` 还原备用屏与 termios，且**不打印经典 banner**。
+/// `--tui`：进备用屏、流式答复、`/exit` 还原备用屏与 termios；开机品牌块进滚动区，经典状态块
+/// （`● Ready`）**不打印**。
 #[test]
 fn pty_tui_enters_the_alt_screen_streams_an_answer_and_restores_on_exit() {
     let (mut pty, _dir, _model) = spawn_tui(
@@ -150,10 +153,14 @@ fn pty_tui_enters_the_alt_screen_streams_an_answer_and_restores_on_exit() {
         pty.output()
     );
 
+    let output = pty.output();
     assert!(
-        !pty.output().contains("● Ready"),
-        "TUI 不打印经典 banner（那一行只属于经典 REPL）：\n{}",
-        pty.output()
+        output.contains('█') || output.contains('▀'),
+        "开机品牌块（火焰字模）必须真的落进滚动区：\n{output}"
+    );
+    assert!(
+        !output.contains("● Ready"),
+        "经典状态块不进 TUI（那一行只属于经典 REPL）：\n{output}"
     );
 }
 
@@ -192,6 +199,56 @@ fn pty_tui_ctrl_c_cancels_a_running_task_without_leaving() {
         code,
         0,
         "取消不带走会话：`/exit` 仍以 0 退出：\n{}",
+        pty.output()
+    );
+
+    // 品牌块在这条路径上同样只进滚动区：字模字形在，经典状态块不在
+    let output = pty.output();
+    assert!(
+        output.contains('█') || output.contains('▀'),
+        "开机品牌块（火焰字模）必须真的落进滚动区：\n{output}"
+    );
+    assert!(
+        !output.contains("● Ready"),
+        "经典状态块不进 TUI（那一行只属于经典 REPL）：\n{output}"
+    );
+}
+
+/// `--tui --no-banner`：开机品牌块整块不推（滚动区里一个火焰字形都没有），但顶行的字标照旧
+/// ——`--no-banner` 只管品牌块，顶行 `IGNIS v…` 是帧的 chrome，与品牌块无关。
+#[test]
+fn pty_tui_no_banner_drops_the_brand_block_but_keeps_the_top_line() {
+    // 空脚本：这一例不发任何模型请求（`/exit` 即退）
+    let (mut pty, _dir, _model) =
+        spawn_tui("tui-no-banner", Vec::new(), &["--tui", "--no-banner"], None);
+
+    // 进屏 + 顶行（字标 + 内核）都写完了，再等输入区的标记：此时滚动区与输入区都已落地，
+    // 下面两条断言看的是同一份完整现场
+    pty.expect("\x1b[?1049h");
+    pty.expect("IGNIS v");
+    pty.expect("kernel native");
+    pty.expect("❯ ");
+
+    let output = pty.output();
+    for glyph in ['█', '▀', '▄'] {
+        assert!(
+            !output.contains(glyph),
+            "`--no-banner` 下品牌块不该进滚动区（{glyph:?}）：\n{output}"
+        );
+    }
+    assert!(
+        output.contains("IGNIS v"),
+        "顶行的字标文案仍在（收掉的只是品牌块）：\n{}",
+        pty.output()
+    );
+
+    pty.send("/exit\r");
+    pty.expect("\x1b[?1049l");
+    let code = pty.wait();
+    assert_eq!(code, 0, "`/exit` 应以 0 退出：\n{}", pty.output());
+    assert!(
+        !pty.output().contains("● Ready"),
+        "经典状态块照旧不进 TUI：\n{}",
         pty.output()
     );
 }
