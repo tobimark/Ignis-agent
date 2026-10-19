@@ -1,4 +1,5 @@
-//! 无子命令时的交互式 REPL：banner、提示词、斜杠命令（[`crate::commands::slash`]）与逐行任务。
+//! 无子命令时的交互式 REPL：两段式启动屏（品牌块 + 状态块）、提示词、斜杠命令
+//! （[`crate::commands::slash`]）与逐行任务。
 //!
 //! 输入读取走 [`LineReader`] 这一层薄接口：终端能承载转义重绘时用行编辑器
 //! （[`crate::editor::reader::EditorLineReader`]：多行、历史、Tab 补全），否则回退 [`StdinReader`]
@@ -9,21 +10,25 @@
 
 use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
-use ignis_core::config::ignis_home;
+use ignis_core::config::{ignis_home, load_config};
 use ignis_core::task::TaskKind;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+use crate::brand;
 use crate::cli::Cli;
 use crate::commands::slash::{self, Dispatch, Parsed};
-use crate::commands::{Session, install_ctrl_c_handler, kernel_note, spawn_ctrl_c_watcher};
+use crate::commands::{
+    Session, install_ctrl_c_handler, kernel_note, no_color_value, spawn_ctrl_c_watcher,
+};
 use crate::editor::raw::{self, RawMode};
 use crate::editor::reader::{EditorLineReader, INVALID_WARNING};
+use crate::render::width_for_stdout;
 
 /// 提示词（固定文案）。
 const PROMPT: &str = "❯ ";
@@ -56,41 +61,10 @@ impl LineReader for StdinReader {
     }
 }
 
-/// REPL banner：固定 5 行（版本号跟 `CARGO_PKG_VERSION` 联动，不写死字面量），有未读告警时追加第 6 行。
-///
-/// 第 4 行是运行时就绪度：技能目录条数 + active 事实数（0 也照实显示 `Memory: 0 facts`——
-/// 记忆是「有就注入」的可选段，不是开关，不该在 banner 上显示成 `off`）。第 5 行是本会话的
-/// 会话行（`Session: new` 或 13 字符短 id，与 `/status` 共用 [`slash::session_label`]），
-/// `-c` 命中时不去 banner 之外再打一遍会话 id。
-///
-/// 最后一行只在有未读告警时出现（spec §6.1：启动时若有未读告警，顶部横幅提示）：`unread` 为
-/// `Some(n)` 且 `n > 0` 时给 `⚠ {n} unread alerts — run \`ignis alerts\``；`None`（计数读失败，
-/// 调用方已打警告）与 `Some(0)` 都保持 5 行。
-pub fn banner_lines(
-    workspace: &Path,
-    kernel: &str,
-    skills: usize,
-    memory: usize,
-    session: Option<&str>,
-    unread_alerts: Option<usize>,
-) -> Vec<String> {
-    let mut lines = vec![
-        format!("IGNIS v{}", env!("CARGO_PKG_VERSION")),
-        "● Ready".to_string(),
-        format!("Workspace: {}", workspace.display()),
-        format!("Runtime: {kernel} · Skills: {skills} · Memory: {memory} facts"),
-        format!("Session: {}", slash::session_label(session)),
-    ];
-    if let Some(line) = alerts_banner_line(unread_alerts) {
-        lines.push(line);
-    }
-    lines
-}
-
-/// banner 的未读告警行（`Some(n>0)` 才有值）；[`banner_lines`] 改调它，逐字不变。
+/// 未读告警行（`Some(n>0)` 才有值）：经典启动屏的状态块与 TUI 的开机行共用这一份。
 ///
 /// `None`（计数读失败，调用方已打警告）与 `Some(0)` 都给 `None`——那一行只在真有未读时出现。
-/// TUI 的开机行也从这里取（同一个文案来源，两处不会分家）。
+/// 两处取的是同一个文案来源，不会分家。
 pub fn alerts_banner_line(unread: Option<usize>) -> Option<String> {
     unread
         .filter(|count| *count > 0)
@@ -100,7 +74,7 @@ pub fn alerts_banner_line(unread: Option<usize>) -> Option<String> {
 /// `-c` 的装载（两条入口共用）：未命中返回 `Some(no_session_note())`，由调用方决定打到哪
 /// （经典 REPL 是 stdout，TUI 是滚动区）；`flag` 为假时什么都不做、返回 `None`。
 ///
-/// 命中时把本工作区最近一次会话设成当前会话并装载有效历史（banner 的 Session 行会带短 id，
+/// 命中时把本工作区最近一次会话设成当前会话并装载有效历史（启动屏状态块的 Session 行会带短 id，
 /// 不另打一行）。读取失败是硬错误——用户点名要恢复，静默起步新会话会让人以为历史还在。
 pub fn resume_continue(session: &mut Session, flag: bool) -> Result<Option<&'static str>, String> {
     if !flag {
@@ -182,7 +156,7 @@ pub async fn run(cli: &Cli) -> Result<ExitCode> {
     }
 
     // `--tui`：先试全屏界面。不可用时 `tui::start` 只多打一行 note（`Ok(None)`），下面的一切
-    // 照旧——banner、`-c` 与读取层选择都走**原路径**（R4：降级不改变经典 REPL 的任何字节）
+    // 照旧——启动屏、`-c` 与读取层选择都走**原路径**（R4：降级不改变经典 REPL 的任何字节）
     if cli.tui {
         #[cfg(unix)]
         {
@@ -203,13 +177,44 @@ pub async fn run(cli: &Cli) -> Result<ExitCode> {
     // 安装点必须在**任何可交互时机之前**：`tokio::signal::ctrl_c` 的处理器在 future 首次轮询时
     // 才装，而空闲 / 任务 / `/compact` / `/learn` 四段的 watcher 都是「每段现起」——第一段 watcher
     // 被轮询之前到达的 Ctrl+C 会走默认处置直接杀进程（P5 台账记的偶发信号退出）。装在这里，
-    // 会话装配、banner 与第一段等待都在它之后；各段 watcher 照旧只管自己那份令牌（监听者各自
+    // 会话装配、启动屏与第一段等待都在它之后；各段 watcher 照旧只管自己那份令牌（监听者各自
     // 成流、互不消耗）。TUI 路径自己管信号（进守卫之前注册），成功时早已返回，不走这一行。
     let _ctrl_c = install_ctrl_c_handler();
 
+    // 两段式启动屏的上半段——品牌块：**先于会话装配**打出，只读配置的 `ui` 段与终端现场，
+    // 不等数据库 / 技能目录就绪。版本行 `IGNIS v{…}` 由这一块的字标承担（旧 banner 的第 1 行），
+    // 所以下面的状态块不再补一行版本。配置读不出来时用默认 `ui`（真错误由 `Session::new` 给出，
+    // 不在这里重复报一遍）。
+    let ui = load_config(&ignis_home())
+        .map(|config| config.ui)
+        .unwrap_or_default();
+    let stdout_tty = io::stdout().is_terminal();
+    let term_raw = std::env::var_os("TERM");
+    let term_supported = RawMode::supported(term_raw.as_deref());
+    // 两个文本化与 `env_text_value` 同一手法（存在即算「已设置」，非 UTF-8 有损解码）
+    let colorterm = std::env::var_os("COLORTERM").map(|value| value.to_string_lossy().into_owned());
+    let term = term_raw
+        .as_deref()
+        .map(|value| value.to_string_lossy().into_owned());
+    let no_color = no_color_value(std::env::var_os("NO_COLOR"));
+    let style = brand::startup_style(
+        &ui,
+        width_for_stdout(stdout_tty),
+        stdout_tty,
+        term_supported,
+        colorterm.as_deref(),
+        term.as_deref(),
+        no_color.as_deref(),
+    );
+    if !cli.no_banner {
+        for line in brand::brand_block(env!("CARGO_PKG_VERSION"), &style) {
+            println!("{line}");
+        }
+    }
+
+    // 会话装配与 `-c`（不变；装载规则与 TUI 入口共用 [`resume_continue`]）：`-c` 的 note
+    // 打在两块之间——品牌块之后、状态块之前
     let mut session = Session::new(cli)?;
-    // `-c`：装载本工作区最近一次会话（命中时 banner 的 Session 行带短 id；没有会话打一行 note）。
-    // 装载规则与 TUI 入口共用一份（[`resume_continue`]）。
     if let Some(note) =
         resume_continue(&mut session, cli.continue_session).map_err(anyhow::Error::msg)?
     {
@@ -219,18 +224,27 @@ pub async fn run(cli: &Cli) -> Result<ExitCode> {
     // 与「不打未读行」（各自已打一行警告）
     let (skills, memory) = session.banner_counts();
     let unread = session.unread_alerts();
-    for line in banner_lines(
-        session.workspace(),
-        session.kernel(),
-        skills,
-        memory,
-        session.current_session(),
-        unread,
-    ) {
-        println!("{line}");
+
+    // 两段式启动屏的下半段——状态块：4 行信息 + 可选告警行（旧 banner 的第 2–6 行语义，逐字
+    // 承接）。会话行与 `/status` 共用 `slash::session_label`。`--no-banner` 把两块一起收掉；
+    // 档位降级只降品牌块——窗口窄到 Minimal 时状态块照旧输出，下游仍可按锚点 grep。
+    if !cli.no_banner {
+        let alerts = alerts_banner_line(unread);
+        let session_label = slash::session_label(session.current_session());
+        let facts = brand::StatusFacts {
+            workspace: session.workspace(),
+            kernel: session.kernel(),
+            skills,
+            memory,
+            session_label: &session_label,
+            alerts: alerts.as_deref(),
+        };
+        for line in brand::status_block(&style, &facts) {
+            println!("{line}");
+        }
     }
-    // 选定非 native 内核时能力提示行跟着 banner 一起给出（`/kernel` 切换时是同一份文案）；
-    // native 不加任何行——启动屏的形状保持 5 行（有未读告警时 6 行）
+    // 选定非 native 内核时能力提示行跟着启动屏一起给出（`/kernel` 切换时是同一份文案）；
+    // native 不加任何行
     if let Some(note) = kernel_note(session.kernel()) {
         println!("{note}");
     }
@@ -356,7 +370,6 @@ async fn next_line(reader: Arc<dyn LineReader>) -> Result<Option<String>> {
 mod tests {
     use std::ffi::OsStr;
     use std::io;
-    use std::path::Path;
 
     use ignis_core::config::Config;
     use ignis_runtime::test_support::{ScriptStep, ScriptedModel};
@@ -422,60 +435,6 @@ mod tests {
         assert_eq!(reason.as_deref(), Some("不是 tty"));
     }
 
-    #[test]
-    fn banner_is_the_five_locked_lines() {
-        let lines = banner_lines(Path::new("/tmp/ws"), "native", 3, 2, None, None);
-
-        assert_eq!(
-            lines,
-            [
-                // 版本号跟 `CARGO_PKG_VERSION` 联动（钉死字面量会让升级后 banner 说谎）
-                format!("IGNIS v{}", env!("CARGO_PKG_VERSION")),
-                "● Ready".to_string(),
-                "Workspace: /tmp/ws".to_string(),
-                "Runtime: native · Skills: 3 · Memory: 2 facts".to_string(),
-                "Session: new".to_string(),
-            ]
-        );
-        assert!(lines.contains(&"● Ready".to_string()), "{lines:?}");
-    }
-
-    #[test]
-    fn banner_counts_zero_facts_instead_of_turning_memory_off() {
-        let lines = banner_lines(Path::new("/tmp/ws"), "native", 5, 0, None, None);
-
-        assert_eq!(lines[3], "Runtime: native · Skills: 5 · Memory: 0 facts");
-        assert!(!lines[3].contains("off"), "{lines:?}");
-    }
-
-    /// 会话行：banner 第 5 行，`Session: new` 或 13 字符短 id（与任务短 id 同一 helper）；
-    /// 有未读告警时它的下标往后挪一位（告警行才排第六）。
-    #[test]
-    fn banner_appends_the_session_line_before_the_alerts() {
-        // 没有会话（还没跑过任务 / `-c` 未命中）：`Session: new`
-        let fresh = banner_lines(Path::new("/tmp/ws"), "native", 3, 2, None, None);
-        assert_eq!(fresh.len(), 5, "{fresh:?}");
-        assert_eq!(fresh[4], "Session: new");
-
-        // 有会话：13 字符短 id
-        let session_id = "019a1b2c-3d4e-7f00-8000-000000000001";
-        let resumed = banner_lines(Path::new("/tmp/ws"), "native", 3, 2, Some(session_id), None);
-        assert_eq!(resumed[4], "Session: 019a1b2c-3d4e");
-
-        // 有未读告警：会话行仍在第 5 行，告警行被挤到第 6 行
-        let alerting = banner_lines(
-            Path::new("/tmp/ws"),
-            "native",
-            3,
-            2,
-            Some(session_id),
-            Some(4),
-        );
-        assert_eq!(alerting.len(), 6, "{alerting:?}");
-        assert_eq!(alerting[4], "Session: 019a1b2c-3d4e");
-        assert_eq!(alerting[5], "⚠ 4 unread alerts — run `ignis alerts`");
-    }
-
     /// `-c` 未命中时的提示行逐字钉住。
     #[test]
     fn no_session_note_is_pinned() {
@@ -485,29 +444,7 @@ mod tests {
         );
     }
 
-    /// 未读告警：有就追加一行（点名条数与下一步命令），没有（0 或计数读失败）保持五行的常规形状。
-    #[test]
-    fn banner_appends_an_unread_alerts_line_only_when_there_are_some() {
-        let lines = banner_lines(Path::new("/tmp/ws"), "native", 3, 2, None, Some(4));
-        assert_eq!(lines.len(), 6, "{lines:?}");
-        assert_eq!(lines[5], "⚠ 4 unread alerts — run `ignis alerts`");
-        // 前四行不受影响，会话行仍在第 5 行
-        assert_eq!(lines[3], "Runtime: native · Skills: 3 · Memory: 2 facts");
-        assert_eq!(lines[4], "Session: new");
-
-        let quiet = banner_lines(Path::new("/tmp/ws"), "native", 3, 2, None, Some(0));
-        assert_eq!(quiet.len(), 5, "{quiet:?}");
-        assert!(
-            !quiet.iter().any(|line| line.contains("unread")),
-            "{quiet:?}"
-        );
-
-        // 计数读失败（`None`，调用方已打警告）：跳过那一行，banner 形状不变
-        let failed = banner_lines(Path::new("/tmp/ws"), "native", 3, 2, None, None);
-        assert_eq!(failed, quiet, "读失败与「没有未读」对用户是同一屏");
-    }
-
-    /// 未读告警行逐字（`Some(n>0)` 才有值）：经典 banner 与 TUI 的开机行共用这一份。
+    /// 未读告警行逐字（`Some(n>0)` 才有值）：经典启动屏的状态块与 TUI 的开机行共用这一份。
     #[test]
     fn alerts_banner_line_is_the_classic_alert_copy() {
         assert_eq!(
@@ -524,11 +461,6 @@ mod tests {
             alerts_banner_line(None),
             None,
             "计数读失败（调用方已打警告）也跳过"
-        );
-        // banner 的第 6 行就是它（既有 5/6 行断言不动）
-        assert_eq!(
-            banner_lines(Path::new("/tmp/ws"), "native", 3, 2, None, Some(4))[5],
-            alerts_banner_line(Some(4)).unwrap()
         );
     }
 
