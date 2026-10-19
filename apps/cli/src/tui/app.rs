@@ -1206,12 +1206,28 @@ mod tests {
     /// 帧协议自身的序列（藏/显光标、归位、清行）。
     const FRAME_SEQUENCES: [&str; 4] = ["\x1b[?25l", "\x1b[?25h", "\x1b[H", "\x1b[K"];
 
-    /// 调色板的六个 SGR（`capture` 的净化白名单）：chrome 与渲染器输出的正当上色。
-    const PALETTE_SGR: [&str; 6] = [
-        "\x1b[0m", "\x1b[1m", "\x1b[2m", "\x1b[31m", "\x1b[36m", "\x1b[90m",
+    /// 调色板在帧里可能产出的 SGR：chrome（reset/bold/dim）与品牌槽（顶行字标与输入区标记的
+    /// `palette.brand`，按主题 × 色阶共五种）。
+    ///
+    /// 净化（`capture::sanitize`）的放行面是 **SGR 形状**而不是枚举出来的几条（T1 起），这里只是
+    /// 帧侧的已知集合：`stray_escape` 要抓的是内容漏出来的非 SGR 转义。
+    const PALETTE_SGR: [&str; 11] = [
+        "\x1b[0m",
+        "\x1b[1m",
+        "\x1b[2m",
+        "\x1b[31m",
+        "\x1b[36m",
+        "\x1b[90m",
+        // 品牌槽（`render::palette` 的 `brand`）：dark/light × 真彩、dark/light × 256、基本色与
+        // 不上色档的黄
+        "\x1b[38;2;247;131;64m",
+        "\x1b[38;2;217;106;43m",
+        "\x1b[38;5;209m",
+        "\x1b[38;5;166m",
+        "\x1b[33m",
     ];
 
-    /// 帧里第一条「既不属于帧协议、也不属于调色板白名单」的转义段（`None` = 干净）。
+    /// 帧里第一条「既不属于帧协议、也不属于调色板已知 SGR」的转义段（`None` = 干净）。
     ///
     /// F1 的判据：内容行漏出来的转义（清屏 `\x1b[2J`、OSC 改标题、裸 ESC）两者都不是，一出现就
     /// 会被这里抓住。
@@ -1244,7 +1260,7 @@ mod tests {
     /// F1（终审修复波）：帧的内容来源全部净化——`push_lines` 的每一行先过 `capture::sanitize`
     /// 再进滚动区，`compose` 在截断之前对每一条内容行（viewport/top/input/status）再过一遍同一
     /// 函数。含清屏（`\x1b[2J`）与 OSC 改标题（`\x1b]0;x\x07`）的行既进不了滚动区、也进不了整帧：
-    /// 帧里除协议自身的序列与调色板白名单之外没有任何 ESC。
+    /// 帧里除协议自身的序列与调色板的已知 SGR（chrome + 品牌槽）之外没有任何 ESC。
     #[test]
     fn escapes_never_reach_the_scrollback_or_the_frame() {
         let (mut app, _buffer) = app();

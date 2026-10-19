@@ -4,7 +4,8 @@
 //! 一帧的全部输入是 [`TuiView`]（它不认识会话与终端）；[`compose`] 把它拼成整帧字节；顶部/底部
 //! 状态行的文案由 [`top_line`]/[`status_line`] 从 [`ViewFacts`] 快照里拼出，宽度截断统一交给
 //! [`compose`]（文案函数只逐字拼，用例才好逐字断言）。帧里的每一条内容行在截断之前都过一遍
-//! [`capture::sanitize`]（幂等）：帧里的 ESC 只来自帧协议本身与调色板白名单的那六个 SGR。
+//! [`capture::sanitize`]（幂等）：内容里的 ESC 只可能是被放行的 SGR（放行面是 SGR 形状，不是枚举
+//! 出来的几条），帧协议自己的序列在一旁照常。
 //!
 //! 帧协议（逐字钉住，金帧用例锁死）：
 //!
@@ -24,7 +25,8 @@
 //!
 //! 颜色（`color`）：`false` 时帧里一条 SGR 都没有（定位与清行不是颜色，照常写）；`true` 时 chrome
 //! 走 [`crate::render::palette`]（按 `view.depth` 取品牌档）——顶部/底部状态行与输入区提示行 dim、
-//! 输入区首行标记（`❯ `）bold，每行结尾补一条重置，被截断的行不会把颜色漏到下一行。
+//! 顶行的字标（`IGNIS v…`）与输入区首行标记（`❯ `）`bold + brand`，每行结尾补一条重置，被截断的
+//! 行不会把颜色漏到下一行。
 
 use std::collections::VecDeque;
 
@@ -337,7 +339,7 @@ pub fn selector_lines(
 ///
 /// 内容行在**截断之前**统一过一遍 [`capture::sanitize`]（幂等）：帧的内容（viewport/top/input/
 /// status）各有各的来源（模型输出、命令输出、会话名），清屏/改标题之类的序列绝不能借帧抵达
-/// 终端；chrome 自己的 SGR 正是白名单里的那几个，上色路径与金帧因此一字不变。
+/// 终端；chrome 自己上的色都是正当 SGR（形状命中 [`capture::sanitize`] 的放行面），原样穿过。
 pub fn compose(view: &TuiView) -> String {
     let palette = palette(view.theme, view.depth);
     let rows = sanitized(layout(view));
@@ -362,7 +364,7 @@ pub fn compose(view: &TuiView) -> String {
     frame
 }
 
-/// 版式里的每一条内容行过一遍净化（[`capture::sanitize`] 幂等：白名单 SGR 与普通文本原样保留）。
+/// 版式里的每一条内容行过一遍净化（[`capture::sanitize`] 幂等：任意 SGR 与普通文本原样保留）。
 ///
 /// 在截断之前做：截断之后的行已经是显示层的一部分，内容边界不再可辨。光标列也从净化后的行算
 /// （[`cursor`]），内容里的转义因此既进不了帧、也不会把光标位置算歪。
@@ -375,11 +377,11 @@ fn sanitized(rows: Vec<(Slot, String)>) -> Vec<(Slot, String)> {
 /// 一行在版式里的位置：决定这一行套哪一档 chrome（行内容本身是普通文本，颜色由 [`paint`] 加）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Slot {
-    /// 顶部状态行（dim）。
+    /// 顶部状态行（字标 `bold + brand`，其余 dim）。
     Top,
     /// 消息视口 / 选择器列表：正文自带渲染器的颜色，chrome 不再上色。
     Viewport,
-    /// 输入区：`0` 首行（标记加粗）、`1` 续行、`2` 提示行（dim）。
+    /// 输入区：`0` 首行（标记 `bold + brand`）、`1` 续行、`2` 提示行（dim）。
     Input(usize),
     /// 底部状态行（dim）。
     Status,
@@ -426,6 +428,9 @@ fn input_slots(input: &InputBlock) -> Vec<(Slot, String)> {
 
 /// 一行普通文本 → 帧里的一行：`color=true` 时按槽位上 chrome。
 ///
+/// 两处品牌落点：顶行的**字标**（首个 ` · ` 之前、以 `IGNIS v` 开头的那一段）与输入区首行的标记
+/// `❯ `——都是 `bold + brand`；顶行其余部分与提示行照旧 dim。
+///
 /// 行尾的重置由 [`compose`] 统一补：输入区首行在标记之后就补一条（标记之后的正文保持默认样式），
 /// 被截断的行也靠行尾那条重置兜住。
 fn paint(slot: Slot, text: &str, palette: &Palette, colored: bool) -> String {
@@ -433,10 +438,22 @@ fn paint(slot: Slot, text: &str, palette: &Palette, colored: bool) -> String {
         return text.to_string();
     }
     match slot {
+        // 顶行：头部（`IGNIS v…`）bold + 品牌色，其余 dim。头部按首个 ` · ` 切出来；切口不匹配
+        // （没有分隔符 / 不以字标开头）时整行 dim——与旧口径一致。
+        Slot::Top => match text.split_once(" · ") {
+            Some((head, rest)) if head.starts_with("IGNIS v") => {
+                let (bold, brand, dim) = (palette.bold, palette.brand, palette.dim);
+                format!("{bold}{brand}{head}{RESET}{dim} · {rest}")
+            }
+            _ => {
+                let dim = palette.dim;
+                format!("{dim}{text}")
+            }
+        },
         Slot::Input(0) => match text.strip_prefix(INPUT_MARK) {
             Some(rest) => {
-                let bold = palette.bold;
-                format!("{bold}{INPUT_MARK}{RESET}{rest}")
+                let (bold, brand) = (palette.bold, palette.brand);
+                format!("{bold}{brand}{INPUT_MARK}{RESET}{rest}")
             }
             // 忙碌期的首行不是输入标记（`working…`）：与提示行同档的说明性文案（dim）
             None => {
@@ -444,7 +461,7 @@ fn paint(slot: Slot, text: &str, palette: &Palette, colored: bool) -> String {
                 format!("{dim}{text}")
             }
         },
-        Slot::Input(HINT_ROW) | Slot::Top | Slot::Status => {
+        Slot::Input(HINT_ROW) | Slot::Status => {
             let dim = palette.dim;
             format!("{dim}{text}")
         }
@@ -919,7 +936,8 @@ mod tests {
         assert!(!frame.contains("\x1b[?25h"), "{frame:?}");
     }
 
-    /// `color=true`：chrome 用调色板（顶/底状态行与提示行 dim、输入区首行标记 bold），每行以重置收尾。
+    /// `color=true`：chrome 用调色板——顶行的字标（首个 ` · ` 之前、以 `IGNIS v` 开头的那一段）
+    /// 与输入区首行标记 `❯ ` 走 `bold + brand`，顶/底状态行与提示行 dim，每行以重置收尾。
     #[test]
     fn compose_with_color_uses_the_palette() {
         let mut view = golden_view(80, 24);
@@ -928,19 +946,24 @@ mod tests {
         view.input.lines[2] = "hint".to_string();
         let frame = compose(&view);
 
-        // 顶/底状态行与提示行 dim（dark 的 dim 是 `\x1b[2m`）
+        // 顶行：`{bold}{brand}IGNIS v…{RESET}{dim} · 其余`（basic 16 档的 brand 槽落黄 `33m`）
         assert!(
-            frame.contains(&format!("\x1b[2m{}\x1b[0m\x1b[K", view.top)),
+            frame.contains(&format!(
+                "\x1b[1m\x1b[33mIGNIS v{}\x1b[0m\x1b[2m · /tmp/ws · kernel native · session new\
+                 \x1b[0m\x1b[K",
+                env!("CARGO_PKG_VERSION")
+            )),
             "{frame:?}"
         );
+        // 底行与提示行 dim（dark 的 dim 是 `\x1b[2m`）
         assert!(
             frame.contains(&format!("\x1b[2m{}\x1b[0m\x1b[K", view.status)),
             "{frame:?}"
         );
         assert!(frame.contains("\x1b[2mhint\x1b[0m\x1b[K"), "{frame:?}");
-        // 输入区首行：标记加粗、标记之后的正文不着色；续行既不 dim 也不 bold
+        // 输入区首行：标记 bold + 品牌色、标记之后的正文不着色；续行既不 dim 也不 bold
         assert!(
-            frame.contains("\x1b[1m❯ \x1b[0m你好\x1b[0m\x1b[K"),
+            frame.contains("\x1b[1m\x1b[33m❯ \x1b[0m你好\x1b[0m\x1b[K"),
             "{frame:?}"
         );
         assert!(frame.contains("\r\n… 续行\x1b[0m\x1b[K"), "{frame:?}");
@@ -948,7 +971,32 @@ mod tests {
         assert_eq!(frame.matches("\x1b[0m\x1b[K").count(), 24, "{frame:?}");
         assert!(!sgr_sequences(&frame).is_empty());
 
-        // light 主题只有 dim 一档不同（浅色背景上 `2m` 几乎看不见）
+        // 品牌槽跟着 `view.depth`：真彩档的字标换成品牌橙的 RGB 槽
+        let mut truecolor = view.clone();
+        truecolor.depth = ColorDepth::True;
+        let true_frame = compose(&truecolor);
+        assert!(
+            true_frame.contains(&format!(
+                "\x1b[1m\x1b[38;2;247;131;64mIGNIS v{}",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "{true_frame:?}"
+        );
+
+        // 顶行不以 `IGNIS v` 开头的头部（含根本没有 ` · ` 分隔符的行）：整行 dim，口径不变
+        for top in [
+            "T · x".to_string(),
+            format!("IGNIS v{}", env!("CARGO_PKG_VERSION")),
+        ] {
+            let mut plain_top = view.clone();
+            plain_top.top = top.clone();
+            assert!(
+                compose(&plain_top).contains(&format!("\x1b[2m{top}\x1b[0m\x1b[K")),
+                "{top:?}"
+            );
+        }
+
+        // light 主题：dim 换亮灰（浅色背景上 `2m` 几乎看不见），字号里那两段照旧上色
         let mut light = view.clone();
         light.theme = Theme::Light;
         let light_frame = compose(&light);
@@ -956,7 +1004,10 @@ mod tests {
         assert!(!light_frame.contains("\x1b[2m"), "{light_frame:?}");
         let dim = crate::render::palette(Theme::Light, light.depth).dim;
         assert!(
-            light_frame.contains(&format!("{dim}{}", light.top)),
+            light_frame.contains(&format!(
+                "\x1b[1m\x1b[33mIGNIS v{}\x1b[0m{dim} · /tmp/ws · kernel native · session new",
+                env!("CARGO_PKG_VERSION")
+            )),
             "{light_frame:?}"
         );
     }

@@ -14,7 +14,8 @@
 //! - [`confirm`]：通道式确认面（[`confirm::tui_confirm`] 把 `/learn` 的确认请求交给 UI 循环、
 //!   按键由 [`app::TuiApp::confirm_key`] 收）——头行/预览与经典 REPL 同源（`commands::learn`）；
 //! - 本文件：可用性判定（[`tui_unavailable_reason`]）、降级 note（[`fallback_note`]）、帧用的
-//!   会话事实快照（[`refresh_facts`]）、提交分类（[`classify`]）与主循环（[`run`]）。
+//!   会话事实快照（[`refresh_facts`]）、开机行（[`startup_lines`]）、提交分类（[`classify`]）与
+//!   主循环（[`run`]）。开机行的品牌块与经典路径同一个函数，只有落点不同（进滚动区）。
 //!
 //! 可用性判定是**纯函数**：tty / `TERM` / 尺寸三件事都由调用方探好后传进来，用例不必造终端也不
 //! 必改环境变量（`repl::run` 与 `tui::start` 各自把现场探好）。
@@ -116,6 +117,7 @@ use ignis_core::task::TaskKind;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::brand;
 use crate::cli::Cli;
 use crate::commands::slash::{self, Dispatch, Parsed, Slash};
 use crate::commands::{Session, env_text_value, kernel_note, no_color_value};
@@ -289,12 +291,12 @@ where
         }
     };
 
-    // 3. 会话（含 `-c`）与开机行：`-c` 的装载、内核能力提示与未读告警行全部取自经典路径那几
-    //    个函数——TUI 不打印经典 banner（`● Ready` 不出现）
+    // 3. 会话（含 `-c`）与开机行：品牌块（`--no-banner` 时不推）、`-c` 的装载、内核能力提示与
+    //    未读告警行——TUI 不打印经典**状态块**（`● Ready` 不出现），品牌块与经典路径同一份
     let (mut session, approvals) = build()?;
     let resume_note =
         resume_continue(&mut session, cli.continue_session).map_err(anyhow::Error::msg)?;
-    let startup = startup_lines(&session, resume_note);
+    let startup = startup_lines(&session, resume_note, term.size().cols, cli.no_banner);
 
     // 4. 主循环：输入读取线程 + 块通道；退出码原样交回
     let (tx, chunks) = mpsc::unbounded_channel();
@@ -303,10 +305,57 @@ where
     Ok(Some(code))
 }
 
-/// 开机行进滚动区的行（顺序即落地顺序）：`-c` 的 note（未命中才有）、内核能力提示（非 native
-/// 才有）、未读告警行（有才有）——三句都来自经典路径同一份函数/常量，TUI 不另写文案。
-fn startup_lines(session: &Session, resume_note: Option<&'static str>) -> Vec<String> {
-    let mut lines: Vec<String> = resume_note.map(str::to_string).into_iter().collect();
+/// 开机行进滚动区的行（顺序即落地顺序）：品牌块（`--no-banner` 时不推）→ `-c` 的 note（未命中才有）
+/// → 内核能力提示（非 native 才有）→ 未读告警行（有才有）——每一句都来自经典路径同一份函数/常量
+/// （品牌块是 [`crate::brand::brand_block`]），TUI 不另写文案。
+///
+/// 终端现场（`COLORTERM`/`TERM`/`NO_COLOR`）从进程环境读，转发给 [`startup_lines_with`]
+/// ——与 [`refresh_facts`] 同一手法。宽度由调用方给（[`start_with`] 传 `term.size().cols`）。
+fn startup_lines(
+    session: &Session,
+    resume_note: Option<&'static str>,
+    cols: usize,
+    no_banner: bool,
+) -> Vec<String> {
+    startup_lines_with(
+        session,
+        resume_note,
+        cols,
+        no_banner,
+        env_text_value(std::env::var_os("COLORTERM")).as_deref(),
+        env_text_value(std::env::var_os("TERM")).as_deref(),
+        no_color_value(std::env::var_os("NO_COLOR")).as_deref(),
+    )
+}
+
+/// 带终端现场注入的变体（用例不必改进程环境）。
+///
+/// `term_supported` 恒 `true`：能走到这里的现场已经过 [`tui_unavailable_reason`] 的 `TERM` 关卡
+/// （dumb / 缺失 / 空串在那就降级了），品牌块的哑终端保守规则在这里没有第二种可能。
+fn startup_lines_with(
+    session: &Session,
+    resume_note: Option<&'static str>,
+    cols: usize,
+    no_banner: bool,
+    colorterm: Option<&str>,
+    term: Option<&str>,
+    no_color: Option<&str>,
+) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    // 品牌块：与经典路径同一个函数、同一份档位判定（宽度不足自然降档），只多了「进滚动区」这个落点
+    if !no_banner {
+        let style = brand::startup_style(
+            &session.ui_config(),
+            cols,
+            true,
+            true,
+            colorterm,
+            term,
+            no_color,
+        );
+        lines.extend(brand::brand_block(env!("CARGO_PKG_VERSION"), &style));
+    }
+    lines.extend(resume_note.map(str::to_string));
     if let Some(note) = kernel_note(session.kernel()) {
         lines.push(note);
     }
@@ -323,9 +372,9 @@ fn startup_lines(session: &Session, resume_note: Option<&'static str>) -> Vec<St
 /// `Ctrl+D`、空闲 SIGINT、stdin 关闭）都靠调用方持有守卫的 `Drop` 还原终端。
 ///
 /// `approvals` 是 [`TuiApproval::channel`] 的回信端（内联审批画在忙碌循环的滚动区里）；
-/// `startup` 是 [`startup_lines`] 的开机行（`-c` note、内核能力提示、未读告警行），先落滚动区再画
-/// 第一帧；`signals` 是进守卫之前注册好的 SIGINT/SIGWINCH 流（F4），接进 [`TuiApp`] 之后由它持有
-/// ——应用自己绝不重复注册。
+/// `startup` 是 [`startup_lines`] 的开机行（品牌块、`-c` note、内核能力提示、未读告警行），先落
+/// 滚动区再画第一帧；`signals` 是进守卫之前注册好的 SIGINT/SIGWINCH 流（F4），接进 [`TuiApp`]
+/// 之后由它持有——应用自己绝不重复注册。
 pub async fn run(
     session: &mut Session,
     term: &mut TerminalGuard,
@@ -585,6 +634,7 @@ mod tests {
     use ignis_storage::NewAlert;
     use tokio::sync::mpsc;
 
+    use crate::brand;
     use crate::cli::Cli;
     use crate::commands::Session;
     use crate::commands::fixtures::{
@@ -603,7 +653,7 @@ mod tests {
 
     use super::{
         MIN_COLS, MIN_ROWS, Size, Submitted, classify, fallback_note, refresh_facts,
-        refresh_facts_with, start_with, startup_lines, tui_unavailable_reason,
+        refresh_facts_with, start_with, startup_lines, startup_lines_with, tui_unavailable_reason,
     };
 
     /// `/learn` 用例的固定草稿（与 pty / `commands` 的用例同一形状）：合法 frontmatter + 一段正文。
@@ -1119,27 +1169,89 @@ mod tests {
         );
     }
 
-    /// 开机行（进滚动区）就是经典路径那几句：`-c` 的 note、内核能力提示（非 native 才有）、
-    /// 未读告警行（有才有）——TUI 不打印经典 banner（`● Ready` 不在这条路上）。
+    /// 开机行（进滚动区）：品牌块（`--no-banner` 时不推）→ `-c` 的 note → 内核能力提示（非 native
+    /// 才有）→ 未读告警行（有才有）——三句文案与品牌块都来自经典路径同一份函数，TUI 不另写文案，
+    /// 也不打印经典状态块（`● Ready` 不在这条路上）。
     #[test]
     fn tui_startup_lines_are_the_classic_copies() {
-        // 非 native：内核能力提示就是 `kernel_note` 那一句；`-c` 未命中的 note 取 `no_session_note`
+        // 非 native：200 列的可用终端走 Full 档（品牌块 = 字模 13 行）+ `-c` 未命中的 note +
+        // 内核能力提示。`NO_COLOR=1` 现场零 SGR，品牌块逐字可读。
         let (_dir, codex) = session_fixture("tui-startup", "codex");
-        let lines = startup_lines(&codex, Some(no_session_note()));
+        let style = brand::startup_style(
+            &codex.ui_config(),
+            200,
+            true,
+            true,
+            None,
+            Some("xterm-256color"),
+            Some("1"),
+        );
+        let brand_lines = brand::brand_block(env!("CARGO_PKG_VERSION"), &style);
+        assert_eq!(brand_lines.len(), 13, "Full 档是字模的 13 行");
+        let lines = startup_lines_with(
+            &codex,
+            Some(no_session_note()),
+            200,
+            false,
+            None,
+            Some("xterm-256color"),
+            Some("1"),
+        );
+        assert_eq!(lines.len(), 13 + 2, "{lines:?}");
+        assert_eq!(lines[..13], brand_lines[..], "前 13 行就是品牌块");
+        assert!(
+            lines[..13].iter().any(|line| line.contains("IGNIS v")),
+            "品牌块里有字标那一行：{lines:?}"
+        );
         assert_eq!(
-            lines,
+            lines[13..],
             [
                 no_session_note().to_string(),
                 kernel_note("codex").expect("非 native 有能力提示"),
-            ]
+            ],
+            "末尾两行仍是 `-c` 的 note 与内核提示"
+        );
+        assert!(
+            !lines.iter().any(|line| line == "● Ready"),
+            "经典状态块不进 TUI：{lines:?}"
         );
         assert!(
             !lines.iter().any(|line| line.contains("unread")),
             "0 条未读：没有告警行：{lines:?}"
         );
+
+        // `--no-banner`：品牌块整块不推，只剩 note 与内核提示
+        assert_eq!(
+            startup_lines_with(
+                &codex,
+                Some(no_session_note()),
+                200,
+                true,
+                None,
+                Some("xterm-256color"),
+                Some("1"),
+            ),
+            [
+                no_session_note().to_string(),
+                kernel_note("codex").expect("非 native 有能力提示"),
+            ]
+        );
+
+        // 上色现场（真彩 + 暗色主题）：品牌块的字标那一段是 `bold + brand` 的品牌橙
+        let colored = startup_lines_with(
+            &codex,
+            None,
+            200,
+            false,
+            Some("truecolor"),
+            Some("xterm-256color"),
+            None,
+        );
         assert!(
-            !lines.iter().any(|line| line == "● Ready"),
-            "经典 banner 不进 TUI：{lines:?}"
+            colored
+                .iter()
+                .any(|line| line.contains("\u{1b}[1m\u{1b}[38;2;247;131;64mIGNIS v")),
+            "字标必须带上品牌色：{colored:?}"
         );
 
         // 未读告警：告警行就是 `alerts_banner_line` 那一份（排在最后）
@@ -1158,12 +1270,30 @@ mod tests {
                 .expect("造两条未读告警");
         }
         assert_eq!(
-            startup_lines(&alerting, None),
+            startup_lines_with(
+                &alerting,
+                None,
+                80,
+                true,
+                None,
+                Some("xterm-256color"),
+                None
+            ),
             [alerts_banner_line(Some(2)).expect("有未读就有告警行")]
         );
 
-        // native 且 `-c` 命中：三行都不出现
+        // native 且 `-c` 命中：三句 note 都不出现
         let (_dir, native) = session_fixture("tui-startup-native", "native");
-        assert_eq!(startup_lines(&native, None), Vec::<String>::new());
+        assert_eq!(
+            startup_lines_with(&native, None, 80, true, None, Some("xterm-256color"), None),
+            Vec::<String>::new()
+        );
+        // 不带注入的入口读进程环境（这里只钉它照样走品牌块那条路、且不掺经典状态块）
+        let lines = startup_lines(&native, None, 80, false);
+        assert!(
+            lines.iter().any(|line| line.contains("IGNIS v")),
+            "{lines:?}"
+        );
+        assert!(!lines.iter().any(|line| line == "● Ready"), "{lines:?}");
     }
 }
