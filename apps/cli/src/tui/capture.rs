@@ -1,7 +1,10 @@
 //! 捕获落点与净化：渲染器写进共享缓冲的字节 → 只能「显示、不能驱动终端」的文本。
 //!
 //! 反目标（设计 §2.2）：模型输出绝不能驱动终端控制。这条防线只有一个入口——渲染器把字节写进
-//! [`CaptureSink`]，滚动区摄入时经 [`sanitize`] 净化，只放行渲染器自己的 SGR 白名单。
+//! [`CaptureSink`]，滚动区摄入时经 [`sanitize`] 净化，放行面只有 SGR（给文本上色）。
+//!
+//! 不变式（设计 §6.2）：scrollback 里除 SGR 与 `\n`/`\t` 外不允许出现任何转义——放宽后的上限只是
+//! 「文本可被上色」（逐格真彩的火焰字模需要任意 SGR 参数），光标与屏幕状态仍不可驱动。
 
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -11,17 +14,6 @@ const ESC: u8 = 0x1b;
 
 /// BEL（0x07）：OSC 的一种收尾标记。
 const BEL: u8 = 0x07;
-
-/// 渲染器自己的 SGR 白名单：`render::palette` 的两档 dim（`2m`/`90m`）加上 bold/error/accent
-/// 与 reset。**只有这六个**进滚动区：其余 ESC/CSI/OSC 一律是「模型想驱动终端」的信号。
-const ALLOWED_SGR: [&[u8]; 6] = [
-    b"\x1b[0m",
-    b"\x1b[1m",
-    b"\x1b[2m",
-    b"\x1b[31m",
-    b"\x1b[36m",
-    b"\x1b[90m",
-];
 
 /// 渲染器的输出落点：把字节追加进共享缓冲；`flush` 是 no-op（渲染器每个事件自己 flush）。
 pub struct CaptureSink(Arc<Mutex<Vec<u8>>>);
@@ -59,22 +51,20 @@ pub fn drain(buffer: &Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
 
 /// 捕获字节 → 可进滚动区的文本。
 ///
-/// 只放行渲染器自己的 SGR 白名单、`\n` 与 `\t`；其余 ESC（连同它后面的 CSI/OSC 序列）与 C0/DEL
-/// 控制字节一律丢掉、不留残渣。非法 UTF-8 按替换字符顶上（防御性，渲染器本体只写合法 UTF-8）。
+/// 只放行任意 SGR（`ESC [` + 数字/分号 + `m`：基本色、256 色、逐格真彩与属性都能给文本上色）、`\n`
+/// 与 `\t`；其余 ESC（连同它后面的 CSI/OSC 序列）与 C0/DEL 控制字节一律丢掉、不留残渣。非法 UTF-8
+/// 按替换字符顶上（防御性，渲染器本体只写合法 UTF-8）。
 pub fn sanitize(bytes: &[u8]) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut index = 0usize;
     while index < bytes.len() {
         let byte = bytes[index];
         if byte == ESC {
-            // 白名单命中的整段原样拷贝；其余整条丢掉（连同它的参数，不留 `[2J` 这类残渣）。
-            match ALLOWED_SGR
-                .iter()
-                .find(|sequence| bytes[index..].starts_with(sequence))
-            {
-                Some(sequence) => {
-                    out.extend_from_slice(sequence);
-                    index += sequence.len();
+            // SGR 形状命中：整段原样拷贝（上色不驱动终端）；其余整条丢掉（连同它的参数，不留 `[2J` 这类残渣）。
+            match sgr_len(bytes, index) {
+                Some(len) => {
+                    out.extend_from_slice(&bytes[index..index + len]);
+                    index += len;
                 }
                 None => index = skip_escape(bytes, index),
             }
@@ -90,6 +80,28 @@ pub fn sanitize(bytes: &[u8]) -> String {
         index += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 一条 SGR（`ESC [` + 参数 + `m`）的整条字节长度；`index` 指向 ESC，形状不对给 `None`。
+///
+/// 形状白名单（设计 §6.2）：参数只认数字与分号（`[0-9;]*`，可以为空，覆盖基本色/256 色/逐格真彩与
+/// 属性），必须以 `m` 收尾。`\x1b[1;5A` 这类只是换了终结字节的 CSI 不在此列——放行面只放宽到「文本
+/// 可被上色」，光标与屏幕状态仍不可驱动。
+fn sgr_len(bytes: &[u8], index: usize) -> Option<usize> {
+    let mut cursor = index + 1;
+    if bytes.get(cursor) != Some(&b'[') {
+        return None;
+    }
+    cursor += 1;
+    while let Some(&byte) = bytes.get(cursor) {
+        match byte {
+            b'0'..=b'9' | b';' => cursor += 1,
+            // `m` 是 SGR 的终结字节：命中即交回整条长度（含 ESC）。
+            b'm' => return Some(cursor + 1 - index),
+            _ => return None,
+        }
+    }
+    None // 没有 `m` 收尾（半条 SGR）：不匹配，交给 skip_escape 整条丢掉
 }
 
 /// 丢掉 `bytes[start..]` 开头的一条转义序列（`start` 是 ESC 的下标），返回它之后的字节下标。
@@ -167,17 +179,17 @@ mod tests {
 
     use super::{CaptureSink, drain, sanitize};
 
-    /// 净化只放行渲染器自己的六个 SGR 串与 `\n`/`\t`，其余 ESC/CSI/OSC 与控制字节一律丢掉。
+    /// 净化放行任意 SGR（`ESC [` + 数字/分号 + `m`：真彩、256 色、基本色与属性都算「上色」）与
+    /// `\n`/`\t`，其余 ESC/CSI/OSC 与控制字节一律丢掉。
     #[test]
-    fn sanitize_keeps_the_renderer_palette_and_drops_every_other_escape() {
-        // 六个白名单 SGR：原样保留（`render::palette` 的四档 + reset/加粗/暗色）。
+    fn sanitize_keeps_every_sgr_and_drops_every_other_escape() {
+        // 任意 SGR：整段原样保留（品牌火焰字模的逐格真彩只能靠这条形状规则进 scrollback）。
         for sgr in [
-            "\u{1b}[0m",
-            "\u{1b}[1m",
-            "\u{1b}[2m",
-            "\u{1b}[31m",
-            "\u{1b}[36m",
-            "\u{1b}[90m",
+            "\u{1b}[38;5;9m",                     // 256 色前景
+            "\u{1b}[38;2;247;131;64m",            // 真彩前景（品牌橙）
+            "\u{1b}[48;2;1;2;3m",                 // 真彩背景
+            "\u{1b}[38;2;247;131;64;48;2;1;2;3m", // 前景背景组合
+            "\u{1b}[m",                           // 空参数：reset
         ] {
             assert_eq!(sanitize(sgr.as_bytes()), sgr, "{sgr:?} 必须原样保留");
         }
@@ -191,7 +203,8 @@ mod tests {
         for dropped in [
             "\u{1b}[2J",                  // 清屏
             "\u{1b}[?1049l",              // 退出备用屏
-            "\u{1b}[1;5A",                // 光标定位/未绑定 CSI
+            "\u{1b}[1;5A",                // 参数合法但终结字节不是 `m`：光标定位照样整条丢
+            "\u{1b}[38;5;9",              // 半条 SGR（缺 `m` 收尾）
             "\u{1b}]0;title\u{7}",        // OSC 改标题（BEL 收尾）
             "\u{1b}]8;;http://x\u{1b}\\", // OSC 8 超链接（ST 收尾）
             "\u{1b}",                     // 裸 ESC
@@ -205,11 +218,16 @@ mod tests {
             );
         }
 
-        // 混在文本里的序列：只丢序列本身，文本一字不动。
+        // 混在文本里的序列：该留的逐字留下，该丢的只丢序列本身、文本一字不动。
         assert_eq!(sanitize(b"a\x1b[2Jb"), "ab");
         assert_eq!(
             sanitize("\u{1b}[2mbe\u{1b}[2Jta\u{1b}[0m".as_bytes()),
             "\u{1b}[2mbeta\u{1b}[0m"
+        );
+        assert_eq!(
+            sanitize("\u{1b}[38;5;9mx\u{1b}[?25l\u{1b}[1;1H".as_bytes()),
+            "\u{1b}[38;5;9mx",
+            "上色的留下；藏光标与定位的丢掉"
         );
 
         // C0 与 DEL 丢弃；`\n` 与 `\t` 是仅有的两个例外。
@@ -227,8 +245,9 @@ mod tests {
         assert_eq!(sanitize(b""), "", "空输入给空串");
     }
 
-    /// 不变式：净化之后的文本里除 `\n`/`\t` 外没有控制字节，且每个 `ESC` 都恰好开启一条白名单
-    /// SGR——「模型输出不能驱动终端」这条防线最终就落在它上面。
+    /// 不变式：净化之后的文本里除 `\n`/`\t` 外没有控制字节，且每个 `ESC` 起头都必须整条是一条 SGR
+    /// ——形状 `ESC [` + 数字/分号 + `m`（按 [`super::sgr_len`] 判定）。「模型输出不能驱动终端」
+    /// 这条防线最终就落在它上面。
     #[test]
     fn sanitize_never_lets_a_control_byte_through() {
         let nasty = [
@@ -236,26 +255,50 @@ mod tests {
             "a\u{1b}\u{8}b\u{7f}c\u{0}d",
             "\u{1b}]8;;https://example.com\u{1b}\\link\u{1b}]8;;\u{1b}\\",
             "\u{1b}[38;5;9mx\u{1b}[?25l\u{1b}[1;1H",
+            "\u{1b}[48;2;1;2;3m真彩\u{1b}[1;5A\u{1b}[m",
         ];
         for input in nasty {
             let clean = sanitize(input.as_bytes());
             for byte in clean.bytes() {
-                // `\n`/`\t` 是排版字符；`ESC` 只准出现在下一条断言认得的白名单 SGR 里。
+                // `\n`/`\t` 是排版字符；`ESC` 只准出现在下一条断言认得的 SGR 里。
                 assert!(
                     byte >= 0x20 || byte == b'\n' || byte == b'\t' || byte == 0x1b,
                     "{input:?} → {clean:?} 里漏出了控制字节 {byte:#04x}"
                 );
             }
-            // 每个 ESC 起头都必须是白名单之一（净化后的 ESC 只能来自白名单拷贝）。
-            let mut rest = clean.as_str();
-            while let Some(pos) = rest.find('\u{1b}') {
+            // 每个 ESC 起头都必须能整条按 `sgr_len` 匹配（净化后的 ESC 只能来自放行的 SGR）。
+            let bytes = clean.as_bytes();
+            let mut index = 0usize;
+            while index < bytes.len() {
+                if bytes[index] != 0x1b {
+                    index += 1;
+                    continue;
+                }
+                let rest = &bytes[index..];
+                let len = super::sgr_len(bytes, index).unwrap_or_else(|| {
+                    panic!("{input:?} → {clean:?} 里漏出了非 SGR 的 ESC：{rest:?}")
+                });
+                let sequence = rest
+                    .get(..len)
+                    .unwrap_or_else(|| panic!("sgr_len 交回的长度 {len} 超出剩余字节 {rest:?}"));
                 assert!(
-                    super::ALLOWED_SGR
-                        .iter()
-                        .any(|sequence| rest.as_bytes()[pos..].starts_with(sequence)),
-                    "{input:?} → {clean:?} 里漏出了非白名单 ESC"
+                    sequence.starts_with(b"\x1b["),
+                    "{input:?} → {clean:?} 里的 ESC 序列不是 CSI：{sequence:?}"
                 );
-                rest = &rest[pos + 1..];
+                let (terminator, params) = sequence[2..].split_last().unwrap_or_else(|| {
+                    panic!("{input:?} → {clean:?} 里漏出了过短的 ESC 序列：{sequence:?}")
+                });
+                assert!(
+                    params
+                        .iter()
+                        .all(|byte| byte.is_ascii_digit() || *byte == b';'),
+                    "{input:?} → {clean:?} 里的 CSI 不是 SGR 参数：{sequence:?}"
+                );
+                assert_eq!(
+                    *terminator, b'm',
+                    "{input:?} → {clean:?} 里的 SGR 没用 `m` 收尾：{sequence:?}"
+                );
+                index += len;
             }
         }
     }
