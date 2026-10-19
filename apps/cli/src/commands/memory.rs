@@ -211,6 +211,7 @@ mod tests {
             unsafe_ops: false,
             continue_session: false,
             tui: false,
+            no_banner: false,
             command: None,
         }
     }

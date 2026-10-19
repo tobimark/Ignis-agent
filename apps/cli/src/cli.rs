@@ -46,6 +46,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub tui: bool,
 
+    /// 跳过启动屏（仅交互式 REPL）——与 `-c`/`--tui` 一样是 REPL 专属开关
+    #[arg(long = "no-banner", global = true)]
+    pub no_banner: bool,
+
     /// 无子命令时进入 REPL
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -258,6 +262,18 @@ pub fn reject_tui_with_subcommand(command: Option<&Command>, tui: bool) -> Resul
     Ok(())
 }
 
+/// `--no-banner` 与任何子命令同用是用法错误（与 [`reject_continue_with_subcommand`] 同形）：
+/// 它和 `-c`/`--tui` 一样是 REPL 专属开关，混用只会让人以为启动屏也管那条命令。
+pub fn reject_no_banner_with_subcommand(
+    command: Option<&Command>,
+    no_banner: bool,
+) -> Result<(), String> {
+    if no_banner && command.is_some() {
+        return Err("--no-banner only applies to the interactive REPL".to_string());
+    }
+    Ok(())
+}
+
 /// 解析参数后分发：错误一律经 `anyhow::Result` 上抛给 `main`。
 ///
 /// `--kernel` 的值域由 clap 把关、配置里的 `default_kernel` 由 [`commands::kernel::resolve_kernel`]
@@ -267,6 +283,8 @@ pub async fn dispatch(cli: &Cli) -> Result<ExitCode> {
     reject_continue_with_subcommand(cli.command.as_ref(), cli.continue_session)
         .map_err(anyhow::Error::msg)?;
     reject_tui_with_subcommand(cli.command.as_ref(), cli.tui).map_err(anyhow::Error::msg)?;
+    reject_no_banner_with_subcommand(cli.command.as_ref(), cli.no_banner)
+        .map_err(anyhow::Error::msg)?;
     match &cli.command {
         Some(Command::Run { task }) => commands::run::run(cli, task).await,
         Some(Command::Task { command }) => commands::task::run(command),
@@ -428,5 +446,58 @@ mod tests {
         let plain = Cli::try_parse_from(["ignis", "run", "x"]).expect("普通调用应可解析");
         assert!(!plain.tui);
         assert!(reject_tui_with_subcommand(plain.command.as_ref(), plain.tui).is_ok());
+    }
+
+    /// `--no-banner` 与 `-c`/`--tui` 同形：单独用（以及和别的 REPL 开关组合）进 REPL；与任何
+    /// 子命令同用是用法错误（文案逐字钉住，`main` 会打 `error:` 前缀并给退出码 1）。
+    #[test]
+    fn no_banner_flag_only_applies_to_the_repl() {
+        // 单独用：无子命令 → REPL；守卫放行
+        let repl =
+            Cli::try_parse_from(["ignis", "--no-banner"]).expect("--no-banner 单独用应可解析");
+        assert!(repl.no_banner);
+        assert!(repl.command.is_none(), "无子命令才进 REPL");
+        assert!(reject_no_banner_with_subcommand(repl.command.as_ref(), repl.no_banner).is_ok());
+
+        // 与另外几个 REPL 开关同用：都放行且仍进 REPL（`--tui`/恢复/预授权/内核照常）
+        for args in [
+            &["ignis", "--no-banner", "--tui"][..],
+            &["ignis", "--no-banner", "-c"][..],
+            &["ignis", "--no-banner", "--yes"][..],
+            &["ignis", "--no-banner", "--kernel", "codex"][..],
+            &["ignis", "--no-banner", "--unsafe", "--workspace", "/tmp/ws"][..],
+        ] {
+            let combined = Cli::try_parse_from(args).expect("REPL 开关可组合");
+            assert!(combined.no_banner, "{args:?}");
+            assert!(combined.command.is_none(), "{args:?}");
+            assert!(
+                reject_no_banner_with_subcommand(combined.command.as_ref(), combined.no_banner)
+                    .is_ok(),
+                "{args:?}"
+            );
+        }
+
+        // 与各类子命令同用：解析照常通过（守卫在分发期），守卫一律给出同一句人话错误
+        for args in [
+            &["ignis", "--no-banner", "run", "x"][..],
+            &["ignis", "--no-banner", "task", "list"][..],
+            &["ignis", "--no-banner", "config", "show"][..],
+            &["ignis", "--no-banner", "doctor"][..],
+        ] {
+            let mixed = Cli::try_parse_from(args).expect("--no-banner 与子命令应可解析");
+            assert!(mixed.no_banner, "{args:?}");
+            assert!(mixed.command.is_some(), "{args:?}");
+            assert_eq!(
+                reject_no_banner_with_subcommand(mixed.command.as_ref(), mixed.no_banner)
+                    .unwrap_err(),
+                "--no-banner only applies to the interactive REPL",
+                "{args:?}"
+            );
+        }
+
+        // 不带旗标的子命令：守卫放行
+        let plain = Cli::try_parse_from(["ignis", "run", "x"]).expect("普通调用应可解析");
+        assert!(!plain.no_banner);
+        assert!(reject_no_banner_with_subcommand(plain.command.as_ref(), plain.no_banner).is_ok());
     }
 }
