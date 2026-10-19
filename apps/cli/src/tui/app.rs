@@ -670,6 +670,7 @@ impl TuiApp {
         TuiView {
             size: self.size,
             color: facts.color,
+            depth: facts.depth,
             theme: facts.theme,
             top: top_line(facts),
             // 视口就是「最近 rows 行」：版式切到该显示的那一段是合成器的事。选择器开着时视口整块
@@ -1054,6 +1055,7 @@ mod tests {
     use crate::editor::keys::Key;
     use crate::editor::raw::{RawMode, serial_slot};
     use crate::editor::reader::INVALID_WARNING;
+    use crate::render::ColorDepth;
     use crate::tui::Size;
     use crate::tui::approval::{ApprovalJob, TuiApproval};
     use crate::tui::capture::CaptureSink;
@@ -1076,6 +1078,7 @@ mod tests {
             mode: OutputMode::Normal,
             theme: Theme::Dark,
             color: false,
+            depth: ColorDepth::Basic16,
             budget: 200_000,
             history_messages: 0,
             stats: None,

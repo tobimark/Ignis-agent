@@ -23,8 +23,8 @@
 //! 绝不吐超过 `rows` 行，光标也一定落在 `1..=rows`/`1..=cols` 里。
 //!
 //! 颜色（`color`）：`false` 时帧里一条 SGR 都没有（定位与清行不是颜色，照常写）；`true` 时 chrome
-//! 走 [`crate::render::palette`]——顶部/底部状态行与输入区提示行 dim、输入区首行标记（`❯ `）bold，
-//! 每行结尾补一条重置，被截断的行不会把颜色漏到下一行。
+//! 走 [`crate::render::palette`]（按 `view.depth` 取品牌档）——顶部/底部状态行与输入区提示行 dim、
+//! 输入区首行标记（`❯ `）bold，每行结尾补一条重置，被截断的行不会把颜色漏到下一行。
 
 use std::collections::VecDeque;
 
@@ -35,7 +35,7 @@ use ignis_storage::SessionSummary;
 
 use crate::commands::slash;
 use crate::render::width::{char_width, display_width, truncate_to_width};
-use crate::render::{Palette, palette};
+use crate::render::{ColorDepth, Palette, palette};
 
 use super::Size;
 use super::capture;
@@ -214,6 +214,8 @@ pub struct ViewFacts {
     pub theme: Theme,
     /// 是否上色（`resolve_color(ui.color, true, NO_COLOR)`）。
     pub color: bool,
+    /// 色阶（`color_depth(color, COLORTERM, TERM)`）：chrome 的品牌档按它取。
+    pub depth: ColorDepth,
     /// 字符预算（`session.context_budget()`）。
     pub budget: usize,
     /// 有效历史条数（`session.history().len()`）。
@@ -245,6 +247,8 @@ pub struct TuiView {
     pub size: Size,
     /// 是否上色（chrome 的上色与每行结尾的重置都看它）。
     pub color: bool,
+    /// 色阶（合成时 `palette(view.theme, view.depth)` 用它取品牌档）。
+    pub depth: ColorDepth,
     /// 配色主题。
     pub theme: Theme,
     /// 顶部状态行（未截断；合成时按宽度截断）。
@@ -335,7 +339,7 @@ pub fn selector_lines(
 /// status）各有各的来源（模型输出、命令输出、会话名），清屏/改标题之类的序列绝不能借帧抵达
 /// 终端；chrome 自己的 SGR 正是白名单里的那几个，上色路径与金帧因此一字不变。
 pub fn compose(view: &TuiView) -> String {
-    let palette = palette(view.theme);
+    let palette = palette(view.theme, view.depth);
     let rows = sanitized(layout(view));
     let mut frame = String::from(HIDE_CURSOR);
     frame.push_str(CURSOR_HOME);
@@ -487,6 +491,7 @@ mod tests {
     use ignis_storage::{SessionRecord, SessionSummary};
 
     use crate::commands::slash;
+    use crate::render::ColorDepth;
     use crate::render::width::{display_width, truncate_to_width};
     use crate::tui::Size;
 
@@ -519,6 +524,7 @@ mod tests {
             mode: OutputMode::Normal,
             theme: Theme::Dark,
             color: false,
+            depth: ColorDepth::Basic16,
             budget: 200_000,
             history_messages: 0,
             stats: None,
@@ -534,6 +540,7 @@ mod tests {
         TuiView {
             size: Size { cols, rows },
             color: false,
+            depth: ColorDepth::Basic16,
             theme: Theme::Dark,
             top: top_line(&facts),
             viewport: vec!["答复一".to_string(), DONE_LINE.to_string()],
@@ -685,6 +692,7 @@ mod tests {
         let view = TuiView {
             size: Size { cols: 10, rows: 5 },
             color: false,
+            depth: ColorDepth::Basic16,
             theme: Theme::Dark,
             top: "T".to_string(),
             viewport: Vec::new(),
@@ -806,6 +814,7 @@ mod tests {
                     size: Size { cols, rows },
                     // 上色路径一起过：SGR 也会被挤进被截断的行
                     color: true,
+                    depth: ColorDepth::Basic16,
                     theme: Theme::Light,
                     top: "IGNIS 很长的顶部状态行".to_string(),
                     viewport: vec!["你".repeat(20), "ab".to_string(), String::new()],
@@ -855,6 +864,7 @@ mod tests {
         let view = TuiView {
             size: Size { cols: 40, rows: 6 },
             color: false,
+            depth: ColorDepth::Basic16,
             theme: Theme::Dark,
             top: long.clone(),
             viewport: vec![long.clone()],
@@ -944,7 +954,7 @@ mod tests {
         let light_frame = compose(&light);
         assert!(light_frame.contains('\u{1b}'), "上色帧必须有 SGR");
         assert!(!light_frame.contains("\x1b[2m"), "{light_frame:?}");
-        let dim = crate::render::palette(Theme::Light).dim;
+        let dim = crate::render::palette(Theme::Light, light.depth).dim;
         assert!(
             light_frame.contains(&format!("{dim}{}", light.top)),
             "{light_frame:?}"

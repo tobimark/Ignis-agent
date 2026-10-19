@@ -1,8 +1,8 @@
 //! 流式渲染：把内核事件写成终端可读的输出。
 //!
 //! 三个聚焦文件分工：`width.rs` 管显示宽度与折行，`markdown.rs` 管「哪些字符是什么样式」
-//! （[`MdStream`]），本模块把两者装配成 [`Renderer`]——模式（minimal/normal/debug）、主题调色板、
-//! 工具耗时配对、结束行与短 id 都在这里。
+//! （[`MdStream`]），本模块把两者装配成 [`Renderer`]——模式（minimal/normal/debug）、主题调色板
+//! （含 [`ColorDepth`] 色阶探测与品牌档）、工具耗时配对、结束行与短 id 都在这里。
 //!
 //! **写序纪律**：正文片段即时写出；工具行、推理块首与 [`Renderer::finish`] 一律从列 0 开始
 //! （写之前先把挂起的行收束）。
@@ -75,11 +75,53 @@ pub struct RendererOptions {
     pub color: bool,
     /// 配色主题。
     pub theme: Theme,
+    /// 终端色阶（由 [`color_depth`] 按终端现场定）：调色板的品牌档按它取值。
+    pub depth: ColorDepth,
     /// 每行目标显示宽度；`usize::MAX` 表示不折行。
     pub width: usize,
 }
 
-/// 主题调色板：四个位置的 ANSI 串。
+/// 终端色阶：启动时（或每轮任务前）定一次，决定调色板里的品牌档取哪一级 ANSI。
+///
+/// 判定见 [`color_depth`]：探测错不致命，降级方向永远朝更保守（真彩 → 256 → 基本色 → 无色）
+/// ——误判只影响观感，不影响功能。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorDepth {
+    /// 真彩（`COLORTERM=truecolor|24bit`）：`38;2;r;g;b`。
+    True,
+    /// 256 色（`TERM` 含 `256color`）：`38;5;n`。
+    Ansi256,
+    /// 基本 16 色（既没有真彩也没有 256 色的现场）：用 `30..37` 这一档。
+    Basic16,
+    /// 不上色（`resolve_color` 的结论为假）：调用方按它门控，一个 SGR 都不写。
+    None,
+}
+
+/// 色阶探测：`color` 为假恒 [`ColorDepth::None`]（`NO_COLOR` 非空 / `ui.color=never` / 非 tty
+/// 都已在 [`resolve_color`] 里收敛成「不上色」，这里不再重判）；否则 `COLORTERM` 为
+/// `truecolor`/`24bit`（大小写不敏感）给真彩，`TERM` 含 `256color` 给 256 色，其余（含两个都缺）
+/// 给基本 16 色。
+///
+/// 两个参数给 `None` 一律按「没设置」处理：探测只做保守降级，绝不 panic、绝不猜高。取值怎么从
+/// 环境读（有损解码）由调用方决定——命令层与 TUI 都按「存在即算已设置」的同一口径转发。
+pub fn color_depth(color: bool, colorterm: Option<&str>, term: Option<&str>) -> ColorDepth {
+    if !color {
+        return ColorDepth::None;
+    }
+    let truecolor = colorterm.is_some_and(|value| {
+        value.eq_ignore_ascii_case("truecolor") || value.eq_ignore_ascii_case("24bit")
+    });
+    if truecolor {
+        return ColorDepth::True;
+    }
+    // tmux / screen 各有自己的 TERM 前缀（`screen-256color`、`tmux-256color`），认的只是这一截
+    if term.is_some_and(|value| value.contains("256color")) {
+        return ColorDepth::Ansi256;
+    }
+    ColorDepth::Basic16
+}
+
+/// 主题调色板：dim/bold/error/accent 四档 + 品牌色与两个状态色。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
     /// 暗色（工具行、推理、引用/围栏正文）。
@@ -90,13 +132,20 @@ pub struct Palette {
     pub error: &'static str,
     /// 强调色（行内代码）。
     pub accent: &'static str,
+    /// 品牌色（火焰橙 `#F78340`；浅色主题加深保证对比度）：prompt `❯`、字标与状态点。
+    pub brand: &'static str,
+    /// 成功/就绪（`● Ready`、结束行的 `● Done`）。
+    pub ok: &'static str,
+    /// 警示（未读告警行、`Aborted`/`Limit reached` 的状态点）。
+    pub warn: &'static str,
 }
 
-/// 主题调色板。
+/// 主题调色板：`dim` 与 `brand` 分档，其余槽位与主题/色阶无关。
 ///
-/// 只有 `dim` 分档：浅色背景上 ANSI 暗色（`2m`）几乎看不见，换成亮灰（`90m`）；其余三档两套
-/// 主题一致（`bold`/`error`/`accent` 在深浅背景上都够清楚）。
-pub fn palette(theme: Theme) -> Palette {
+/// 只有 `dim` 分主题：浅色背景上 ANSI 暗色（`2m`）几乎看不见，换成亮灰（`90m`）。`brand` 分主题
+/// （浅色主题用加深的橙，深色底上对比度才够）也分色阶（真彩 `38;2;…` / 256 `38;5;n` / 基本色
+/// 落黄 `33`）：色阶探测与「无色零 SGR」由调用方门控，这里只负责给出该档的 ANSI 串。
+pub fn palette(theme: Theme, depth: ColorDepth) -> Palette {
     let dim = match theme {
         Theme::Dark => "\x1b[2m",
         Theme::Light => "\x1b[90m",
@@ -106,7 +155,72 @@ pub fn palette(theme: Theme) -> Palette {
         bold: "\x1b[1m",
         error: "\x1b[31m",
         accent: "\x1b[36m",
+        brand: brand_slot(theme, depth),
+        ok: "\x1b[32m",
+        warn: "\x1b[33m",
     }
+}
+
+/// 品牌橙按主题 × 色阶取值：深色底 `#F78340`、浅色底加深成 `#D96A2B`；256 档的色号由
+/// [`rgb_to_ansi256`] 算（两处必须一致）；基本色与不上色（[`ColorDepth::None`]）都落黄 `33`
+/// ——`None` 只是「调用方不会再上色」，槽位仍给最保守的那一档，形状上不带空串。
+fn brand_slot(theme: Theme, depth: ColorDepth) -> &'static str {
+    match (theme, depth) {
+        (Theme::Dark, ColorDepth::True) => "\x1b[38;2;247;131;64m",
+        (Theme::Dark, ColorDepth::Ansi256) => "\x1b[38;5;209m",
+        (Theme::Light, ColorDepth::True) => "\x1b[38;2;217;106;43m",
+        (Theme::Light, ColorDepth::Ansi256) => "\x1b[38;5;166m",
+        (_, ColorDepth::Basic16 | ColorDepth::None) => "\x1b[33m",
+    }
+}
+
+/// xterm 256 色立方档的六个电平（`16..=231` 那一段就是它们的 6³ 组合）。
+const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+
+/// 一个通道值 → 立方档下标：按 xterm 立方档 `[0,95,135,175,215,255]` 取最近的档。
+fn cube_index(value: u8) -> usize {
+    if value < 48 {
+        0
+    } else if value < 115 {
+        1
+    } else {
+        (value as usize - 35) / 40
+    }
+}
+
+/// 归一化到 256 色（xterm 调色板）：立方候选与灰阶候选各算一个，取平方距离更近的那个（平手取
+/// 立方）。
+///
+/// - 立方候选 = `(levels[r6], levels[g6], levels[b6])`，色号 `16 + 36*r6 + 6*g6 + b6`；
+/// - 灰阶候选 = 平均亮度落到的灰阶档 `i`（夹在 `0..=23`），色号 `232 + i`，灰度值 `8 + 10*i`。
+///
+/// 品牌橙的两个 256 槽位常量（[`palette`]）就是拿它算的：改这里必须同步改常量，反之亦然。
+pub fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
+    let (r6, g6, b6) = (cube_index(r), cube_index(g), cube_index(b));
+    let cube = (CUBE_LEVELS[r6], CUBE_LEVELS[g6], CUBE_LEVELS[b6]);
+    let cube_code = 16 + 36 * r6 + 6 * g6 + b6;
+
+    // 灰阶档 i = clamp((平均亮度 - 8) / 10, 0, 23)：上界取 230 是因为 247/10 会算出 24（越界）
+    let average = (u32::from(r) + u32::from(g) + u32::from(b)) / 3;
+    let gray_index = average.saturating_sub(8).min(230) / 10;
+    let gray_value = (8 + 10 * gray_index) as u8;
+    let gray_code = 232 + gray_index;
+    let gray = (gray_value, gray_value, gray_value);
+
+    if color_distance((r, g, b), gray) < color_distance((r, g, b), cube) {
+        gray_code as u8
+    } else {
+        cube_code as u8
+    }
+}
+
+/// 两个 RGB 的平方距离（通道差的平方和；最大 3×255²，`u32` 足够）。
+fn color_distance(from: (u8, u8, u8), to: (u8, u8, u8)) -> u32 {
+    let channel = |a: u8, b: u8| {
+        let delta = i32::from(a) - i32::from(b);
+        (delta * delta) as u32
+    };
+    channel(from.0, to.0) + channel(from.1, to.1) + channel(from.2, to.2)
 }
 
 /// 是否上色：`NO_COLOR` 非空恒 `false`（优先级最高，含 `Always`；空串按 NO_COLOR 的约定视为
@@ -267,7 +381,7 @@ impl Renderer {
     ) -> Self {
         Self {
             out,
-            palette: palette(options.theme),
+            palette: palette(options.theme, options.depth),
             options,
             saw_schedule_create,
             md: MdStream::new(),
@@ -782,7 +896,8 @@ mod tests {
         }
     }
 
-    /// 测试用渲染器：模式/颜色/主题/宽度都显式给（不探测终端）。
+    /// 测试用渲染器：模式/颜色/主题/宽度都显式给（不探测终端），色阶固定基本 16 色
+    /// （要别的色阶的用例另加带 `depth` 的变体）。
     fn renderer_with(
         mode: OutputMode,
         color: bool,
@@ -797,6 +912,7 @@ mod tests {
                 mode,
                 color,
                 theme,
+                depth: ColorDepth::Basic16,
                 width,
             },
             Arc::clone(&flag),
@@ -1334,14 +1450,92 @@ mod tests {
     }
 
     #[test]
-    fn palette_differs_only_on_the_dim_slot() {
-        let dark = palette(Theme::Dark);
-        let light = palette(Theme::Light);
-        assert_eq!(dark.dim, "\u{1b}[2m");
-        assert_eq!(light.dim, "\u{1b}[90m");
-        assert_eq!(dark.bold, light.bold);
-        assert_eq!(dark.error, light.error);
-        assert_eq!(dark.accent, light.accent);
+    fn color_depth_detection_table() {
+        // color=false 恒 None（NO_COLOR / ui.color=never 经 resolve_color 收敛到这里）
+        assert_eq!(
+            color_depth(false, Some("truecolor"), Some("xterm-256color")),
+            ColorDepth::None
+        );
+        assert_eq!(
+            color_depth(true, Some("truecolor"), Some("xterm")),
+            ColorDepth::True
+        );
+        assert_eq!(
+            color_depth(true, Some("TrueColor"), Some("xterm")),
+            ColorDepth::True,
+            "大小写不敏感"
+        );
+        assert_eq!(color_depth(true, Some("24bit"), None), ColorDepth::True);
+        assert_eq!(
+            color_depth(true, None, Some("screen-256color")),
+            ColorDepth::Ansi256
+        );
+        assert_eq!(color_depth(true, None, Some("xterm")), ColorDepth::Basic16);
+        assert_eq!(color_depth(true, None, None), ColorDepth::Basic16);
+    }
+
+    #[test]
+    fn rgb_to_ansi256_picks_the_nearest_of_cube_and_gray() {
+        assert_eq!(rgb_to_ansi256(255, 0, 0), 196);
+        assert_eq!(rgb_to_ansi256(0, 0, 0), 16);
+        assert_eq!(rgb_to_ansi256(255, 255, 255), 231);
+        // 品牌橙两档（Palette 的 256 槽位常量必须与量化函数一致）
+        assert_eq!(rgb_to_ansi256(247, 131, 64), 209);
+        assert_eq!(rgb_to_ansi256(217, 106, 43), 166);
+        // 中性灰走灰阶候选（立方候选比它远）：128 = 第 12 级灰的灰度值
+        assert_eq!(rgb_to_ansi256(128, 128, 128), 244);
+        assert_eq!(rgb_to_ansi256(130, 130, 130), 244, "灰阶择近不是精确相等");
+    }
+
+    /// 槽位矩阵（dark/light × True/Ansi256/Basic16）：dim 分主题、brand 分主题分色阶，其余一律
+    /// 与主题/色阶无关。
+    #[test]
+    fn palette_slots_follow_the_theme_and_depth_matrix() {
+        // dim 分主题（浅色背景上 `2m` 几乎看不见，换亮灰）
+        assert_eq!(palette(Theme::Dark, ColorDepth::True).dim, "\u{1b}[2m");
+        assert_eq!(palette(Theme::Light, ColorDepth::True).dim, "\u{1b}[90m");
+
+        // brand：真彩给品牌橙 RGB（浅色主题加深），256 给立方色号，基本色两主题都落黄
+        let brand = |theme: Theme, depth: ColorDepth| palette(theme, depth).brand;
+        assert_eq!(
+            brand(Theme::Dark, ColorDepth::True),
+            "\u{1b}[38;2;247;131;64m"
+        );
+        assert_eq!(
+            brand(Theme::Light, ColorDepth::True),
+            "\u{1b}[38;2;217;106;43m"
+        );
+        assert_eq!(brand(Theme::Dark, ColorDepth::Ansi256), "\u{1b}[38;5;209m");
+        assert_eq!(brand(Theme::Light, ColorDepth::Ansi256), "\u{1b}[38;5;166m");
+        assert_eq!(brand(Theme::Dark, ColorDepth::Basic16), "\u{1b}[33m");
+        assert_eq!(brand(Theme::Light, ColorDepth::Basic16), "\u{1b}[33m");
+        // 256 档与量化函数同源（两个主题各锁一次）
+        assert_eq!(
+            brand(Theme::Dark, ColorDepth::Ansi256),
+            format!("\u{1b}[38;5;{}m", rgb_to_ansi256(247, 131, 64))
+        );
+        assert_eq!(
+            brand(Theme::Light, ColorDepth::Ansi256),
+            format!("\u{1b}[38;5;{}m", rgb_to_ansi256(217, 106, 43))
+        );
+
+        // 状态色与 bold/error/accent 在全部主题 × 色阶组合下都不变
+        for theme in [Theme::Dark, Theme::Light] {
+            for depth in [ColorDepth::True, ColorDepth::Ansi256, ColorDepth::Basic16] {
+                let slots = palette(theme, depth);
+                assert_eq!(slots.ok, "\u{1b}[32m", "{theme:?}/{depth:?}");
+                assert_eq!(slots.warn, "\u{1b}[33m", "{theme:?}/{depth:?}");
+                assert_eq!(slots.bold, "\u{1b}[1m", "{theme:?}/{depth:?}");
+                assert_eq!(slots.error, "\u{1b}[31m", "{theme:?}/{depth:?}");
+                assert_eq!(slots.accent, "\u{1b}[36m", "{theme:?}/{depth:?}");
+            }
+        }
+
+        // 不上色（None）与基本色同档：槽位照旧可取，调用方按 `depth != None` 门控
+        assert_eq!(
+            palette(Theme::Light, ColorDepth::None).brand,
+            palette(Theme::Light, ColorDepth::Basic16).brand
+        );
     }
 
     #[test]

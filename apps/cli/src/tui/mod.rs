@@ -118,10 +118,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cli::Cli;
 use crate::commands::slash::{self, Dispatch, Parsed, Slash};
-use crate::commands::{Session, kernel_note, no_color_value};
+use crate::commands::{Session, env_text_value, kernel_note, no_color_value};
 use crate::editor::draw::CONTINUATION;
 use crate::editor::history::History;
-use crate::render::resolve_color;
+use crate::render::{color_depth, resolve_color};
 use crate::repl::{alerts_banner_line, resume_continue};
 use crate::tui::app::{Action, Busy, InputChunk, TuiApp, Wake};
 use crate::tui::approval::{ApprovalJob, TuiApproval};
@@ -133,17 +133,28 @@ use crate::tui::view::{Scrollback, ViewFacts, compose};
 const ECHO_MARK: &str = "❯ ";
 
 /// 会用到的会话事实快照（只用既有/本任务新增的 `pub` 访问器）。
+///
+/// 色阶的终端现场（`COLORTERM`/`TERM`）从进程环境读，转发给 [`refresh_facts_with`]。
 pub fn refresh_facts(session: &Session) -> ViewFacts {
-    // 非 UTF-8 的取值照样算「已设置」：转换与经典路径共用 `no_color_value`
+    // 非 UTF-8 的取值照样算「已设置」：转换与经典路径共用 `no_color_value` / `env_text_value`
     refresh_facts_with(
         session,
         no_color_value(std::env::var_os("NO_COLOR")).as_deref(),
+        env_text_value(std::env::var_os("COLORTERM")).as_deref(),
+        env_text_value(std::env::var_os("TERM")).as_deref(),
     )
 }
 
-/// 带 `NO_COLOR` 注入的变体（用例不必改进程环境）。
-pub fn refresh_facts_with(session: &Session, no_color: Option<&str>) -> ViewFacts {
+/// 带 `NO_COLOR` 与终端现场注入的变体（用例不必改进程环境）。
+pub fn refresh_facts_with(
+    session: &Session,
+    no_color: Option<&str>,
+    colorterm: Option<&str>,
+    term: Option<&str>,
+) -> ViewFacts {
     let ui = session.ui_config();
+    // TUI 只在终端上跑：stdout 恒是 tty，颜色只看 `ui.color` 与 `NO_COLOR`；色阶在它的结论之上
+    let color = resolve_color(ui.color, true, no_color);
     ViewFacts {
         version: env!("CARGO_PKG_VERSION"),
         workspace: session.workspace().display().to_string(),
@@ -151,8 +162,8 @@ pub fn refresh_facts_with(session: &Session, no_color: Option<&str>) -> ViewFact
         session: slash::session_label(session.current_session()),
         mode: session.output_mode(),
         theme: ui.theme,
-        // TUI 只在终端上跑：stdout 恒是 tty，颜色只看 `ui.color` 与 `NO_COLOR`
-        color: resolve_color(ui.color, true, no_color),
+        color,
+        depth: color_depth(color, colorterm, term),
         budget: session.context_budget(),
         history_messages: session.history().len(),
         stats: session.last_prompt_stats().copied(),
@@ -583,6 +594,7 @@ mod tests {
     use crate::commands::kernel_note;
     use crate::commands::slash::{self, Slash};
     use crate::editor::history::History;
+    use crate::render::ColorDepth;
     use crate::repl::{alerts_banner_line, no_session_note};
     use crate::tui::app::{InputChunk, SELECTOR_HINT, TuiApp};
     use crate::tui::approval::ApprovalJob;
@@ -759,7 +771,7 @@ mod tests {
     #[test]
     fn refresh_facts_reads_the_session_and_the_no_color_convention() {
         let (_dir, session) = session_fixture("tui-facts", "native");
-        let facts = refresh_facts_with(&session, Some("1"));
+        let facts = refresh_facts_with(&session, Some("1"), None, Some("xterm-256color"));
 
         assert_eq!(facts.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(facts.workspace, session.workspace().display().to_string());
@@ -775,10 +787,10 @@ mod tests {
         assert_eq!(facts.usage, session.last_usage().copied());
         assert!(facts.native, "native 内核");
         assert!(!facts.color, "`NO_COLOR=1`（非空）恒无色");
-        assert!(
-            refresh_facts_with(&session, None).color,
-            "tty + auto → 上色"
-        );
+        assert_eq!(facts.depth, ColorDepth::None, "不上色时色阶恒 None");
+        let colored_facts = refresh_facts_with(&session, None, None, Some("xterm-256color"));
+        assert!(colored_facts.color, "tty + auto → 上色");
+        assert_eq!(colored_facts.depth, ColorDepth::Ansi256, "256 色按 TERM 判");
 
         // `ui.color = Always`：没有 `NO_COLOR` 时上色；`NO_COLOR` 非空时照样无色
         let (_dir, always) = session_fixture_with_config(
@@ -792,8 +804,12 @@ mod tests {
                 ..Config::default()
             },
         );
-        assert!(refresh_facts_with(&always, None).color);
-        assert!(!refresh_facts_with(&always, Some("1")).color);
+        let truecolor = refresh_facts_with(&always, None, Some("truecolor"), Some("xterm"));
+        assert!(truecolor.color);
+        assert_eq!(truecolor.depth, ColorDepth::True, "COLORTERM 的真彩优先");
+        let no_color = refresh_facts_with(&always, Some("1"), Some("truecolor"), Some("xterm"));
+        assert!(!no_color.color);
+        assert_eq!(no_color.depth, ColorDepth::None, "`NO_COLOR` 压在色阶之上");
 
         // `ui.color = never`：tty + 没有 NO_COLOR 也恒无色 → 帧里零 SGR
         let (_dir, never) = session_fixture_with_config(
@@ -807,8 +823,9 @@ mod tests {
                 ..Config::default()
             },
         );
-        let plain = refresh_facts_with(&never, None);
+        let plain = refresh_facts_with(&never, None, Some("truecolor"), Some("xterm"));
         assert!(!plain.color, "`never` 恒无色");
+        assert_eq!(plain.depth, ColorDepth::None, "`never` 的色阶同样是 None");
         let mut app = headless_app();
         app.push_lines(["答复一".to_string()]);
         let frame = compose(&app.view(&plain));

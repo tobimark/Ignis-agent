@@ -45,7 +45,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::approval::{InteractiveApproval, PolicyOnlyApproval, resolve_mode};
 use crate::cli::Cli;
-use crate::render::{Renderer, RendererOptions, format_task_end, resolve_color, width_for_stdout};
+use crate::render::{
+    Renderer, RendererOptions, color_depth, format_task_end, resolve_color, width_for_stdout,
+};
 
 use self::kernel::{
     NATIVE_KERNEL, known_kernel, missing_api_key, mk_runtime, mk_runtime_with_path, resolve_kernel,
@@ -996,8 +998,11 @@ impl Write for SharedSink {
 }
 
 /// 渲染选项：模式来自**会话状态**（`/details` 只改会话，不写回配置），主题来自 `config.ui`，
-/// `ColorChoice` + stdout 的 tty 状态 + `NO_COLOR` 定颜色，宽度按 stdout 类型给
+/// `ColorChoice` + stdout 的 tty 状态 + `NO_COLOR` 定颜色与色阶，宽度按 stdout 类型给
 /// （tty → 探测终端列数，非 tty → 不折行）。
+///
+/// 色阶的终端现场（`COLORTERM`/`TERM`）从进程环境读、有损解码后转发给
+/// [`renderer_options_with`]（用例走注入变体，不必改进程环境）。
 ///
 /// `pub(crate)`：TUI 的帧合成器按同一份口径取宽度（TUI 下 stdout 是 tty，宽度就是面板列数）。
 pub(crate) fn renderer_options(
@@ -1006,10 +1011,37 @@ pub(crate) fn renderer_options(
     is_tty: bool,
     no_color: Option<&str>,
 ) -> RendererOptions {
+    let colorterm = env_text_value(std::env::var_os("COLORTERM"));
+    let term = env_text_value(std::env::var_os("TERM"));
+    renderer_options_with(
+        config,
+        mode,
+        is_tty,
+        no_color,
+        colorterm.as_deref(),
+        term.as_deref(),
+    )
+}
+
+/// 带终端现场注入的变体（与 `choose_reader_with` / `resolve_api_key_with` 同一手法）：色阶只看
+/// 传进来的 `colorterm`/`term`。
+///
+/// 色阶在 [`resolve_color`] 的结论**之上**判：`color=false`（`NO_COLOR` 非空 / `never` / 非 tty）
+/// 恒 `ColorDepth::None`，既有「无色零 SGR」不变式不受影响。
+pub(crate) fn renderer_options_with(
+    config: &Config,
+    mode: OutputMode,
+    is_tty: bool,
+    no_color: Option<&str>,
+    colorterm: Option<&str>,
+    term: Option<&str>,
+) -> RendererOptions {
+    let color = resolve_color(config.ui.color, is_tty, no_color);
     RendererOptions {
         mode,
-        color: resolve_color(config.ui.color, is_tty, no_color),
+        color,
         theme: config.ui.theme,
+        depth: color_depth(color, colorterm, term),
         width: width_for_stdout(is_tty),
     }
 }
@@ -1020,6 +1052,12 @@ pub(crate) fn renderer_options(
 ///
 /// `pub(crate)`：`NO_COLOR` 的约定只有这一处，TUI 的 `refresh_facts` 也从这里读。
 pub(crate) fn no_color_value(raw: Option<OsString>) -> Option<String> {
+    raw.map(|value| value.to_string_lossy().into_owned())
+}
+
+/// 终端环境变量（`COLORTERM`/`TERM`）取值的文本化：存在即算「已设置」，非 UTF-8 同样有损解码
+/// （与 [`no_color_value`] 一个手法）——色阶判定不该因为一个乱码值整条丢掉。
+pub(crate) fn env_text_value(raw: Option<OsString>) -> Option<String> {
     raw.map(|value| value.to_string_lossy().into_owned())
 }
 
@@ -1474,6 +1512,67 @@ mod tests {
         assert_eq!(session.kernel(), "codex");
     }
 
+    /// 色阶贯穿命令层：`renderer_options_with` 在 `resolve_color` 的结论之上判档——无色恒 `None`，
+    /// 其余按注入的终端现场给真彩 / 256 / 基本色。`renderer_options` 只是读进程环境转发，不在用例
+    /// 里断言（hermetic：不改运行者的环境）。
+    #[test]
+    fn renderer_options_threads_the_color_depth() {
+        use crate::render::ColorDepth;
+
+        let config = Config::default();
+        let options = |tty: bool, no_color: Option<&str>, colorterm: Option<&str>, term| {
+            renderer_options_with(&config, OutputMode::Normal, tty, no_color, colorterm, term)
+        };
+
+        // COLORTERM 的真彩优先于 TERM 的 256 色；两个现场都没有则退回基本 16 色
+        assert_eq!(
+            options(true, None, Some("truecolor"), Some("xterm-256color")).depth,
+            ColorDepth::True
+        );
+        assert_eq!(
+            options(true, None, Some("24bit"), Some("xterm")).depth,
+            ColorDepth::True
+        );
+        assert_eq!(
+            options(true, None, None, Some("xterm-256color")).depth,
+            ColorDepth::Ansi256
+        );
+        assert_eq!(
+            options(true, None, None, Some("xterm")).depth,
+            ColorDepth::Basic16
+        );
+        assert_eq!(options(true, None, None, None).depth, ColorDepth::Basic16);
+
+        // 三种「不上色」的来路都收敛到 `None`：非 tty、`NO_COLOR` 非空、`ui.color=never`
+        for (tty, no_color, color) in [
+            (false, None, ColorChoice::Auto),
+            (true, Some("1"), ColorChoice::Auto),
+            (true, None, ColorChoice::Never),
+        ] {
+            let config = Config {
+                ui: UiConfig {
+                    color,
+                    ..UiConfig::default()
+                },
+                ..Config::default()
+            };
+            let options = renderer_options_with(
+                &config,
+                OutputMode::Normal,
+                tty,
+                no_color,
+                Some("24bit"),
+                Some("xterm-256color"),
+            );
+            assert!(!options.color, "不上色：{tty}/{no_color:?}/{color:?}");
+            assert_eq!(
+                options.depth,
+                ColorDepth::None,
+                "不上色时色阶恒 None：{tty}/{no_color:?}/{color:?}"
+            );
+        }
+    }
+
     /// 渲染选项的三个来源各管一段：输出模式来自**会话状态**（`/details` 只改会话），主题来自
     /// `config.ui`，`ColorChoice` + tty + `NO_COLOR` 定颜色，stdout 不是 tty 时宽度是「不折行」。
     #[test]
@@ -1576,6 +1675,28 @@ mod tests {
             no_color_value(Some(OsString::from("1"))).as_deref(),
             Some("1")
         );
+    }
+
+    /// 终端现场（`COLORTERM`/`TERM`）的文本化与 `NO_COLOR` 同一手法：非 UTF-8 有损解码后照样算
+    /// 「已设置」（色阶判定不该因为一个乱码值整条丢掉）。
+    #[cfg(unix)]
+    #[test]
+    fn env_text_value_decodes_lossily() {
+        use std::os::unix::ffi::OsStringExt;
+
+        assert_eq!(
+            env_text_value(Some(OsString::from_vec(vec![0xff, 0xfe]))).as_deref(),
+            Some("\u{fffd}\u{fffd}")
+        );
+        assert_eq!(
+            env_text_value(Some(OsString::from("xterm-256color"))).as_deref(),
+            Some("xterm-256color")
+        );
+        assert_eq!(
+            env_text_value(Some(OsString::from(""))).as_deref(),
+            Some("")
+        );
+        assert_eq!(env_text_value(None), None);
     }
 
     /// 指向脚本化假模型的 native 配置：`run_task` 真的会走一遍 native 内核（HTTP → SSE），
