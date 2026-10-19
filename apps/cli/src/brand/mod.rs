@@ -171,7 +171,11 @@ pub fn brand_block(version: &str, style: &StartupStyle) -> Vec<String> {
     match style.tier {
         Tier::Minimal => vec![wordmark],
         Tier::Compact => flame_with_text(&flame::COMPACT, style, &wordmark, None),
-        Tier::Full => flame_with_text(&flame::FULL, style, &wordmark, Some(TAGLINE)),
+        Tier::Full => {
+            // 标语按 `dim` 槽包裹后才交给火焰块；门控在 `wrap` 里（`depth == None` 给纯文本）
+            let tagline = wrap(TAGLINE, style, palette(style.theme, style.depth).dim);
+            flame_with_text(&flame::FULL, style, &wordmark, Some(&tagline))
+        }
     }
 }
 
@@ -619,6 +623,57 @@ mod tests {
             tagline_left.chars().count(),
             flame::FULL.cols,
             "{:?}",
+            lines[1]
+        );
+    }
+
+    /// Full 档的标语必须真的被 `dim` 包一层（上色档）。此前代码把裸 `const TAGLINE` 直接塞进
+    /// 火焰块，`Full + 上色` 现场标语落成默认色——与模块文档和 brief 的规则分家，也躲过了
+    /// 这里唯一一条 Full 测试（它跑在 `ColorDepth::None`）。
+    #[test]
+    fn brand_block_full_wraps_the_tagline_in_dim() {
+        let style = StartupStyle {
+            tier: Tier::Full,
+            depth: ColorDepth::True,
+            theme: Theme::Dark,
+        };
+        let lines = brand_block("9.9.9", &style);
+        assert_eq!(lines.len(), flame::FULL.rows, "Full 档仍是字模的 13 行");
+        assert!(
+            lines[1].ends_with("  \u{1b}[2mYour Personal Autonomous Agent\u{1b}[0m"),
+            "第 2 行标语必须整体 `dim` 包裹：{:?}",
+            lines[1]
+        );
+        // 字标那一行仍是 `bold + brand`；标语只占行尾那一段，火焰行的上色形态不变
+        assert!(
+            lines[0].ends_with("  \u{1b}[1m\u{1b}[38;2;247;131;64mIGNIS v9.9.9\u{1b}[0m"),
+            "{:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("\u{1b}[38;2;") && lines[1].contains('▀'),
+            "火焰格仍是真彩上色（标语是追加在右侧）：{:?}",
+            lines[1]
+        );
+    }
+
+    /// 浅色主题的 `dim` 槽是亮灰 `90m`（暗色 `2m` 在浅色底几乎看不见）——标语按主题取槽。
+    #[test]
+    fn brand_block_full_tagline_follows_the_theme_dim_slot() {
+        let style = StartupStyle {
+            tier: Tier::Full,
+            depth: ColorDepth::True,
+            theme: Theme::Light,
+        };
+        let lines = brand_block("9.9.9", &style);
+        assert!(
+            lines[1].ends_with("  \u{1b}[90mYour Personal Autonomous Agent\u{1b}[0m"),
+            "浅色主题的标语走 `90m`：{:?}",
+            lines[1]
+        );
+        assert!(
+            !lines[1].contains("\u{1b}[2m"),
+            "浅色主题不该落 `2m`：{:?}",
             lines[1]
         );
     }
