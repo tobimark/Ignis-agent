@@ -926,10 +926,10 @@ impl Session {
         {
             let _ = writeln!(err, "warning: session write failed: {error}");
         }
-        let _ = writeln!(
-            out,
-            "{}",
-            format_task_end(
+        // 结束行的状态点按终态着色（Done 绿 / Failed 红 / Aborted 与 Limit reached 黄）：着色只
+        // 包 `● {状态词}` 这一整段，`● Done` 锚点子串保持连续；`color=false` 时逐字不变
+        let end_line = renderer.paint_status_dot(
+            &format_task_end(
                 &outcome.id,
                 outcome.status,
                 started.elapsed(),
@@ -937,8 +937,10 @@ impl Session {
                 &outcome.skills_used,
                 outcome.tool_calls,
                 options.mode,
-            )
+            ),
+            outcome.status,
         );
+        let _ = writeln!(out, "{end_line}");
         // 非成功终态不能只留一个状态词：原因（内核给出、已过 Redactor）打到错误面，与
         // `main` 的错误行同形。任务 id 已在结束行里，随后可直接 `ignis task show {id}`。
         if outcome.status != RunStatus::Success

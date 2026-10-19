@@ -441,6 +441,31 @@ impl Renderer {
         let _ = self.out.flush();
     }
 
+    /// 结束行的状态点着色：把 `● {状态词}` **整段**包上槽位色，再原样接上剩余部分。
+    ///
+    /// 色档按终态给（`Success` 绿 / `Failed` 红 / `Aborted` 与 `LimitReached` 黄）：状态词与
+    /// [`status_word`] 同源，不另立一份状态表。着色范围含 `●` 与状态词两者：`● Done` 是终端里
+    /// 可直接复制去 grep / `ignis task show` 的锚点，夹断成两段 SGR 就不再是连续子串。
+    ///
+    /// `color=false`、或行不以 `● {该状态的状态词}` 开头（正文行、别的状态的结束行）时原样
+    /// 返回：一个 SGR 都不写，非 tty 的 e2e 输出因此逐字不变。
+    pub fn paint_status_dot(&self, line: &str, status: RunStatus) -> String {
+        if !self.options.color {
+            return line.to_string();
+        }
+        let anchor = format!("● {}", status_word(status));
+        // 前缀对不上就不认领：正文里出现的 `● Done` 只是普通文字
+        let Some(rest) = line.strip_prefix(&anchor) else {
+            return line.to_string();
+        };
+        let color = match status {
+            RunStatus::Success => self.palette.ok,
+            RunStatus::Failed => self.palette.error,
+            RunStatus::Aborted | RunStatus::LimitReached => self.palette.warn,
+        };
+        format!("{color}{anchor}{RESET}{rest}")
+    }
+
     /// 正文增量：过 `MdStream` 后逐片段写出。
     fn push_answer(&mut self, text: &str) {
         for segment in self.md.feed(text) {
@@ -1692,5 +1717,99 @@ mod tests {
             OutputMode::Debug,
         );
         assert!(debug.contains(" · 1 tool · tokens "), "{debug}");
+    }
+
+    // ---- 结束行状态点 ----
+
+    /// 结束行的状态点按终态着色：`● {状态词}` **整段**包上槽位色（锚点子串不被拆开），剩余部分
+    /// 逐字保留。输入取 [`format_task_end`] 的真实输出。
+    #[test]
+    fn paint_status_dot_colors_the_state_word_of_the_task_end_line() {
+        let usage = Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+            estimated: false,
+        };
+        let elapsed = Duration::from_millis(2100);
+        let (renderer, _buf, _flag) = renderer(OutputMode::Normal, true, NO_WRAP);
+
+        for (status, word, color) in [
+            (RunStatus::Success, "Done", "\u{1b}[32m"),
+            (RunStatus::Failed, "Failed", "\u{1b}[31m"),
+            (RunStatus::Aborted, "Aborted", "\u{1b}[33m"),
+            (RunStatus::LimitReached, "Limit reached", "\u{1b}[33m"),
+        ] {
+            let line =
+                format_task_end(TASK_ID, status, elapsed, &usage, &[], 2, OutputMode::Normal);
+            let painted = renderer.paint_status_dot(&line, status);
+            let anchor = format!("● {word}");
+            assert_eq!(
+                painted,
+                format!("{color}{anchor}\u{1b}[0m · 2.1s · 2 tools · task 019a1b2c-3d4e"),
+                "{status:?}"
+            );
+            // 锚点整段着色：终端里能直接复制 `● Done` 去 grep，子串不被 SGR 拆开
+            assert!(painted.contains(&anchor), "{status:?}: {painted}");
+        }
+    }
+
+    /// `color=false` 一字不动（非 tty 的 e2e 走这条：结束行输出逐字不变）。
+    #[test]
+    fn paint_status_dot_is_verbatim_without_color() {
+        let usage = Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+            estimated: false,
+        };
+        let (off, _buf, _flag) = renderer(OutputMode::Normal, false, NO_WRAP);
+
+        for status in [
+            RunStatus::Success,
+            RunStatus::Failed,
+            RunStatus::Aborted,
+            RunStatus::LimitReached,
+        ] {
+            let line = format_task_end(
+                TASK_ID,
+                status,
+                Duration::from_millis(2100),
+                &usage,
+                &[],
+                2,
+                OutputMode::Normal,
+            );
+            let painted = off.paint_status_dot(&line, status);
+            assert_eq!(painted, line, "{status:?} 必须逐字相等");
+            assert!(!painted.contains('\u{1b}'), "{status:?}: {painted}");
+        }
+    }
+
+    /// 不以 `● {该状态词}` 开头的行原样返回：正文行（哪怕正文里提到 `● Done`）、缩进过的行与
+    /// 别的状态的结束行都不着色（防误伤正文）。
+    #[test]
+    fn paint_status_dot_leaves_lines_it_does_not_own_untouched() {
+        let (renderer, _buf, _flag) = renderer(OutputMode::Normal, true, NO_WRAP);
+
+        for line in [
+            // 状态点在正文中间：含 `● Done` 子串但不是结束行
+            "总结里写了 ● Done · 2.1s 这一行",
+            // 状态点不在列 0：结束行以外的行都不该被认领
+            "  ● Done · 2.1s",
+            "· thinking (4 chars)",
+            "",
+        ] {
+            assert_eq!(
+                renderer.paint_status_dot(line, RunStatus::Success),
+                line,
+                "{line:?}"
+            );
+        }
+
+        // 状态词对不上：不许把别的状态词包进这一档色
+        let failed = "● Failed · 0.3s";
+        assert_eq!(
+            renderer.paint_status_dot(failed, RunStatus::Success),
+            failed
+        );
     }
 }
