@@ -3,9 +3,10 @@
 //! 分工：[`Scrollback`] 是捕获文本的落点（按行摄入、上限 [`SCROLLBACK_LINES`]、记着滚动位置）；
 //! 一帧的全部输入是 [`TuiView`]（它不认识会话与终端）；[`compose`] 把它拼成整帧字节；顶部/底部
 //! 状态行的文案由 [`top_line`]/[`status_line`] 从 [`ViewFacts`] 快照里拼出，宽度截断统一交给
-//! [`compose`]（文案函数只逐字拼，用例才好逐字断言）。帧里的每一条内容行在截断之前都过一遍
-//! [`capture::sanitize`]（幂等）：内容里的 ESC 只可能是被放行的 SGR（放行面是 SGR 形状，不是枚举
-//! 出来的几条），帧协议自己的序列在一旁照常。
+//! [`compose`]（文案函数只逐字拼，用例才好逐字断言）。帧里的每一条内容行在截断之前都过一遍净化
+//! （幂等，放行面看 `color`）：上色帧走 [`capture::sanitize`]，内容里的 ESC 只可能是被放行的 SGR
+//! （放行面是 SGR 形状，不是枚举出来的几条）；无色帧走 [`capture::sanitize_plain`]，连 SGR 也不放行。
+//! 帧协议自己的序列在一旁照常。
 //!
 //! 帧协议（逐字钉住，金帧用例锁死）：
 //!
@@ -23,10 +24,10 @@
 //! `[top] ++ input(3) ++ [status]` 取前 `rows` 行——终端比预期小是常态（用户随手拉窗口）：合成器
 //! 绝不吐超过 `rows` 行，光标也一定落在 `1..=rows`/`1..=cols` 里。
 //!
-//! 颜色（`color`）：`false` 时帧里一条 SGR 都没有（定位与清行不是颜色，照常写）；`true` 时 chrome
-//! 走 [`crate::render::palette`]（按 `view.depth` 取品牌档）——顶部/底部状态行与输入区提示行 dim、
-//! 顶行的字标（`IGNIS v…`）与输入区首行标记（`❯ `）`bold + brand`，每行结尾补一条重置，被截断的
-//! 行不会把颜色漏到下一行。
+//! 颜色（`color`）：`false` 时帧里一条 SGR 都没有（内容里的 SGR 在净化时就丢掉了；定位与清行不是
+//! 颜色，照常写）；`true` 时 chrome 走 [`crate::render::palette`]（按 `view.depth` 取品牌档）——顶部/
+//! 底部状态行与输入区提示行 dim、顶行的字标（`IGNIS v…`）与输入区首行标记（`❯ `）`bold + brand`、
+//! 每行结尾补一条重置：被截断的行不会把颜色漏到下一行。
 
 use std::collections::VecDeque;
 
@@ -337,12 +338,14 @@ pub fn selector_lines(
 
 /// 合成整帧字节（纯函数，逐字节可断言）；每一行都过 [`truncate_to_width`]。
 ///
-/// 内容行在**截断之前**统一过一遍 [`capture::sanitize`]（幂等）：帧的内容（viewport/top/input/
-/// status）各有各的来源（模型输出、命令输出、会话名），清屏/改标题之类的序列绝不能借帧抵达
-/// 终端；chrome 自己上的色都是正当 SGR（形状命中 [`capture::sanitize`] 的放行面），原样穿过。
+/// 内容行在**截断之前**统一过一遍净化（幂等）：帧的内容（viewport/top/input/status）各有各的来源
+/// （模型输出、命令输出、会话名），清屏/改标题之类的序列绝不能借帧抵达终端。放行面跟着 `view.color`
+/// 走：上色帧用 [`capture::sanitize`]（chrome 自己上的色都是正当 SGR，形状命中放行面，原样穿过），
+/// 无色帧用 [`capture::sanitize_plain`]（一条 SGR 都不放行——无色帧不补行尾重置，漏进来的属性会跨
+/// `\r\n` 一路刷到后面的行）。
 pub fn compose(view: &TuiView) -> String {
     let palette = palette(view.theme, view.depth);
-    let rows = sanitized(layout(view));
+    let rows = sanitized(layout(view), view.color);
     let mut frame = String::from(HIDE_CURSOR);
     frame.push_str(CURSOR_HOME);
     for (index, (slot, text)) in rows.iter().enumerate() {
@@ -364,13 +367,23 @@ pub fn compose(view: &TuiView) -> String {
     frame
 }
 
-/// 版式里的每一条内容行过一遍净化（[`capture::sanitize`] 幂等：任意 SGR 与普通文本原样保留）。
+/// 版式里的每一条内容行过一遍净化（幂等：普通文本与放行的序列原样保留）。
+///
+/// `colored` 决定放行面：上色帧放行任意 SGR（[`capture::sanitize`]），无色帧一条 SGR 也不留
+/// （[`capture::sanitize_plain`]）——无色帧不补行尾重置，任何属性都会跨行漏下去。
 ///
 /// 在截断之前做：截断之后的行已经是显示层的一部分，内容边界不再可辨。光标列也从净化后的行算
 /// （[`cursor`]），内容里的转义因此既进不了帧、也不会把光标位置算歪。
-fn sanitized(rows: Vec<(Slot, String)>) -> Vec<(Slot, String)> {
+fn sanitized(rows: Vec<(Slot, String)>, colored: bool) -> Vec<(Slot, String)> {
     rows.into_iter()
-        .map(|(slot, text)| (slot, capture::sanitize(text.as_bytes())))
+        .map(|(slot, text)| {
+            let text = if colored {
+                capture::sanitize(text.as_bytes())
+            } else {
+                capture::sanitize_plain(text.as_bytes())
+            };
+            (slot, text)
+        })
         .collect()
 }
 
@@ -934,6 +947,42 @@ mod tests {
             "{frame:?}"
         );
         assert!(!frame.contains("\x1b[?25h"), "{frame:?}");
+    }
+
+    /// `color=false` 时内容里的 SGR 也一并净化掉：无色帧不补行尾重置，`\x1b[8m`（隐藏）/`\x1b[7m`
+    /// （反显）这类属性一旦进帧就会跨 `\r\n` 刷到后面的视口行、输入区与两条状态行——所以无色帧
+    /// 的内容行里一个 ESC 都不许有（帧协议自己的定位/清行/光标序列不算内容）。
+    #[test]
+    fn compose_without_color_strips_captured_sgr() {
+        let mut view = golden_view(80, 24);
+        view.color = false;
+        view.input.cursor = None;
+        // 视口塞进隐藏与反显（`capture::sanitize` 的放行面认得它们）：文本留下，序列一条也不许进帧。
+        view.viewport = vec![
+            "\u{1b}[8mhidden".to_string(),
+            "\u{1b}[7mreverse\u{1b}[0m".to_string(),
+        ];
+        let frame = compose(&view);
+        assert!(!frame.contains("\u{1b}[8m"), "{frame:?}");
+        assert!(!frame.contains("\u{1b}[7m"), "{frame:?}");
+        assert!(
+            sgr_sequences(&frame).is_empty(),
+            "无色帧里一条 SGR 都不许有：{frame:?}"
+        );
+
+        // 视口两行落在 rows[1..=2]：序列去掉、文本逐字留下、行里没有 ESC。
+        let parsed = parse_frame(&frame);
+        assert_eq!(parsed.rows[1], "hidden", "隐藏属性丢掉、文本逐字留下");
+        assert_eq!(parsed.rows[2], "reverse", "反显属性丢掉、文本逐字留下");
+        for row in &parsed.rows[1..=2] {
+            assert!(!row.contains('\u{1b}'), "{row:?} 里漏进了 SGR");
+        }
+
+        // 上色档口径不变：同样的内容在 `color=true` 下原样穿过（放行面只在无色档收紧）。
+        view.color = true;
+        let colored = compose(&view);
+        assert!(colored.contains("\u{1b}[8mhidden"), "{colored:?}");
+        assert!(colored.contains("\u{1b}[7mreverse\u{1b}[0m"), "{colored:?}");
     }
 
     /// `color=true`：chrome 用调色板——顶行的字标（首个 ` · ` 之前、以 `IGNIS v` 开头的那一段）

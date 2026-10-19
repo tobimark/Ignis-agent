@@ -1,10 +1,12 @@
 //! 捕获落点与净化：渲染器写进共享缓冲的字节 → 只能「显示、不能驱动终端」的文本。
 //!
 //! 反目标（设计 §2.2）：模型输出绝不能驱动终端控制。这条防线只有一个入口——渲染器把字节写进
-//! [`CaptureSink`]，滚动区摄入时经 [`sanitize`] 净化，放行面只有 SGR（给文本上色）。
+//! [`CaptureSink`]，滚动区摄入时经 [`sanitize`]（上色档）或 [`sanitize_plain`]（无色档）净化：
+//! 上色档的放行面只有 SGR（给文本上色），无色档一条 SGR 也不放行。
 //!
-//! 不变式（设计 §6.2）：scrollback 里除 SGR 与 `\n`/`\t` 外不允许出现任何转义——放宽后的上限只是
-//! 「文本可被上色」（逐格真彩的火焰字模需要任意 SGR 参数），光标与屏幕状态仍不可驱动。
+//! 不变式（设计 §6.2）：上色档的 scrollback 里除 SGR 与 `\n`/`\t` 外不允许出现任何转义——放宽后的
+//! 上限只是「文本可被上色」（逐格真彩的火焰字模需要任意 SGR 参数），光标与屏幕状态仍不可驱动。
+//! 无色档更紧一档：连 SGR 都不放行，净化后的文本里一个 ESC 也没有。
 
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -49,24 +51,44 @@ pub fn drain(buffer: &Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
     std::mem::take(&mut *lock(buffer))
 }
 
-/// 捕获字节 → 可进滚动区的文本。
+/// 捕获字节 → 可进滚动区的文本（**上色档**：放行任意 SGR）。
 ///
 /// 只放行任意 SGR（`ESC [` + 数字/分号 + `m`：基本色、256 色、逐格真彩与属性都能给文本上色）、`\n`
 /// 与 `\t`；其余 ESC（连同它后面的 CSI/OSC 序列）与 C0/DEL 控制字节一律丢掉、不留残渣。非法 UTF-8
 /// 按替换字符顶上（防御性，渲染器本体只写合法 UTF-8）。
+///
+/// 无色档走 [`sanitize_plain`]；两条路共用 `sanitize_with` 这一个解析器，放行面不会各自漂移。
 pub fn sanitize(bytes: &[u8]) -> String {
+    sanitize_with(bytes, true)
+}
+
+/// 捕获字节 → 可进滚动区的文本（**无色档**：一条 SGR 都不留）。
+///
+/// 与 [`sanitize`] 只差放行面：SGR 也整条丢掉，其余 ESC/CSI/OSC 与 C0/DEL 字节的处理逐字相同。无色帧
+/// 不补行尾重置（`view::compose`），放行进来的属性（`\x1b[8m` 隐藏、`\x1b[7m` 反显、背景色、闪烁）会
+/// 跨 `\r\n` 漏进后面的视口行、输入区与两条状态行并每帧重发——所以「无色」在净化这一步就得字面成立。
+pub fn sanitize_plain(bytes: &[u8]) -> String {
+    sanitize_with(bytes, false)
+}
+
+/// 净化的唯一实现：`keep_sgr` 决定 SGR 是整段原样拷贝，还是当普通转义整条丢掉。
+///
+/// 两条路共用一个解析器（差别只有这一个开关）：形状白名单、CSI/OSC/ESE 的丢弃口径与 UTF-8 兜底不会
+/// 在「上色」与「无色」之间各走各的。
+fn sanitize_with(bytes: &[u8], keep_sgr: bool) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut index = 0usize;
     while index < bytes.len() {
         let byte = bytes[index];
         if byte == ESC {
-            // SGR 形状命中：整段原样拷贝（上色不驱动终端）；其余整条丢掉（连同它的参数，不留 `[2J` 这类残渣）。
+            // 上色档命中 SGR 形状：整段原样拷贝（上色不驱动终端）；无色档与其余序列一律整条丢掉
+            // （连同它的参数，不留 `[2J` 这类残渣）。
             match sgr_len(bytes, index) {
-                Some(len) => {
+                Some(len) if keep_sgr => {
                     out.extend_from_slice(&bytes[index..index + len]);
                     index += len;
                 }
-                None => index = skip_escape(bytes, index),
+                _ => index = skip_escape(bytes, index),
             }
             continue;
         }
@@ -177,7 +199,7 @@ mod tests {
     use std::io::Write;
     use std::sync::{Arc, Mutex};
 
-    use super::{CaptureSink, drain, sanitize};
+    use super::{CaptureSink, drain, sanitize, sanitize_plain};
 
     /// 净化放行任意 SGR（`ESC [` + 数字/分号 + `m`：真彩、256 色、基本色与属性都算「上色」）与
     /// `\n`/`\t`，其余 ESC/CSI/OSC 与控制字节一律丢掉。
@@ -243,6 +265,56 @@ mod tests {
         assert_eq!(sanitize("你好，world".as_bytes()), "你好，world");
         assert_eq!(sanitize(b"a\xffb"), "a\u{fffd}b");
         assert_eq!(sanitize(b""), "", "空输入给空串");
+    }
+
+    /// 无色档（[`sanitize_plain`]）：SGR 也整条丢掉——放行面比上色档紧一档，其余口径逐字相同
+    /// （两条路共用同一个解析器）。
+    #[test]
+    fn sanitize_plain_drops_every_sgr_and_keeps_the_text() {
+        // 危险属性（隐藏 / 反显 / 闪烁 / 背景色）与普通上色：一条都不留，文本一字不动。
+        for sgr in [
+            "\u{1b}[8m",          // 隐藏：能直接把 UI 变没
+            "\u{1b}[7m",          // 反显：能把整屏反着刷
+            "\u{1b}[5m",          // 闪烁
+            "\u{1b}[48;2;1;2;3m", // 真彩背景
+            "\u{1b}[38;5;9m",     // 256 色前景
+            "\u{1b}[m",           // 空参数 reset
+        ] {
+            assert_eq!(
+                sanitize_plain(format!("{sgr}正文{sgr}").as_bytes()),
+                "正文",
+                "{sgr:?} 在无色档必须整条丢掉"
+            );
+        }
+        assert_eq!(
+            sanitize_plain("\u{1b}[8mhidden\u{1b}[7mreverse".as_bytes()),
+            "hiddenreverse",
+            "危险属性只丢序列、文本逐字留下"
+        );
+
+        // 其余口径与上色档一致：非 SGR 的 ESC/CSI/OSC 照旧整条丢，`\n`/`\t` 留下，控制字节丢掉。
+        assert_eq!(sanitize_plain(b"a\x1b[2Jb"), "ab");
+        assert_eq!(
+            sanitize_plain("\u{1b}]0;title\u{7}\u{1b}[1;5Aok".as_bytes()),
+            "ok"
+        );
+        assert_eq!(sanitize_plain(b"line1\nline2\ttab"), "line1\nline2\ttab");
+        assert_eq!(sanitize_plain(b"a\x08b\x00c\x7fd"), "abcd");
+        assert_eq!(sanitize_plain("你好，world".as_bytes()), "你好，world");
+        assert_eq!(sanitize_plain(b""), "", "空输入给空串");
+
+        // 不变式：无色档净化之后一个 ESC 都不许剩下（控制字节同理）。
+        let nasty = "\u{1b}[2J\u{1b}[8m隐藏\u{1b}[7m反显\u{1b}[48;2;1;2;3m底\u{1b}[5m闪\
+                     \u{1b}]0;x\u{7}\u{1b}[?25l\n\tend";
+        let clean = sanitize_plain(nasty.as_bytes());
+        assert_eq!(clean, "隐藏反显底闪\n\tend", "{nasty:?} 的文本必须逐字留下");
+        assert!(!clean.contains('\u{1b}'), "{clean:?} 里不许有 ESC");
+        assert!(
+            clean
+                .bytes()
+                .all(|byte| byte >= 0x20 || byte == b'\n' || byte == b'\t'),
+            "{clean:?} 里漏出了控制字节"
+        );
     }
 
     /// 不变式：净化之后的文本里除 `\n`/`\t` 外没有控制字节，且每个 `ESC` 起头都必须整条是一条 SGR
