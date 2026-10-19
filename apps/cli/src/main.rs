@@ -1,6 +1,7 @@
 //! `ignis` 可执行入口：解析参数、分发命令，把错误打成 `error: {人话}`。
 
 pub mod approval;
+pub mod brand;
 pub mod cli;
 pub mod commands;
 pub mod editor;
