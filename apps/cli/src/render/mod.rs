@@ -64,6 +64,16 @@ const REASONING_PREFIX: &str = "· ";
 /// debug 模式下的推理块标记：带上通道名，与正文同屏也不混淆。
 const REASONING_PREFIX_DEBUG: &str = "[reasoning] ";
 
+/// 渲染风味：经典 REPL 逐字节不变；TUI 才启用新的工具行/结束行字形。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RenderFlavor {
+    /// 经典 REPL / 管道 / e2e：`→` / `  ✓` / `● Done`（既有字节契约）。
+    #[default]
+    Classic,
+    /// TUI：`⚙` / `✓` / `✗` 与 `✓ Done` 摘要。
+    Tui,
+}
+
 /// 渲染选项：命令层按 `config.ui` + stdout 的 tty 状态装配。
 ///
 /// `width == usize::MAX` 表示不插入物理换行（非 tty / 管道 / e2e），其余取值是每行的目标列数。
@@ -351,6 +361,8 @@ pub struct Renderer {
     out: Box<dyn Write + Send>,
     /// 渲染选项（模式/颜色/主题/宽度）。
     options: RendererOptions,
+    /// 渲染风味（经典路径默认 Classic；TUI 用 `with_flavor` 切换）。
+    flavor: RenderFlavor,
     /// 主题调色板（由 `options.theme` 定，构造时算一次）。
     palette: Palette,
     /// 本轮事件里是否出现过 `schedule_create`（命令层在任务结束后读它决定自拉起提示）。
@@ -381,8 +393,9 @@ impl Renderer {
     ) -> Self {
         Self {
             out,
-            palette: palette(options.theme, options.depth),
             options,
+            flavor: RenderFlavor::Classic,
+            palette: palette(options.theme, options.depth),
             saw_schedule_create,
             md: MdStream::new(),
             line: Line::Start,
@@ -392,6 +405,12 @@ impl Renderer {
             seq: 0,
             last: None,
         }
+    }
+
+    /// 切换渲染风味（TUI 在装配会话时调用；经典路径不调用，保持逐字节不变）。
+    pub fn with_flavor(mut self, flavor: RenderFlavor) -> Self {
+        self.flavor = flavor;
+        self
     }
 
     /// 渲染一个事件。
@@ -453,11 +472,18 @@ impl Renderer {
         if !self.options.color {
             return line.to_string();
         }
-        let anchor = format!("● {}", status_word(status));
-        // 前缀对不上就不认领：正文里出现的 `● Done` 只是普通文字
-        let Some(rest) = line.strip_prefix(&anchor) else {
+        // 经典路径认 `● Done`，TUI 认 `✓ Done` / `✗ Failed` / `◼ Aborted` / `! Limit reached`。
+        let classic = format!("● {}", status_word(status));
+        let tui = format!("{} {}", task_glyph(status), status_word(status));
+        let anchor = if line.starts_with(&classic) {
+            classic
+        } else if line.starts_with(&tui) {
+            tui
+        } else {
+            // 前缀对不上就不认领：正文里出现的 `● Done` 只是普通文字
             return line.to_string();
         };
+        let rest = &line[anchor.len()..];
         let color = match status {
             RunStatus::Success => self.palette.ok,
             RunStatus::Failed => self.palette.error,
@@ -647,7 +673,12 @@ impl Renderer {
         if self.options.mode == OutputMode::Minimal {
             return;
         }
-        let mut line = format!("→ {summary}");
+        let mut line = match self.flavor {
+            RenderFlavor::Classic => format!("→ {summary}"),
+            // TUI：工具名在前、摘要随后；状态行同时显示 Executing
+            RenderFlavor::Tui if summary.is_empty() => format!("⚙ {name}"),
+            RenderFlavor::Tui => format!("⚙ {name} — {summary}"),
+        };
         if self.options.mode == OutputMode::Debug && !call_id.is_empty() {
             line.push_str(&format!(" [{call_id}]"));
         }
@@ -682,20 +713,36 @@ impl Renderer {
             Some(tool) => (tool.summary.clone(), format_elapsed(tool.started.elapsed())),
             None => (name.to_string(), String::new()),
         };
-        let mut line = if elapsed.is_empty() {
-            format!("  {mark} {label}")
-        } else {
-            format!("  {mark} {label} · {elapsed}")
+        let mut line = match self.flavor {
+            RenderFlavor::Classic => {
+                if elapsed.is_empty() {
+                    format!("  {mark} {label}")
+                } else {
+                    format!("  {mark} {label} · {elapsed}")
+                }
+            }
+            // TUI：工具名 + 明确的终态词；摘要不再出现在结果行（开始行已经给过）。
+            RenderFlavor::Tui => {
+                let state = if ok { "Done" } else { "Failed" };
+                if elapsed.is_empty() {
+                    format!("{mark} {name} — {state}")
+                } else {
+                    format!("{mark} {name} — {state} · {elapsed}")
+                }
+            }
         };
         if self.options.mode == OutputMode::Debug && !call_id.is_empty() {
             line.push_str(&format!(" [{call_id}]"));
         }
 
         self.ensure_line_start();
-        let color = if ok {
-            self.palette.dim
-        } else {
+        let color = if !ok {
             self.palette.error
+        } else if self.flavor == RenderFlavor::Tui {
+            // TUI 的成功结果用绿色；经典路径保持 dim（既有字节与观感不变）
+            self.palette.ok
+        } else {
+            self.palette.dim
         };
         self.write_colored(&line, color);
         self.write_char('\n');
@@ -871,6 +918,51 @@ pub fn format_task_end(
     line
 }
 
+/// TUI 的终态字形（经典路径用 `●`）。
+fn task_glyph(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::Success => "✓",
+        RunStatus::Failed => "✗",
+        RunStatus::Aborted => "◼",
+        RunStatus::LimitReached => "!",
+    }
+}
+
+/// TUI 的结束行：`✓ Done · 3.2s · 4 tools · task 019a1b2c-3d4e`。
+///
+/// 信息量与经典 [`format_task_end`] 一致（minimal/normal/debug 三档、单复数、skills 追加），
+/// 只换字形；经典路径不调用它，逐字节契约不受影响。
+pub fn format_task_end_tui(
+    id: &str,
+    status: RunStatus,
+    elapsed: Duration,
+    usage: &Usage,
+    skills: &[String],
+    tool_calls: usize,
+    mode: OutputMode,
+) -> String {
+    let elapsed = format_elapsed(elapsed);
+    let mut line = format!("{} {} · {elapsed}", task_glyph(status), status_word(status));
+    let tools = if tool_calls == 1 { "tool" } else { "tools" };
+    match mode {
+        OutputMode::Minimal => {}
+        OutputMode::Normal => {
+            line.push_str(&format!(" · {tool_calls} {tools} · task {}", short_id(id)));
+        }
+        OutputMode::Debug => {
+            let mark = if usage.estimated { "~" } else { "" };
+            line.push_str(&format!(
+                " · {tool_calls} {tools} · tokens {mark}in={} {mark}out={} · task {id}",
+                usage.input_tokens, usage.output_tokens
+            ));
+        }
+    }
+    if mode != OutputMode::Minimal && !skills.is_empty() {
+        line.push_str(&format!(" · skills: {}", skills.join(",")));
+    }
+    line
+}
+
 /// 终态的状态词（`minimal` 也用它：状态词不能省）。
 fn status_word(status: RunStatus) -> &'static str {
     match status {
@@ -919,6 +1011,12 @@ mod tests {
         fn text(&self) -> String {
             String::from_utf8(self.0.lock().unwrap().clone()).expect("UTF-8 渲染输出")
         }
+    }
+
+    /// TUI 风味的渲染器：无色、不折行，便于逐字断言。
+    fn renderer_tui(mode: OutputMode) -> (Renderer, SharedBuf) {
+        let (renderer, buf, _) = renderer_with(mode, false, Theme::Dark, NO_WRAP);
+        (renderer.with_flavor(RenderFlavor::Tui), buf)
     }
 
     /// 测试用渲染器：模式/颜色/主题/宽度都显式给（不探测终端），色阶固定基本 16 色
@@ -1682,6 +1780,170 @@ mod tests {
 
     /// F2（评审遗留）：工具计数按单复数出词——恰好一次是 `1 tool`，其余（含 0）是 `N tools`，
     /// normal 与 debug 两个模式共用同一口径。
+    /// TUI 工具生命周期：`⚙ name — summary` / `✓ name — Done` / `✗ name — Failed`；经典路径不变。
+    #[test]
+    fn tui_flavor_renders_the_tool_lifecycle_with_names() {
+        let (mut renderer, buf) = renderer_tui(OutputMode::Normal);
+        renderer.on_event(&RuntimeEvent::ToolExec {
+            name: "shell_run".into(),
+            summary: "Running ls".into(),
+            args: json!({}),
+            call_id: "c1".into(),
+        });
+        assert_eq!(buf.text(), "⚙ shell_run — Running ls\n");
+        renderer.on_event(&RuntimeEvent::ToolResult {
+            name: "shell_run".into(),
+            ok: true,
+            output: None,
+            call_id: "c1".into(),
+        });
+        let text = buf.text();
+        assert!(
+            text.contains("✓ shell_run — Done · "),
+            "TUI 成功行必须带工具名与终态词：{text:?}"
+        );
+        assert!(!text.contains('→'), "TUI 不再用经典箭头：{text:?}");
+        assert!(!text.contains("  ✓"), "TUI 结果行不再用经典缩进：{text:?}");
+
+        // 失败行用红叉 + Failed + 输出首行预览。
+        let (mut renderer, buf) = renderer_tui(OutputMode::Normal);
+        renderer.on_event(&RuntimeEvent::ToolExec {
+            name: "fs_write".into(),
+            summary: "Writing a.txt".into(),
+            args: json!({}),
+            call_id: "c2".into(),
+        });
+        renderer.on_event(&RuntimeEvent::ToolResult {
+            name: "fs_write".into(),
+            ok: false,
+            output: Some("permission denied".into()),
+            call_id: "c2".into(),
+        });
+        let text = buf.text();
+        assert!(text.contains("✗ fs_write — Failed · "), "{text:?}");
+        assert!(text.contains("    permission denied"), "{text:?}");
+
+        // 经典风味（默认）保持 `→ /   ✓` 的字节契约。
+        let (mut classic, classic_buf, _) =
+            renderer_with(OutputMode::Normal, false, Theme::Dark, NO_WRAP);
+        classic.on_event(&RuntimeEvent::ToolExec {
+            name: "shell_run".into(),
+            summary: "Running ls".into(),
+            args: json!({}),
+            call_id: "c3".into(),
+        });
+        classic.on_event(&RuntimeEvent::ToolResult {
+            name: "shell_run".into(),
+            ok: true,
+            output: None,
+            call_id: "c3".into(),
+        });
+        let classic_text = classic_buf.text();
+        assert!(
+            classic_text.starts_with("→ Running ls\n"),
+            "{classic_text:?}"
+        );
+        assert!(
+            classic_text.contains("  ✓ Running ls · "),
+            "{classic_text:?}"
+        );
+    }
+
+    /// TUI 结束行：✓/✗/◼/! 字形与 classic 相同的信息量。
+    #[test]
+    fn tui_task_end_line_uses_status_glyphs() {
+        let usage = Usage {
+            input_tokens: 1234,
+            output_tokens: 567,
+            estimated: false,
+        };
+        let elapsed = Duration::from_millis(2100);
+        assert_eq!(
+            format_task_end_tui(
+                TASK_ID,
+                RunStatus::Success,
+                elapsed,
+                &usage,
+                &[],
+                3,
+                OutputMode::Normal
+            ),
+            "✓ Done · 2.1s · 3 tools · task 019a1b2c-3d4e"
+        );
+        assert_eq!(
+            format_task_end_tui(
+                TASK_ID,
+                RunStatus::Failed,
+                elapsed,
+                &usage,
+                &[],
+                0,
+                OutputMode::Minimal
+            ),
+            "✗ Failed · 2.1s"
+        );
+        assert_eq!(
+            format_task_end_tui(
+                TASK_ID,
+                RunStatus::Aborted,
+                elapsed,
+                &usage,
+                &[],
+                1,
+                OutputMode::Normal
+            ),
+            "◼ Aborted · 2.1s · 1 tool · task 019a1b2c-3d4e"
+        );
+        let estimated = Usage {
+            input_tokens: 1234,
+            output_tokens: 567,
+            estimated: true,
+        };
+        assert_eq!(
+            format_task_end_tui(
+                TASK_ID,
+                RunStatus::LimitReached,
+                elapsed,
+                &estimated,
+                &["demo".to_string()],
+                2,
+                OutputMode::Debug
+            ),
+            format!(
+                "! Limit reached · 2.1s · 2 tools · tokens ~in=1234 ~out=567 · task {TASK_ID} · skills: demo"
+            )
+        );
+    }
+
+    /// TUI 结束行的状态字形也走调色板：`✓ Done` 整段绿色。
+    #[test]
+    fn tui_status_glyph_is_colored() {
+        let buf = SharedBuf::default();
+        let renderer = Renderer::new(
+            Box::new(buf),
+            RendererOptions {
+                mode: OutputMode::Normal,
+                color: true,
+                theme: Theme::Dark,
+                depth: ColorDepth::Basic16,
+                width: NO_WRAP,
+            },
+            Arc::new(AtomicBool::new(false)),
+        )
+        .with_flavor(RenderFlavor::Tui);
+        let line = format_task_end_tui(
+            TASK_ID,
+            RunStatus::Success,
+            Duration::from_millis(2100),
+            &Usage::default(),
+            &[],
+            0,
+            OutputMode::Normal,
+        );
+        let painted = renderer.paint_status_dot(&line, RunStatus::Success);
+        assert!(painted.starts_with("\x1b[32m✓ Done\x1b[0m"), "{painted:?}");
+    }
+
     #[test]
     fn task_end_line_pluralizes_the_tool_count() {
         let usage = Usage {

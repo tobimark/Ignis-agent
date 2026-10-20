@@ -17,6 +17,8 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+pub mod caps;
+pub mod catalog;
 pub mod claude;
 mod cli_process;
 pub mod codex;
@@ -211,6 +213,12 @@ pub struct ModelConfig {
     pub model: String,
     pub api_key_env: String,
     pub protocol: ModelProtocol,
+    /// 用户显式声明的上下文窗口（tokens）：只覆盖能力解析，不改变内核的字符预算。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    /// 用户显式声明的最大输出（tokens）；与上下文窗口是两个独立字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
 }
 
 impl Default for ModelConfig {
@@ -220,6 +228,8 @@ impl Default for ModelConfig {
             model: "gpt-4o-mini".into(),
             api_key_env: "OPENAI_API_KEY".into(),
             protocol: ModelProtocol::OpenAi,
+            context_window: None,
+            max_output_tokens: None,
         }
     }
 }

@@ -98,6 +98,9 @@ pub struct TaskOutcome {
     /// 值为 `None`。
     pub error: Option<String>,
     pub usage: Usage,
+    /// 最后一轮模型请求的用量（input+output）：上下文占用展示用它，而 [`TaskOutcome::usage`]
+    /// 仍是整轮任务的累计值。外部内核不产生 `Usage` 事件时为 `None`。
+    pub context_usage: Option<Usage>,
     pub messages: Vec<ChatMessage>,
     /// 本次任务真正加载过的技能：事件流里 `load_skill` 调用按首次出现顺序去重（重复加载只记一次）；
     /// 事件流没以 `Done` 收尾时只记已经看到的那些。命令层的结束行据此标注 `skills: …`。
@@ -363,6 +366,8 @@ impl TaskRunner {
         let mut skills_used: Vec<String> = Vec::new();
         // 工具调用计数：每个 `ToolExec` 事件算一次，无终态事件时也带着已看到的那些
         let mut tool_calls: usize = 0;
+        // 最后一轮 Usage：上下文占用与「整轮累计」是两个口径（设计 §4.4）
+        let mut context_usage: Option<Usage> = None;
         let mut stream = self.runtime.run(request, cancel).await;
         while let Some(event) = stream.next().await {
             self.append_jsonl(log, task_id, serde_json::to_value(&event)?)?;
@@ -379,6 +384,12 @@ impl TaskRunner {
                     usage.input_tokens = usage.input_tokens.saturating_add(*input_tokens);
                     usage.output_tokens = usage.output_tokens.saturating_add(*output_tokens);
                     usage.estimated |= *estimated;
+                    // 后到的 Usage 覆盖前一轮：上下文占用看的是「最后一次请求实际带了多少」
+                    context_usage = Some(Usage {
+                        input_tokens: *input_tokens,
+                        output_tokens: *output_tokens,
+                        estimated: *estimated,
+                    });
                 }
                 // 每次 `ToolExec` 都计一次数：不看工具名、不看参数是否合法，也不去重
                 RuntimeEvent::ToolExec { name, args, .. } => {
@@ -456,6 +467,7 @@ impl TaskRunner {
             final_text,
             error,
             usage: *usage,
+            context_usage,
             messages,
             skills_used,
             tool_calls,
@@ -902,6 +914,15 @@ mod tests {
             }
         );
         assert_eq!(
+            report.outcome.context_usage,
+            Some(Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                estimated: false,
+            }),
+            "单轮任务的上下文占用就是这一轮用量"
+        );
+        assert_eq!(
             env.log_path().file_name().unwrap().to_str().unwrap(),
             format!("{}.jsonl", report.outcome.id)
         );
@@ -981,6 +1002,52 @@ mod tests {
             seen[0].system_prompt
         );
         assert!(seen[0].system_prompt.contains("fs_read"));
+    }
+
+    /// 多轮工具调用的 Usage 是两套口径：`usage` 累计整轮，`context_usage` 只留最后一轮
+    /// （状态栏的「当前上下文占用」必须看后者，不能把历史轮次反复累加）。
+    #[tokio::test]
+    async fn context_usage_keeps_the_last_round_while_usage_accumulates() {
+        let events = vec![
+            RuntimeEvent::Usage {
+                input_tokens: 1_000,
+                output_tokens: 200,
+                estimated: false,
+            },
+            RuntimeEvent::ToolExec {
+                name: "fs_read".into(),
+                summary: "Reading a.txt".into(),
+                args: json!({"path": "a.txt"}),
+                call_id: "call_1".into(),
+            },
+            RuntimeEvent::Usage {
+                input_tokens: 2_400,
+                output_tokens: 300,
+                estimated: true,
+            },
+            success(Some("done")),
+        ];
+        let env = Env::new("context-usage", events, None);
+        let report = env.run(env.request("do it")).await;
+
+        assert_eq!(
+            report.outcome.usage,
+            Usage {
+                input_tokens: 3_400,
+                output_tokens: 500,
+                estimated: true,
+            },
+            "整轮累计"
+        );
+        assert_eq!(
+            report.outcome.context_usage,
+            Some(Usage {
+                input_tokens: 2_400,
+                output_tokens: 300,
+                estimated: true,
+            }),
+            "上下文占用只看最后一轮"
+        );
     }
 
     #[tokio::test]

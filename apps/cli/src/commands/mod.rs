@@ -30,14 +30,17 @@ use ignis_core::config::{Config, OutputMode, ensure_home, ignis_home, load_confi
 use ignis_core::learn as core_learn;
 use ignis_core::learn::{LearnError, SkillDraft};
 use ignis_core::memory::MemoryStore;
+use ignis_core::scheduler::{JobProfile, ProfileRisk};
 use ignis_core::security::{ApprovalMode, Policy, Redactor};
 use ignis_core::session::{
     COMPACT_KEEP_TURNS, HistoryMessage, SessionStore, render_transcript, split_turns,
     summarize_turns, summary_message,
 };
-use ignis_core::skills::SkillCatalog;
+use ignis_core::skills::{SkillCatalog, SkillMeta};
 use ignis_core::task::{PromptStats, TaskKind, TaskOutcome, TaskRequest, TaskRunner};
-use ignis_runtime::{ApprovalHandler, ChatMessage, Role, RunStatus, Usage};
+use ignis_core::tools::available_tool_names;
+use ignis_runtime::caps::{ModelCapabilities, ModelCapabilityResolver};
+use ignis_runtime::{ApprovalHandler, ChatMessage, ModelConfig, Role, RunStatus, Usage};
 use ignis_storage::{Db, SessionSummary};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -46,7 +49,8 @@ use tokio_util::sync::CancellationToken;
 use crate::approval::{InteractiveApproval, PolicyOnlyApproval, resolve_mode};
 use crate::cli::Cli;
 use crate::render::{
-    Renderer, RendererOptions, color_depth, format_task_end, resolve_color, width_for_stdout,
+    RenderFlavor, Renderer, RendererOptions, color_depth, format_task_end, format_task_end_tui,
+    resolve_color, width_for_stdout,
 };
 
 use self::kernel::{
@@ -66,6 +70,63 @@ const NO_COMPLETED_TASK: &str = "learn: no completed task to learn from";
 /// 确认面的未来：`BoxFuture<'static, bool>` 的口径。CLI crate 不依赖 `futures`，用 std 拼同一个类型
 /// （零新增依赖）。
 pub type ConfirmLearn = Pin<Box<dyn Future<Output = bool> + Send + 'static>>;
+
+/// 交互模式：Normal 逐次审批，Plan 只读规划，Auto 按预授权策略自主执行。
+///
+/// 三个模式都有真实行为：Plan 由 [`TaskRunner`] 的只读工具 profile 与计划提示共同约束；
+/// Auto 换成 Preauthorized 策略（Dangerous 仍拒绝）；Normal 保持注入的审批面。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InteractionMode {
+    Normal,
+    Plan,
+    Auto,
+}
+
+impl InteractionMode {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Plan => "Plan",
+            Self::Auto => "Auto",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "normal" => Some(Self::Normal),
+            "plan" => Some(Self::Plan),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+}
+
+/// Plan 模式的只读工具边界：模型只能读文件/读技能正文，写文件、跑 shell、抓网页与建调度都被
+/// `ProfileExecutor` 挡住，系统提示里也只出现这几个工具。
+fn plan_profile() -> JobProfile {
+    JobProfile {
+        tools: vec!["fs_read".into(), "fs_list".into(), "load_skill".into()],
+        risk: ProfileRisk::Safe,
+    }
+}
+
+/// Plan 模式的任务前缀：即使模型想跳过边界，也先明确“只规划、不执行副作用”。
+fn plan_prompt(prompt: String) -> String {
+    format!(
+        "Plan mode: produce a concrete step-by-step plan only. Do not modify files, run shell \
+         commands, fetch the network, or create schedules. Read-only tools may be used.\n\n{prompt}"
+    )
+}
+
+/// Auto 模式的策略：与 `--yes` 同一口径（Safe/Elevated 预授权，Dangerous 仍拒绝）。
+fn auto_policy() -> (Arc<Policy>, Arc<dyn ApprovalHandler>) {
+    (
+        Arc::new(Policy::new(ApprovalMode::Preauthorized {
+            unsafe_ops: false,
+        })),
+        Arc::new(PolicyOnlyApproval),
+    )
+}
 
 /// 一次 CLI 会话的共享依赖：`run` 与 REPL 都从这里取当前内核与工作区。
 pub struct Session {
@@ -94,6 +155,8 @@ pub struct Session {
     kernel: String,
     /// 本会话的输出模式：初值取自 `config.ui.output_mode`，`/details` 只改这一份（不写回配置文件）。
     output_mode: OutputMode,
+    /// 本会话的交互模式：`/mode` 只改这一份；Plan/Auto 的真实边界见 [`InteractionMode`]。
+    interaction_mode: InteractionMode,
     /// 会话级模型覆盖（`/model <name>`）：只在 native 内核上生效，也不写回配置文件；
     /// `None` 表示照配置里的 `model.model` 走。
     model_override: Option<String>,
@@ -107,6 +170,14 @@ pub struct Session {
     /// 最近一轮任务的组装统计（`/context` 的 `chars` 与 `prompt` 行）：`None` = 本会话还没跑过
     /// 任务、或最近一次会话切换（`-c` / `/new` / `/resume`）把它清掉了。
     last_prompt_stats: Option<PromptStats>,
+    /// 最后一轮模型请求的用量（当前上下文占用）：`None` = 还没拿到 Provider Usage。
+    last_context_usage: Option<Usage>,
+    /// 模型能力解析器（带缓存；网络探测只在启动/切换模型时发生）。
+    caps: ModelCapabilityResolver,
+    /// 当前模型的能力快照（同步 `/model info` 与 TUI 首帧都读它）。
+    model_caps: Option<ModelCapabilities>,
+    /// 渲染风味：经典路径 Classic；TUI 在启动时切到 Tui。
+    render_flavor: RenderFlavor,
     /// 本会话是否已经做过自拉起提示（每会话至多一次，REPL 跨轮次共享）。
     already_prompted: AtomicBool,
 }
@@ -164,6 +235,11 @@ fn approvals_for(
             Arc::new(PolicyOnlyApproval)
         }
     }
+}
+
+/// 技能扫描目录：项目级 `.ignis/skills` 在前（同名覆盖全局），全局 `~/.ignis/skills` 在后。
+fn skill_dirs(home: &Path, workspace: &Path) -> Vec<PathBuf> {
+    vec![workspace.join(".ignis/skills"), home.join("skills")]
 }
 
 impl Session {
@@ -224,10 +300,16 @@ impl Session {
         // 选定内核先构造一次：缺二进制的错误在碰记忆库与第一轮任务之前就变成人话（构造开销小）
         mk_runtime(kernel, &config, &workspace).map_err(anyhow::Error::msg)?;
 
-        // 记忆与技能目录都落在 `~/.ignis` 下：每轮任务的运行器在组装期把已知事实与技能目录注入
-        // 系统提示，也把 `remember`/`load_skill`/`notify_user`/`schedule_create` 四个元工具挂进注册表
+        // 记忆落在 `~/.ignis`；技能同时扫描项目级 `.ignis/skills` 与全局 `~/.ignis/skills`
+        //（项目目录在前，同名项目技能覆盖全局）。每轮任务的运行器在组装期把已知事实与技能目录
+        // 注入系统提示，也把 `remember`/`load_skill`/`notify_user`/`schedule_create` 四个元工具
+        // 挂进注册表。
         let memory = MemoryStore::new(Arc::clone(&db), home.join("memory"));
-        let skills = SkillCatalog::load(&home.join("skills"));
+        let skills = SkillCatalog::load_all(&skill_dirs(&home, &workspace));
+        // 首帧的同步能力快照先算好：config 随后会被移进 Session。通用目录在首次
+        // `refresh_model_capabilities` 时读缓存/拉取 models.dev。
+        let model_caps = ModelCapabilities::static_resolve(&config.model);
+        let catalog_cache = home.join("model_catalog.json");
 
         Ok(Self {
             log_dir: home.join("logs"),
@@ -244,11 +326,16 @@ impl Session {
             notifier: Arc::new(MultiNotifier::new(Vec::new())),
             kernel: kernel.to_string(),
             output_mode,
+            interaction_mode: InteractionMode::Normal,
             model_override: None,
             history: Vec::new(),
             current_session: None,
             last_usage: None,
             last_prompt_stats: None,
+            last_context_usage: None,
+            caps: ModelCapabilityResolver::with_catalog_cache(catalog_cache),
+            model_caps: Some(model_caps),
+            render_flavor: RenderFlavor::Classic,
             already_prompted: AtomicBool::new(false),
         })
     }
@@ -298,6 +385,65 @@ impl Session {
     /// 设置会话级模型覆盖（`/model <name>`）：只影响本会话的后续任务，不写回配置文件。
     pub fn set_model(&mut self, name: &str) {
         self.model_override = Some(name.to_string());
+    }
+
+    /// 当前生效的模型配置（会话级覆盖已应用；能力解析与 `/model info` 都读它）。
+    pub fn model_config(&self) -> ModelConfig {
+        let mut config = self.config.model.clone();
+        config.model = self.model().to_string();
+        config
+    }
+
+    /// Provider 展示名（OpenAI / OpenRouter / Anthropic / Gemini / Ollama / vLLM / …）。
+    pub fn model_provider(&self) -> String {
+        self.model_capabilities().provider
+    }
+
+    /// 当前模型能力快照：有异步探测结果时用它，否则退回 Registry + 用户配置的同步解析。
+    pub fn model_capabilities(&self) -> ModelCapabilities {
+        self.model_caps
+            .clone()
+            .unwrap_or_else(|| ModelCapabilities::static_resolve(&self.model_config()))
+    }
+
+    /// 重新解析模型能力（启动、`/model` 切换之后调用）。
+    ///
+    /// native 才会做网络探测；外部内核用自己的默认模型，Ignis 这边的窗口对它没有意义。
+    /// 缓存 key 包含 base_url/model/用户覆盖，旧模型的条目不会误用到新模型。
+    pub async fn refresh_model_capabilities(&mut self) -> ModelCapabilities {
+        let config = self.model_config();
+        let caps = if self.is_native() {
+            self.caps.resolve(&config).await
+        } else {
+            ModelCapabilities::static_resolve(&config)
+        };
+        self.model_caps = Some(caps.clone());
+        caps
+    }
+
+    /// 最后一轮模型请求的用量（当前上下文占用）；外部内核没有 Usage 时为 `None`。
+    pub fn last_context_usage(&self) -> Option<&Usage> {
+        self.last_context_usage.as_ref()
+    }
+
+    /// 一轮任务可用的真实工具名（内置 + 元工具；与模型看到的注册表同源）。
+    pub fn tool_names(&self) -> Vec<String> {
+        available_tool_names()
+    }
+
+    /// 当前技能目录的元信息（名称 / 描述 / 来源），供欢迎面板与 `/skills` 共用。
+    pub fn skill_metas(&self) -> Vec<SkillMeta> {
+        self.skills().metas().to_vec()
+    }
+
+    /// active 记忆事实条数；读库失败时 `None`（UI 显示 `--`，不打印 warning 污染 TUI）。
+    pub fn memory_count(&self) -> Option<usize> {
+        self.memory.list(false).ok().map(|facts| facts.len())
+    }
+
+    /// TUI 启动时切到 `Tui`；经典 REPL 不调用，保持 `Classic` 的逐字节输出。
+    pub fn set_render_flavor(&mut self, flavor: RenderFlavor) {
+        self.render_flavor = flavor;
     }
 
     /// 本会话的输出模式（初值来自 `config.ui.output_mode`，`/details` 可切）。
@@ -381,6 +527,7 @@ impl Session {
     fn clear_turn_state(&mut self) {
         self.last_usage = None;
         self.last_prompt_stats = None;
+        self.last_context_usage = None;
     }
 
     /// 换上一段会话（`-c` 与 `/resume` 共用）：当前会话指针与 canonical 历史成对更新，最近一轮的
@@ -698,14 +845,29 @@ impl Session {
         Arc::clone(&guard)
     }
 
-    /// 重扫 `~/.ignis/skills` + 内置技能，换掉会话里的那一份；返回新目录的技能条数
-    /// （`metas().len()`，覆盖后仍是合并后的条数）。
+    /// 当前交互模式（TUI 状态行与 `/mode` 共用）。
+    pub(crate) fn interaction_mode(&self) -> InteractionMode {
+        self.interaction_mode
+    }
+
+    /// 切换交互模式。Plan/Auto 需要 native 工具执行面；外部内核没有 Ignis 工具，不能假装
+    /// 有边界，直接拒绝。
+    pub(crate) fn set_interaction_mode(&mut self, mode: InteractionMode) -> Result<(), String> {
+        if mode != InteractionMode::Normal && !self.is_native() {
+            return Err("mode: plan/auto requires native kernel".to_string());
+        }
+        self.interaction_mode = mode;
+        Ok(())
+    }
+
+    /// 重扫项目级 `.ignis/skills` + `~/.ignis/skills` + 内置技能，换掉会话里的那一份；
+    /// 返回新目录的技能条数（`metas().len()`，覆盖后仍是合并后的条数）。
     ///
-    /// 目录来源与会话构造同一处（`self.home.join("skills")`）：`/skills reload` 认的就是这份
-    /// 安装的数据目录。已经在跑的那一轮任务握着自己那份快照（[`Session::run_task`] 每轮取一次），
-    /// 换掉的只影响后续轮次与之后的 `/skills`。锁中毒同样只取回内部值。
+    /// 目录来源与会话构造同一处（[`skill_dirs`]）：`/skills reload` 认的就是这两份目录。
+    /// 已经在跑的那一轮任务握着自己那份快照（[`Session::run_task`] 每轮取一次），换掉的只影响
+    /// 后续轮次与之后的 `/skills`。锁中毒同样只取回内部值。
     pub(crate) fn reload_skills(&mut self) -> usize {
-        let catalog = SkillCatalog::load(&self.home.join("skills"));
+        let catalog = SkillCatalog::load_all(&skill_dirs(&self.home, &self.workspace));
         let count = catalog.metas().len();
         let mut guard = self
             .skills
@@ -823,6 +985,12 @@ impl Session {
     ) -> Result<TaskOutcome> {
         // 输出面拆成两份共享它的句柄：渲染器拿一份，结束行与自拉起提示拿另一份（写序不变）
         let (render_out, mut out) = shared_writer(out);
+        // Plan 模式的任务前缀：真实工具边界在下面 `plan_profile`，这里负责把“只规划”说清楚。
+        let prompt = if self.interaction_mode == InteractionMode::Plan {
+            plan_prompt(prompt)
+        } else {
+            prompt
+        };
         // C1：提示词先过会话面的脱敏器再用——标题（`ensure_session`）、轮次落库（`append_turn`）
         // 与送给运行器的 `TaskRequest` 都取这一份（运行器入口另有一道同源脱敏，重复替换幂等），
         // 三面同源；提示词里的已知密钥因此既到不了模型，也写不进 `sessions.title` /
@@ -846,18 +1014,25 @@ impl Session {
             mk_runtime(&self.kernel, &config, &self.workspace).map_err(anyhow::Error::msg)?;
         // 技能目录每轮只取一次快照：这一轮运行期间 `/skills reload` 换掉的是下一轮的目录
         let skills = self.skills();
+        // Auto 换掉审批策略（Dangerous 仍拒绝）；Normal/Plan 继续用会话注入的审批面。
+        let (policy, approvals) = if self.interaction_mode == InteractionMode::Auto {
+            auto_policy()
+        } else {
+            (Arc::clone(&self.policy), Arc::clone(&self.approvals))
+        };
+        // Plan 的执行边界：只读工具 profile 包在真实执行器外，白名单外的工具既不可见也调不动。
+        let profile = (self.interaction_mode == InteractionMode::Plan).then(plan_profile);
         let runner = TaskRunner::new(
             Arc::clone(&self.db),
             Arc::clone(&config),
             runtime,
-            Arc::clone(&self.policy),
-            Arc::clone(&self.approvals),
+            policy,
+            approvals,
             self.log_dir.clone(),
             Arc::clone(&self.memory),
             Arc::clone(&skills),
             Arc::clone(&self.notifier),
-            // CLI 交互运行没有 job profile：执行器不包白名单（调度运行由守护进程注入）
-            None,
+            profile,
         );
 
         let (sink, mut events) = mpsc::unbounded_channel();
@@ -870,7 +1045,8 @@ impl Session {
             // 非 UTF-8 的取值照样算「已设置」：转换在 `no_color_value` 里做有损解码
             no_color_value(std::env::var_os("NO_COLOR")).as_deref(),
         );
-        let mut renderer = Renderer::new(render_out, options, Arc::clone(&saw_schedule_create));
+        let mut renderer = Renderer::new(render_out, options, Arc::clone(&saw_schedule_create))
+            .with_flavor(self.render_flavor);
 
         let cancel = CancellationToken::new();
         let watcher = spawn_ctrl_c_watcher(cancel.clone());
@@ -917,6 +1093,7 @@ impl Session {
         self.history = outcome.messages.clone();
         self.last_usage = Some(outcome.usage);
         self.last_prompt_stats = Some(outcome.stats);
+        self.last_context_usage = outcome.context_usage;
         // 轮次落库：只追加 REPL 的一轮（user + 有最终答复时的 assistant），写库失败 fail-soft
         if kind == TaskKind::Repl
             && let Some(session_id) = session_id.as_deref()
@@ -928,8 +1105,8 @@ impl Session {
         }
         // 结束行的状态点按终态着色（Done 绿 / Failed 红 / Aborted 与 Limit reached 黄）：着色只
         // 包 `● {状态词}` 这一整段，`● Done` 锚点子串保持连续；`color=false` 时逐字不变
-        let end_line = renderer.paint_status_dot(
-            &format_task_end(
+        let summary = match self.render_flavor {
+            RenderFlavor::Classic => format_task_end(
                 &outcome.id,
                 outcome.status,
                 started.elapsed(),
@@ -938,8 +1115,17 @@ impl Session {
                 outcome.tool_calls,
                 options.mode,
             ),
-            outcome.status,
-        );
+            RenderFlavor::Tui => format_task_end_tui(
+                &outcome.id,
+                outcome.status,
+                started.elapsed(),
+                &outcome.usage,
+                &outcome.skills_used,
+                outcome.tool_calls,
+                options.mode,
+            ),
+        };
+        let end_line = renderer.paint_status_dot(&summary, outcome.status);
         let _ = writeln!(out, "{end_line}");
         // 非成功终态不能只留一个状态词：原因（内核给出、已过 Redactor）打到错误面，与
         // `main` 的错误行同形。任务 id 已在结束行里，随后可直接 `ignis task show {id}`。
@@ -1170,6 +1356,7 @@ pub(crate) mod fixtures {
         let home = home.to_path_buf();
         let db = Arc::new(Db::open(&home.join("ignis.db")).unwrap());
         let output_mode = config.ui.output_mode;
+        let model_caps = ModelCapabilities::static_resolve(&config.model);
         Session {
             home: home.clone(),
             workspace: home.clone(),
@@ -1184,9 +1371,14 @@ pub(crate) mod fixtures {
             kernel: kernel.to_string(),
             already_prompted: AtomicBool::new(false),
             output_mode,
+            interaction_mode: InteractionMode::Normal,
             model_override: None,
             last_usage: None,
             last_prompt_stats: None,
+            last_context_usage: None,
+            caps: ModelCapabilityResolver::new(),
+            model_caps: Some(model_caps),
+            render_flavor: RenderFlavor::Classic,
             history: Vec::new(),
             current_session: None,
         }
@@ -1209,6 +1401,43 @@ mod tests {
     };
     use super::*;
     use crate::commands::kernel::fixtures::{TempDir, set_executable};
+
+    /// 三种交互模式都有真实执行边界：Plan 的只读白名单 + 提示、Auto 的预授权策略。
+    #[test]
+    fn interaction_modes_have_real_execution_boundaries() {
+        assert_eq!(
+            InteractionMode::parse("normal"),
+            Some(InteractionMode::Normal)
+        );
+        assert_eq!(InteractionMode::parse("plan"), Some(InteractionMode::Plan));
+        assert_eq!(InteractionMode::parse("auto"), Some(InteractionMode::Auto));
+        assert_eq!(InteractionMode::parse("turbo"), None);
+
+        let plan = plan_profile();
+        assert_eq!(plan.risk, ProfileRisk::Safe);
+        assert_eq!(
+            plan.tools,
+            ["fs_read", "fs_list", "load_skill"],
+            "Plan 不能看到写文件/Shell/网络/调度工具"
+        );
+        let prompt = plan_prompt("refactor the parser".into());
+        assert!(prompt.starts_with("Plan mode:"), "{prompt}");
+        assert!(prompt.ends_with("refactor the parser"), "{prompt}");
+
+        let (policy, _) = auto_policy();
+        assert_eq!(
+            policy.mode(),
+            ApprovalMode::Preauthorized { unsafe_ops: false }
+        );
+        assert_eq!(
+            policy.decide(RiskLevel::Elevated, "fs_write"),
+            ignis_core::security::PolicyDecision::Allow
+        );
+        assert!(matches!(
+            policy.decide(RiskLevel::Dangerous, "shell_run"),
+            ignis_core::security::PolicyDecision::Deny(_)
+        ));
+    }
 
     /// 父子两个用例共享的环境变量名：父用例只在拉起子进程时设它，子探针只在它存在时才真的
     /// `raise`——`cargo test -- --ignored`（或 `--include-ignored`）之类的全量扫描即使扫到

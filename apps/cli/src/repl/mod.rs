@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::brand;
 use crate::cli::Cli;
-use crate::commands::slash::{self, Dispatch, Parsed};
+use crate::commands::slash::{self, Dispatch, Parsed, Slash};
 use crate::commands::{
     Session, install_ctrl_c_handler, kernel_note, no_color_value, spawn_ctrl_c_watcher,
 };
@@ -291,57 +291,83 @@ async fn repl_loop(session: &mut Session, reader: Arc<dyn LineReader>) -> Result
             return Ok(ExitCode::SUCCESS);
         };
 
-        // 本地分类：空行跳过；未知命令只在本地报错（v0.1 里它们会被当成任务送给模型）
-        match slash::parse(&line) {
+        // 本地分类：空行跳过；未知命令只在本地报错（v0.1 里它们会被当成任务送给模型）。
+        // 技能目录是会话快照，分类时先借出来、再进可变的命令/任务分支。
+        let parsed = {
+            let skills = session.skills();
+            slash::parse_with_skills(&line, &skills)
+        };
+        match parsed {
             Parsed::Empty => {}
             Parsed::Unknown(name) => eprintln!("{}", slash::unknown_command_line(&name)),
-            Parsed::Command(command, args) => match slash::dispatch(session, command, &args) {
-                Ok(Dispatch::Exit) => return Ok(ExitCode::SUCCESS),
-                Ok(Dispatch::Lines(lines)) => {
-                    for line in lines {
-                        println!("{line}");
-                    }
+            Parsed::Command(command, args) => {
+                // `/model info` 读的是当前模型的能力：先刷新一次。`/model <name>` 与 `/kernel`
+                // 可能在分发里改状态，成功/失败都刷新一次（失败时用的是未变的那份配置）。
+                let model_info =
+                    command == Slash::Model && args.first().is_some_and(|arg| arg == "info");
+                if model_info {
+                    session.refresh_model_capabilities().await;
                 }
-                // `/compact` 需要模型往返：分发只交回意图，这里 `await` 真正的执行
-                // （成功打 stdout；错误与命令自己的错误同形，打到 stderr）。执行期间挂与任务轮次
-                // 同款的 Ctrl-C 监听：取消令牌传进摘要请求，Ctrl-C 能当场中止（内核收成
-                // `Done{Aborted}`，`Session::compact` 交回 `error: compact: summarization failed:
-                // aborted` 且不改状态）；执行结束（无论成败）立刻收掉监听任务。
-                Ok(Dispatch::Compact) => {
-                    let cancel = CancellationToken::new();
-                    let watcher = spawn_ctrl_c_watcher(cancel.clone());
-                    let compacted = session.compact(cancel).await;
-                    watcher.abort();
-                    match compacted {
-                        Ok(lines) => {
-                            for line in lines {
-                                println!("{line}");
-                            }
+                let result = slash::dispatch(session, command, &args);
+                if command == Slash::Kernel
+                    || (command == Slash::Model && !args.is_empty() && !model_info)
+                {
+                    session.refresh_model_capabilities().await;
+                }
+                match result {
+                    Ok(Dispatch::Exit) => return Ok(ExitCode::SUCCESS),
+                    Ok(Dispatch::Lines(lines)) => {
+                        for line in lines {
+                            println!("{line}");
                         }
-                        Err(error) => eprintln!("error: {error}"),
                     }
-                }
-                // `/learn` 与 `/compact` 同款：草稿请求也可被 Ctrl-C 中止（取消令牌直达无工具请求），
-                // 确认读的是真 stdin（canonical 模式下的读一行，与审批同一时机）。成功打 stdout
-                // （落盘回显或 `discarded`），错误打 stderr——生成/校验/落盘失败都不写一个字节。
-                Ok(Dispatch::Learn(arg)) => {
-                    let cancel = CancellationToken::new();
-                    let watcher = spawn_ctrl_c_watcher(cancel.clone());
-                    let learned = session.learn(arg.as_deref(), cancel).await;
-                    watcher.abort();
-                    match learned {
-                        Ok(lines) => {
-                            for line in lines {
-                                println!("{line}");
+                    // `/compact` 需要模型往返：分发只交回意图，这里 `await` 真正的执行
+                    // （成功打 stdout；错误与命令自己的错误同形，打到 stderr）。执行期间挂与任务轮次
+                    // 同款的 Ctrl-C 监听：取消令牌传进摘要请求，Ctrl-C 能当场中止（内核收成
+                    // `Done{Aborted}`，`Session::compact` 交回 `error: compact: summarization failed:
+                    // aborted` 且不改状态）；执行结束（无论成败）立刻收掉监听任务。
+                    Ok(Dispatch::Compact) => {
+                        let cancel = CancellationToken::new();
+                        let watcher = spawn_ctrl_c_watcher(cancel.clone());
+                        let compacted = session.compact(cancel).await;
+                        watcher.abort();
+                        match compacted {
+                            Ok(lines) => {
+                                for line in lines {
+                                    println!("{line}");
+                                }
                             }
+                            Err(error) => eprintln!("error: {error}"),
                         }
-                        Err(error) => eprintln!("error: {error}"),
                     }
+                    // `/learn` 与 `/compact` 同款：草稿请求也可被 Ctrl-C 中止（取消令牌直达无工具请求），
+                    // 确认读的是真 stdin（canonical 模式下的读一行，与审批同一时机）。成功打 stdout
+                    // （落盘回显或 `discarded`），错误打 stderr——生成/校验/落盘失败都不写一个字节。
+                    Ok(Dispatch::Learn(arg)) => {
+                        let cancel = CancellationToken::new();
+                        let watcher = spawn_ctrl_c_watcher(cancel.clone());
+                        let learned = session.learn(arg.as_deref(), cancel).await;
+                        watcher.abort();
+                        match learned {
+                            Ok(lines) => {
+                                for line in lines {
+                                    println!("{line}");
+                                }
+                            }
+                            Err(error) => eprintln!("error: {error}"),
+                        }
+                    }
+                    // 命令自己的错误（内核名非法、取值不对、尚未实现的命令）打到 stderr，
+                    // 与 `main` 的错误行同形
+                    Err(error) => eprintln!("error: {error}"),
                 }
-                // 命令自己的错误（内核名非法、取值不对、尚未实现的命令）打到 stderr，
-                // 与 `main` 的错误行同形
-                Err(error) => eprintln!("error: {error}"),
-            },
+            }
+            Parsed::Skill(name, prompt) => {
+                session
+                    .run_task(slash::skill_task_prompt(&name, &prompt), TaskKind::Repl)
+                    .await?;
+                println!();
+            }
             Parsed::Task(prompt) => {
                 session.run_task(prompt, TaskKind::Repl).await?;
                 // 轮次之间空一行：上一轮的结束行与下一轮的提示符不至于粘在一起

@@ -2,7 +2,7 @@
 
 **Ignis 是一个用 Rust 从零实现执行循环的本地个人 AI Agent**：单二进制 CLI，可切换执行内核（`native` / `codex` / `claude`），具备长期记忆、技能与后台定时任务，能把真实任务做完（读写文件、跑 Shell、抓网页），而不是只聊天。
 
-**v0.2（版本号 `0.2.0`，主题 *Interactive & Persistent*）** 在 v0.1 的「能跑、能记、能调度」之上补齐终端交互与持久化：流式渲染 + 推理/正文分道、多行行编辑器、15 个本地斜杠命令、可恢复的持久会话、上下文可视化与压缩，以及全屏 TUI Beta（`ignis --tui`）。
+**当前版本 `0.2.2`（v0.2 主题 *Interactive & Persistent*）** 在 v0.1 的「能跑、能记、能调度」之上补齐终端交互与持久化：流式渲染 + 推理/正文分道、多行行编辑器、17 个本地斜杠命令、可恢复的持久会话、上下文可视化与压缩，以及全屏 TUI（`ignis --tui`）；0.2.1 升级了 TUI 的品牌横幅、欢迎面板、实时状态栏与模型上下文窗口解析，0.2.2 增加 Ctrl+P 命令面板、技能感知的 `/` 补全、统一 Agent 状态语言、Normal/Plan/Auto 交互模式与按需 `/usage` 面板。
 
 - **Rust**（edition 2024，MSRV 1.98；`rust-toolchain.toml` 固定 `stable`）
 - **单二进制** `ignis`（glibc 基线，无运行时依赖；内置技能编译进二进制）
@@ -15,11 +15,12 @@
 
 - **渲染**：模型输出的 Markdown 子集（围栏代码块、`#`–`####` 标题、`- `/`* ` 无序列表、`> ` 引用、`---` 分隔线、行内 `` `code` `` 与 `**粗体**`；表格 / 链接 / 图片 / 斜体原样通过）；推理（`think`）与正文**分道渲染**——normal 以 `· ` 起行、debug 加 `[reasoning] ` 前缀、minimal 只给收尾摘要行；输出模式 `minimal` / `normal` / `debug`（`/details` 或 `ui.output_mode` 切换）；主题 dark / light + 无色（`ui.theme`、`ui.color`、`NO_COLOR`）。
 - **输入**：多行编辑（`Alt+Enter` / `Ctrl+J` 换行）、历史（`~/.ignis/history`）、Tab 补全（命令名与 `/kernel` 取值）、bracketed paste（整段粘贴不被当成逐行提交）、按显示宽度折行与 CJK 全角宽度（`\t` 只按 8 列制表位展开到屏幕）；raw mode 不可用（`TERM` 缺失 / `dumb`、stdout 不是终端）时回退按行输入，并打一行 `note: line editing unavailable (<原因>); using plain line input`。
-- **命令**：15 个本地斜杠命令（分组、顺序与文案见[命令参考](#命令参考)，以 `/help` 为准）；除 `/compact`、`/learn` 各要一次模型往返外，其余 13 条全在本地完成、不消耗模型；未知命令只在本地报错（`Unknown command: /<名字> — /help lists commands`，绝不送给模型）。
+- **命令**：17 个本地斜杠命令（分组、顺序与文案见[命令参考](#命令参考)，以 `/help` 为准）；除 `/compact`、`/learn` 各要一次模型往返外，其余 15 条全在本地完成、不消耗模型；未知命令只在本地报错（`Unknown command: /<名字> — /help lists commands`，绝不送给模型）。发现后的技能也可以 `/<name> <task>` 直接调用。
 - **会话**：`-c` / `--continue` 恢复本工作区最近一次会话；REPL 里 `/new` 开新会话、`/sessions` 列最近会话、`/resume <id>`（≥8 字符唯一前缀）切换；canonical 历史（用户提示词 + assistant 最终答复）按轮落库、`tasks.session_id` 记下每轮任务归属。
-- **上下文**：`/context` 只读展示历史条数与字符、字符预算、最近一轮用量与组装统计（facts / skills / system chars）；`/compact` 把较早轮次摘要化（保留最近两轮，原始消息不删）。
-- **记忆·技能**：`/memory <list|search|add|edit|delete>`（与 `ignis memory …` 同一份口径）；`remember` 元工具成功后固定打一行确认 `  ✓ memory: <key> (<scope>) <文本 ≤60 字符>`；`/skills [reload]` 列技能目录或重扫；实验性 `/learn [task-id]` 从一条已完成任务生成 `SKILL.md` 草稿，**确认后**才落盘（不自动部署、不自动执行）。
-- **TUI Beta**：`ignis --tui` 全屏界面（备用屏 + 帧合成，复用同一套 markdown / 宽度 / 调色板与命令分发）；不满足条件时只打一行 note 并降级到经典 REPL。
+- **上下文**：`/context` 只读展示历史条数与字符、字符预算、最近一轮用量与组装统计（facts / skills / system chars）；`/compact` 把较早轮次摘要化（保留最近两轮，原始消息不删）。TUI 额外展示自动解析的**模型上下文窗口**（tokens）与实时占用/进度条；`/model info` 展示 Provider、原生窗口、Runtime/用户限制、有效限制与来源。
+- **记忆·技能**：`/memory <list|search|add|edit|delete>`（与 `ignis memory …` 同一份口径）；`remember` 元工具成功后固定打一行确认 `  ✓ memory: <key> (<scope>) <文本 ≤60 字符>`；`/skills [reload]` 列技能目录或重扫；技能来自内置、项目级 `.ignis/skills` 与全局 `~/.ignis/skills`（目录符号链接会被跟随，悬空链接在 `/skills` 里告警），发现后可用 `/<name> <task>` 调用（模型先 `load_skill` 读全文）；实验性 `/learn [task-id]` 从一条已完成任务生成 `SKILL.md` 草稿，**确认后**才落盘（不自动部署、不自动执行）。
+- **TUI（0.2.1/0.2.2）**：`ignis --tui` 全屏界面（备用屏 + 帧合成，复用同一套 markdown / 宽度 / 调色板与命令分发）；启动显示大型 `IGNIS` 渐变横幅、火焰缩略图与双栏欢迎面板（真实 Model / Provider / Workspace / Session / Runtime / Memory / Tools / Skills），输入区上方是实时模型/上下文/Agent 状态行；输入区是动态高度：空输入只占一行 `❯`，超过终端宽度的长行按显示宽度折行（续行 `… `），多行输入显示 1–2 行正文，Tab/斜杠提示非空时再加一行；空输入状态栏提示 `Type a task · / commands · Ctrl+P palette`。`Ctrl+P` 打开可搜索命令/技能面板（选中填入输入区，回车执行）；`/` 补全同时包含静态命令与已发现技能。滚动区用 `◈ Thinking…` / `◉ Response` 段标区分思考与正文，状态语言统一为 `Ready / Thinking / Executing / Waiting / Scheduled / Failed / Completed`（审批期 Waiting，调度任务成功收尾 Scheduled）。`/usage` 按需展示窗口/来源与真实 Provider 用量。`--tui -c` 命中时会把 canonical 历史重放进滚动区（不会只显示欢迎面板）；不满足条件时只打一行 note 并降级到经典 REPL。
+- **TUI 品牌**：首页标语 `Your Heraclitus.` / `Fire, With Intent.` / `Ever-Living Fire.`；侧边火焰来自 `assets/ignis-sidebar-truecolor.ans`（11×16 truecolor，按高度采样 4–11 行；Basic16/无色档零 SGR）。经典 REPL 的旧火焰与逐字节输出保持不变。
 
 ## 设计理念：remember, act, improve
 
@@ -122,7 +123,7 @@ ignis memory search <query>            # 按关键词检索事实
 ignis memory add --scope <user|project|global> --key <k> <text>   # 同 key 再写一次即取代旧值
 ignis memory edit <id> <text>          # 改写一条事实
 ignis memory delete <id>               # 删除一条事实
-ignis skills list                      # 列出技能（内置 + ~/.ignis/skills，按名称排序）
+ignis skills list                      # 列出技能（内置 + 项目 .ignis/skills + ~/.ignis/skills）
 ignis doctor                           # 环境自检（含 codex / claude 探测）
 ignis daemon start [--foreground] | stop | status   # 调度守护进程（start 默认后台自守护）
 ignis schedule list | pause <id> | resume <id> | remove <id> | history [<id>] [--limit N]
@@ -135,10 +136,13 @@ REPL 专属开关（与任何子命令同用是用法错误，退出码 1）：
 
 | 开关 | 作用 |
 |---|---|
-| `-c` / `--continue` | 恢复**本工作区**最近一次会话并装载 canonical 历史；没有旧会话时打 `note: no previous session in this workspace; starting a new one` 后照常起步 |
+| `-c` / `--continue` | 恢复**本工作区**最近一次会话并装载 canonical 历史；TUI 会把历史重放进滚动区；没有旧会话时打 `note: no previous session in this workspace; starting a new one` 后照常起步 |
 | `--tui` | 用全屏 TUI（Beta）进入 REPL；不满足条件时打一行 `note: TUI unavailable (<原因>); falling back to the classic REPL` 并降级到经典 REPL |
 
 `-c` 只是恢复会话，不删数据；`--tui` **不**默认恢复会话——要恢复就 `ignis --tui -c`。
+`-c` 的作用域是**当前 workspace**：从不同目录运行会恢复那个目录的会话（或没有会话）。
+要恢复 `ignis-test` 的会话，请在 `/home/tobi/workspace/ignis-test` 下运行，或显式加
+`--workspace /home/tobi/workspace/ignis-test`；也可以把该路径写进 `workspace_root` 固定默认值。
 
 ### 斜杠命令（15 个，`/help` 为准）
 
@@ -149,12 +153,15 @@ REPL 专属开关（与任何子命令同用是用法错误，退出码 1）：
 | SESSION | `/new` | Start a new session |
 | SESSION | `/sessions` | List recent sessions in this workspace |
 | SESSION | `/resume <id>` | Resume a session from this workspace |
-| AGENT | `/model [name]` | Show or set the model of this session |
+| AGENT | `/model [name\|info]` | Show model capabilities, or set the session model |
 | AGENT | `/status` | Show kernel, model, workspace, alerts and last usage |
 | AGENT | `/tasks [N]` | List the most recent tasks (default 10) |
 | AGENT | `/skills [reload]` | List the skill catalog, or reload it |
+| AGENT | `/<skill-name> <task>` | Invoke a discovered skill (load it, then run the task) |
+| AGENT | `/mode [normal\|plan\|auto]` | Show or set the interaction mode |
 | INTELLIGENCE | `/memory <list\|search\|add\|edit\|delete>` | Read or edit long-term memory |
 | INTELLIGENCE | `/context` | Show the context budget and the last turn usage |
+| INTELLIGENCE | `/usage` | Show context window, source and provider usage |
 | INTELLIGENCE | `/compact` | Summarize older turns into a summary message |
 | INTELLIGENCE | `/learn [task-id]` | Draft a skill from a completed task |
 | INTERFACE | `/details [minimal\|normal\|debug]` | Show or switch the output mode |
@@ -162,11 +169,59 @@ REPL 专属开关（与任何子命令同用是用法错误，退出码 1）：
 | INTERFACE | `/help` | Show this list |
 | INTERFACE | `/kernel [name]` | Show or switch the execution kernel (native\|codex\|claude) |
 
-`/compact` 与 `/learn` 各要一次**无工具的 native 请求**（`config.model` + Ignis 凭据）：外置内核或没有 Ignis 凭据时报 `error: compact requires native kernel credentials (current kernel does not provide them)` / `error: learn requires native kernel credentials (current kernel does not provide them)`，且不改状态。其余 13 条命令全在本地完成（`/context` 只读、不消耗模型）。
+`/compact` 与 `/learn` 各要一次**无工具的 native 请求**（`config.model` + Ignis 凭据）：外置内核或没有 Ignis 凭据时报 `error: compact requires native kernel credentials (current kernel does not provide them)` / `error: learn requires native kernel credentials (current kernel does not provide them)`，且不改状态。其余 15 条静态命令全在本地完成（`/context` 与 `/usage` 只读、不消耗模型）。
+
+交互模式（`/mode`）：
+- `Normal`：逐次审批，保持 TUI 内联确认面板。
+- `Plan`：只读规划。模型只看到 `fs_read` / `fs_list` / `load_skill`，并收到“只规划、不执行副作用”的任务前缀；写文件、Shell、网络与调度工具由执行器白名单挡住。
+- `Auto`：按明确策略自主执行。Safe/Elevated 自动放行，Dangerous 仍拒绝（与 `--yes` 同一口径，不冒充 `--unsafe`）；仅 native 内核可用。
+
+`/usage` 只展示能说清来源的数字：有效窗口与来源（Runtime/Provider/Catalog/Registry/User config）、最近一次 Provider 输入 token、最后一轮 in/out、历史条数与字符预算。Provider 没提供的缓存、累计费用与压缩记录不伪造。
+
+技能命令（`/<skill-name> <task>`）不在这张静态表里：首词命中当前技能目录时才生效，命令表优先；它会把任务转成“先 `load_skill` 读全文，再按技能执行”，因此需要一次真实任务轮次。技能目录的扫描顺序是内置 → 项目级 `<workspace>/.ignis/skills` → 全局 `~/.ignis/skills`（同名项目技能覆盖全局），目录符号链接会被跟随。
+
+### 模型上下文窗口与 `/model info`
+
+Ignis 在启动/切换模型时按固定优先级解析当前模型的能力：
+
+1. **Runtime API**：vLLM `/models` 的 `max_model_len`、Ollama `/api/show` 的 `num_ctx` / `*.context_length`；
+2. **Provider API**：OpenRouter `/models` 的 `context_length` 与 `top_provider.max_completion_tokens`；
+3. **通用模型目录**：models.dev 的 `provider/model → limit.context/output`（首次拉取，
+   缓存到 `~/.ignis/model_catalog.json`，24h TTL；离线回退旧缓存/内置 Registry）；
+4. **本地 Registry**：OpenAI / Anthropic / Gemini 等常见模型的发布窗口（离线兜底）；
+5. **用户配置**：`model.context_window` / `model.max_output_tokens`（作为窗口上限/显式声明）；
+6. **Unknown**：无法可靠确定时不猜、不默认 200K，UI 显示 `?` / `--`。
+
+目录查找先用 `base_url` 的 host 匹配 Provider（例如 `api.minimax.cn` → `minimax`），再按
+`provider/model` 精确匹配；多 Provider 同名模型值冲突时显示 Unknown，不猜。删除
+`~/.ignis/model_catalog.json` 可以强制下次启动重新拉取目录。
+
+**上下文窗口 ≠ 最大输出**：两个字段独立展示；有效窗口取 `min(原生窗口, Runtime 限制, 用户上限)`。
+TUI 运行状态行显示 `ctx 12.5K/128K [██░░░░░░░░] 10%`；Provider 返回 Usage 时用真实值，
+尚未返回时用字符数估算并明确标 `≈`；窗口未知时显示 `ctx 12.5K/? [----------] --`。
+`/model info` 展示来源与有效限制。直连 MiniMax-M3 的真实输出：
+
+```text
+Model Information
+───────────────────────────────────
+Provider        OpenAI-compatible
+Model           MiniMax-M3
+Context Window  1,000,000 tokens
+Max Input       --
+Max Output      512,000 tokens
+Runtime Limit   --
+User Limit      --
+Effective Limit 1,000,000 tokens
+Source          Model Catalog
+───────────────────────────────────
+```
+
+Provider API 能直接返回窗口时（如 OpenRouter）来源显示 `Provider API`；目录未收录或无法
+判定的模型仍然显示 `Unknown`，可以用 `ignis config set model.context_window <tokens>` 显式声明。
 
 ## 配置
 
-`ignis config show` 打印生效配置（环境变量覆盖已应用；`api_key` 恒为 `***`）。`ignis config set <key> <value>` 以**文件原文**为底稿只改写被点名的那一项写回 `config.json`（0600；不会把默认值物化进文件，也不会持久化环境派生值），白名单之外一律报「未知配置项」。可写的点路径共 **17** 项：
+`ignis config show` 打印生效配置（环境变量覆盖已应用；`api_key` 恒为 `***`）。`ignis config set <key> <value>` 以**文件原文**为底稿只改写被点名的那一项写回 `config.json`（0600；不会把默认值物化进文件，也不会持久化环境派生值），白名单之外一律报「未知配置项」。可写的点路径共 **19** 项：
 
 | 点路径 | 取值 |
 |---|---|
@@ -176,6 +231,8 @@ REPL 专属开关（与任何子命令同用是用法错误，退出码 1）：
 | `model.base_url` | 文本（URL） |
 | `model.model` | 文本（模型名，只作用于 `native`） |
 | `model.api_key_env` | 文本（环境变量名，默认 `OPENAI_API_KEY`） |
+| `model.context_window` | 正整数（用户显式声明的上下文窗口 tokens；未知模型/自建代理用） |
+| `model.max_output_tokens` | 正整数（用户显式声明的最大输出 tokens；与上下文窗口独立） |
 | `limits.max_steps` | 0-4294967295 的整数 |
 | `limits.task_timeout_secs` | 非负整数 |
 | `limits.token_budget` | 非负整数 |
@@ -231,9 +288,11 @@ ignis -c
 # 退出：
 #   /exit
 
-# 第三次：在 TUI 里恢复同一会话
+# 第三次：在 TUI 里恢复同一会话（必须在同一 workspace：这里 cd 到 ignis-test）
+cd /home/tobi/workspace/ignis-test
 ignis --tui -c
-# 顶部状态行：IGNIS v0.2.0 · <工作区> · kernel native · session <13 字符短 id>
+# TUI 会把上一轮对话重放进滚动区；顶部状态行：
+# IGNIS v0.2.2 · <工作区> · kernel native · session <13 字符短 id>
 # 输入 /status —— session: 行与上面同值（与第二次同一个会话 id）
 # 退出：
 #   /exit
@@ -375,12 +434,13 @@ ignis daemon stop            # 幂等：没在跑也算成功
 
 ## 已知偏差
 
-- **TUI 是 Beta（`ignis --tui`）**：刻意不做鼠标（没有鼠标事件解码与命中测试，终端自身的选区 / 滚动照旧可用）；滚动区有界（只留最近 2000 行，超出的丢最旧）；任务运行中不接受输入（忙碌期按键一律丢弃，输入区首行是 `working…`、提示行是 `Ctrl+C cancels`）；Esc 的消歧窗口是一个 100ms tick（`Alt+Enter` 被切在两个 tick 之间时可能被当成 Enter）；`\t` 只按 8 列制表位展开到屏幕（提交 / 落盘 / 送模型的文本一个字节不动）；**SIGTERM / SIGTSTP / SIGHUP 没有处理器**——被 `kill`、`Ctrl+Z` 挂起或终端断开时进程直接走掉，备用屏与 raw mode 由终端自己收尾（回到 shell 可能看起来坏掉），敲 `stty sane` 或 `reset` 复原；正常退出（`/exit`、空缓冲 `Ctrl+D`、空闲 `Ctrl+C`、stdin 关闭）与 panic 都由终端守卫的 `Drop` 还原。
+- **TUI 是 Beta（`ignis --tui`）**：启动欢迎面板取代经典品牌块（实时视图、随 Resize 重排，**不进 scrollback**；`--no-banner` 关闭整块欢迎视图）；刻意不做鼠标（没有鼠标事件解码与命中测试，终端自身的选区 / 滚动照旧可用）；滚动区有界（只留最近 2000 行，超出的丢最旧）；任务运行中不接受输入（忙碌期按键一律丢弃，输入区首行是 `working…`、提示行是 `Ctrl+C cancels`）；Esc 的消歧窗口是一个 100ms tick（`Alt+Enter` 被切在两个 tick 之间时可能被当成 Enter）；`\t` 只按 8 列制表位展开到屏幕（提交 / 落盘 / 送模型的文本一个字节不动）；**SIGTERM / SIGTSTP / SIGHUP 没有处理器**——被 `kill`、`Ctrl+Z` 挂起或终端断开时进程直接走掉，备用屏与 raw mode 由终端自己收尾（回到 shell 可能看起来坏掉），敲 `stty sane` 或 `reset` 复原；正常退出（`/exit`、空缓冲 `Ctrl+D`、空闲 `Ctrl+C`、stdin 关闭）与 panic 都由终端守卫的 `Drop` 还原。
+- **模型能力解析的已知边界**：Provider API 能返回窗口就优先用（OpenRouter / vLLM / Ollama / LM Studio）；直连 MiniMax 等不暴露窗口字段的端点走 models.dev 通用目录（首次拉取，缓存 `~/.ignis/model_catalog.json`，24h TTL；离线回退旧缓存/内置 Registry）。目录由社区维护，未收录的新模型或同名冲突会显示 `Unknown`，可用 `model.context_window` 覆盖。没有 Provider Usage 时 TUI 用 `system_chars + history_chars` 做保守估算并标 `≈`，不是本机 tokenizer 的精确计数。`trim_history` 仍按 `limits.context_char_budget`（字符）工作，token 窗口只用于展示与阈值预警。
 - **`--tui` 不默认恢复会话**：只有 `-c` / `--continue` 才装载本工作区最近一次会话（要恢复就 `ignis --tui -c`）；TUI 不满足条件（stdin / stdout 不是终端、`TERM` 是哑终端、尺寸小于 20×8）时只多打一行 `note: TUI unavailable (<原因>); falling back to the classic REPL`，其余一切照旧。
 - **经典 REPL 在「读一行」期间不响应 Ctrl-C**：审批提示与 `/learn` 的保存确认（`save this skill draft? [s]ave [d]iscard> `）在读一行期间不响应 Ctrl-C——进程级 SIGINT 只被接住、不取消那次同步读；模型往返本身（任务轮次、`/compact`、`/learn` 的草稿生成）可以被 Ctrl-C 取消。TUI 里 Ctrl-C 会取消本轮（任务 / 压缩 / 学习），不转发给工具、也不改审批决定。
 - **`/compact` 与 `/learn` 需要 native 凭据**：两者各发一次无工具的 native 请求，外置内核或没有 Ignis 凭据时明确报错（不静默降级、不改状态）；外置内核的用量 / 上限退化（token 记 0、只剩墙钟超时与取消）与「不经 Ignis 审批、无 `approvals` 行」见[限制](#限制) #2、#7。
 - **脱敏是字面替换**：已知密钥按字面替换为 `***`（先 JSON 转义形式、后原文），不做正则或相似度匹配——密钥的截断 / 重组 / 编码变体不在覆盖内；**修复前已落库的明文行不回写**（没有 scrub / migration，新代码不再产生新的明文行）。
-- **banner 形状与 `demo.md` 概念图不同**（`demo.md` 原文标注「CLI 概念展示，并非已经实现的 Ignis 界面」）：实际启动屏为 `IGNIS v0.2.0` / `● Ready` / `Workspace: <dir>` / `Runtime: <kernel> · Skills: <n> · Memory: <n> facts` / `Session: <new|13 字符短 id>`（版本号逐字取包版本 `env!("CARGO_PKG_VERSION")`，当前 `0.2.0`），有未读告警时追加一行 `⚠ N unread alerts — run \`ignis alerts\``。
+- **banner 形状与 `demo.md` 概念图不同**（`demo.md` 原文标注「CLI 概念展示，并非已经实现的 Ignis 界面」）：**经典 REPL** 的启动屏为 `IGNIS v0.2.2` / `● Ready` / `Workspace: <dir>` / `Runtime: <kernel> · Skills: <n> · Memory: <n> facts` / `Session: <new|13 字符短 id>`（版本号逐字取包版本 `env!("CARGO_PKG_VERSION")`，当前 `0.2.2`），有未读告警时追加一行 `⚠ N unread alerts — run \`ignis alerts\``；**TUI** 的启动屏是新的实时欢迎面板（大型渐变横幅 + 火焰缩略图 + 双栏环境/工具/技能面板），不打印经典状态块。
 - **设计文档措辞与 `demo.md` 不完全一致**：`docs/superpowers/specs/2026-10-15-ignis-v0.1-design.md` 与 `docs/superpowers/specs/2026-10-16-ignis-v0.2-design.md` 按对话中的新决定固化了工程取舍（Rust 取代 TS/Node、Telegram 推迟为 CLI 收件箱 / 桌面通知、内核数量、v0.2 的交付口径等），冲突时以设计文档为准。
 - **设计文档的 DDL 措辞与实现的库表不同**：v0.1 设计文档 §6.7「任务模型」只给字段级草案（§9 把「数据库 schema 字段级细化」留给构建者），与实现有三处出入——实现多了 `jobs.workspace` / `jobs.last_run_at` / `job_runs.task_id`，用量是 `job_runs.input_tokens` + `output_tokens` 两列（没有单列 `usage`），`alerts` 表在设计文档里只有文字描述；v0.2 设计 §6.6 的会话 DDL 与实现的 004 一致。一律以 [`packages/storage/src/migrations.rs`](packages/storage/src/migrations.rs) 的 001–004 DDL 为准。
 - **`demo.md` 按作者要求保持原文未修改**；上述偏差只记录在这里，不回改历史文档。

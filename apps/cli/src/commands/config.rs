@@ -84,6 +84,8 @@ const FIELDS: &[(&str, Kind)] = &[
     ("model.base_url", Kind::Text),
     ("model.model", Kind::Text),
     ("model.api_key_env", Kind::Text),
+    ("model.context_window", Kind::PositiveU64),
+    ("model.max_output_tokens", Kind::PositiveU64),
     ("limits.max_steps", Kind::U32),
     ("limits.task_timeout_secs", Kind::U64),
     ("limits.token_budget", Kind::U64),
@@ -115,6 +117,8 @@ enum Kind {
     U32,
     U64,
     Usize,
+    /// 正整数（模型窗口/输出上限：0 没有意义，直接拒绝）。
+    PositiveU64,
     /// 枚举字面量：payload 是该项允许的取值（小写字符串，口径同 core 枚举的 serde 名）。
     Choice(&'static [&'static str]),
 }
@@ -127,6 +131,11 @@ impl Kind {
             Kind::U32 => raw.parse::<u32>().ok().map(|value| json!(value)),
             Kind::U64 => raw.parse::<u64>().ok().map(|value| json!(value)),
             Kind::Usize => raw.parse::<usize>().ok().map(|value| json!(value)),
+            Kind::PositiveU64 => raw
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .map(|value| json!(value)),
             // 枚举同样以字符串写进 JSON；这里先按白名单拦一道，好把 serde 的英文报错
             // 换成中文人话。落盘前仍由 `serde_json::from_value::<Config>` 按真实类型复核。
             Kind::Choice(allowed) => allowed
@@ -141,6 +150,7 @@ impl Kind {
             Kind::Text | Kind::Secret => "文本".to_string(),
             Kind::U32 => "0-4294967295 的整数".to_string(),
             Kind::U64 | Kind::Usize => "非负整数".to_string(),
+            Kind::PositiveU64 => "正整数".to_string(),
             Kind::Choice(allowed) => format!("{} 之一", allowed.join("|")),
         }
     }
@@ -295,6 +305,44 @@ mod tests {
         // `save_config` 的 0600 不能被破坏
         #[cfg(unix)]
         assert_eq!(mode(&home.path().join("config.json")), 0o600);
+    }
+
+    /// 模型能力覆盖：正整数落盘、0/非数字拒绝且不动文件。
+    #[test]
+    fn config_set_model_capability_overrides_roundtrip() {
+        let home = TempHome::new("set-model-caps");
+        assert_eq!(
+            set_value(home.path(), "model.context_window", "32000").unwrap(),
+            "32000"
+        );
+        assert_eq!(
+            set_value(home.path(), "model.max_output_tokens", "4096").unwrap(),
+            "4096"
+        );
+        let saved = load_config_file(home.path()).unwrap();
+        assert_eq!(saved.model.context_window, Some(32_000));
+        assert_eq!(saved.model.max_output_tokens, Some(4_096));
+
+        // 0 不是合法窗口：拒绝，且文件保持原样。
+        let path = home.path().join("config.json");
+        let before = fs::read_to_string(&path).unwrap();
+        for (key, value) in [
+            ("model.context_window", "0"),
+            ("model.max_output_tokens", "0"),
+            ("model.context_window", "lots"),
+        ] {
+            let error = set_value(home.path(), key, value).unwrap_err().to_string();
+            assert!(error.contains("正整数"), "{key}={value}: {error}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), before, "{key}={value}");
+        }
+
+        // `config show` 逐项展示覆盖值，None 不物化成 null。
+        let shown = render(&load_config_file(home.path()).unwrap()).unwrap();
+        assert!(shown.contains("model.context_window = 32000\n"), "{shown}");
+        assert!(
+            shown.contains("model.max_output_tokens = 4096\n"),
+            "{shown}"
+        );
     }
 
     #[test]

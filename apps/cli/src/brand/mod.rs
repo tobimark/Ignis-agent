@@ -6,7 +6,8 @@
 //!
 //! **字模数据**：[`flame::FULL`]（20×13）与 [`flame::COMPACT`]（12×8）由
 //! `tools/gen-flame-art.py` 从 `assets/ignis-flame-transparent.png` 生成（生成期工具，
-//! 不参与构建），运行时零解码、零文件 IO。
+//! 不参与构建），运行时零解码、零文件 IO。TUI 欢迎面板的侧边火焰另见 [`sidebar`]
+//! （编译期嵌入 `assets/ignis-sidebar-truecolor.ans`）。
 //!
 //! **档位规则**（[`tier`]）：stdout 不是 tty 或终端不支持（`TERM` 缺失 / 空 / `dumb`）恒
 //! [`Tier::Minimal`]；否则 `cols >= 100` 给 Full、`cols >= 60` 给 Compact，其余 Minimal。
@@ -28,7 +29,9 @@ use ignis_core::config::{Theme, UiConfig};
 
 use crate::render::{ColorDepth, color_depth, palette, resolve_color};
 
+pub mod banner;
 pub mod flame;
+pub mod sidebar;
 
 /// ANSI：重置。每段着色自带收尾（上色档的行尾也要收一次）。
 const RESET: &str = "\u{1b}[0m";
@@ -262,14 +265,54 @@ fn flame_with_text(
 
 /// 呈现一行：返回「这一行的字符串」与「可见格数」（SGR 零宽，补空格对齐要知道格数）。
 fn art_row(art: &Art, row: usize, depth: ColorDepth) -> (String, usize) {
-    let ink = Ink::of(depth);
     let start = row * art.cols;
     let cells = art.cells.get(start..start + art.cols).unwrap_or_default();
     // 行尾先截到最后一个「有不透明半格」的单元：短行就是短行，不补透明格
-    let cells = &cells[..cells
+    let cells = trim_cells(cells);
+    (render_cells(cells, depth), cells.len())
+}
+
+/// 从字模采样出不超过 `max_rows` × `max_cols` 的缩略图：欢迎面板高度不足时仍保留火焰轮廓。
+///
+/// 行/列的采样步长按比例取整（`div_ceil`）；结果行宽可能不一致，调用方负责居中/补齐。
+pub fn art_rows_limited(
+    art: &Art,
+    max_rows: usize,
+    max_cols: usize,
+    depth: ColorDepth,
+) -> Vec<String> {
+    if max_rows == 0 || max_cols == 0 {
+        return Vec::new();
+    }
+    if max_rows >= art.rows && max_cols >= art.cols {
+        return art_rows(art, depth);
+    }
+    let row_step = art.rows.div_ceil(max_rows);
+    let col_step = art.cols.div_ceil(max_cols);
+    let mut rows = Vec::new();
+    for row in (0..art.rows).step_by(row_step) {
+        let start = row * art.cols;
+        let cells: Vec<(u32, u32)> = (0..art.cols)
+            .step_by(col_step)
+            .filter_map(|col| art.cells.get(start + col).copied())
+            .collect();
+        let cells = trim_cells(&cells);
+        rows.push(render_cells(cells, depth));
+    }
+    rows
+}
+
+/// 行尾截到最后一个「有不透明半格」的单元。
+fn trim_cells(cells: &[(u32, u32)]) -> &[(u32, u32)] {
+    &cells[..cells
         .iter()
         .rposition(|(top, bottom)| *top != 0 || *bottom != 0)
-        .map_or(0, |last| last + 1)];
+        .map_or(0, |last| last + 1)]
+}
+
+/// 一组格 → 一行（不含换行；有色阶时行尾补 reset）。
+fn render_cells(cells: &[(u32, u32)], depth: ColorDepth) -> String {
+    let ink = Ink::of(depth);
     let mut line = String::new();
     for (top, bottom) in cells {
         match ink {
@@ -280,7 +323,7 @@ fn art_row(art: &Art, row: usize, depth: ColorDepth) -> (String, usize) {
     if ink.is_some() {
         line.push_str(RESET);
     }
-    (line, cells.len())
+    line
 }
 
 /// 剪影字形：全透明空格、仅上 `▀`、仅下 `▄`、上下都不透明 `█`。
@@ -546,6 +589,31 @@ mod tests {
             ["\u{1b}[38;5;196m\u{1b}[48;5;21m▀\u{1b}[0m \u{1b}[38;5;46m\u{1b}[49m▀\u{1b}[0m"]
         );
         assert_eq!(art_rows(&GAP_FIXTURE, ColorDepth::None), ["█ ▀"]);
+    }
+
+    /// 空间不足时的缩略图：行数/列数都不超预算，火焰字形仍在（不是空白）。
+    #[test]
+    fn art_rows_limited_preserves_the_flame_inside_the_budget() {
+        for (rows, cols) in [(4, 10), (6, 12), (8, 12), (3, 8)] {
+            let lines = art_rows_limited(&flame::COMPACT, rows, cols, ColorDepth::None);
+            assert!(lines.len() <= rows, "{rows}x{cols}: {lines:?}");
+            assert!(
+                lines.iter().all(|line| line.chars().count() <= cols),
+                "{rows}x{cols}: {lines:?}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains('█') || line.contains('▀') || line.contains('▄')),
+                "{rows}x{cols}：缩略图不能是空白：{lines:?}"
+            );
+        }
+        // 预算足够时原样返回完整字模。
+        assert_eq!(
+            art_rows_limited(&flame::COMPACT, 8, 12, ColorDepth::None),
+            art_rows(&flame::COMPACT, ColorDepth::None)
+        );
+        assert!(art_rows_limited(&flame::COMPACT, 0, 12, ColorDepth::None).is_empty());
     }
 
     #[test]

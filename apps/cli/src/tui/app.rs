@@ -20,7 +20,7 @@
 use std::future::Future;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ignis_runtime::{ApprovalDecision, ApprovalRequest};
 use ignis_storage::SessionSummary;
@@ -41,15 +41,16 @@ use crate::tui::confirm::ConfirmJob;
 use crate::tui::input::InputState;
 use crate::tui::term;
 use crate::tui::view::{
-    FIXED_ROWS, InputBlock, Scrollback, TuiView, ViewFacts, compose, selector_lines, status_line,
-    top_line,
+    AgentState, InputBlock, PaletteItem, Scrollback, TuiView, ViewFacts, compose, content_rows,
+    filtered_palette, meta_line, palette_lines, selector_lines, status_line, top_line,
 };
+use crate::tui::welcome;
 
 /// 100ms 的心跳：忙碌期每 tick 排空一次捕获（流式输出落进滚动区），空闲期用它做 Esc 消歧。
 const TICK: Duration = Duration::from_millis(100);
 
 /// 空闲期的提示行（底部状态行；T6 的滚动口径与它同一句）。
-pub(crate) const IDLE_HINT: &str = "PgUp/PgDn scroll";
+pub(crate) const IDLE_HINT: &str = "Type a task · / commands · Ctrl+P palette";
 
 /// 忙碌期的提示行（输入区第 3 行 + 底部状态行）。
 pub(crate) const BUSY_HINT: &str = "Ctrl+C cancels";
@@ -62,13 +63,16 @@ const WORKING: &str = "working…";
 const CHOICE_PROMPT: &str = "choice> ";
 
 /// 审批态输入区第 3 行的提示（四个可选按键；`d` 先看明细再问一轮）。
-const APPROVAL_HINT: &str = "a/s/r/d";
+const APPROVAL_HINT: &str = "a allow once · s session · r reject · d details";
 
 /// 确认态输入区第 3 行的提示（只有 `s` 保存；其余按键与 `d` 一样放弃）。
 const CONFIRM_HINT: &str = "s/d";
 
 /// 选择器输入区第 3 行与底部状态行的提示（↑↓ 移动、Enter 装载、Esc 关闭）。
 pub(crate) const SELECTOR_HINT: &str = "↑↓ / Enter / Esc";
+
+/// 命令面板输入区的提示。
+pub(crate) const PALETTE_HINT: &str = "type to filter · ↑↓ · Enter · Esc";
 
 /// 进入主循环前的默认面板尺寸（守卫探到尺寸之前用；与 `term` 的回退 80×24 同值）。
 const INITIAL_SIZE: Size = Size { cols: 80, rows: 24 };
@@ -88,6 +92,8 @@ pub enum Action {
     Submit(String),
     /// 选择器选中一条会话：整条 id 交回外层执行（`Session::resume_session`），选择器已关闭。
     Resume(String),
+    /// `Ctrl+P`：打开命令面板（项目/技能/命令由外层注入的事实构建）。
+    Palette,
     /// 退出：空缓冲 `Ctrl+D`、`Ctrl+C` 字节与空闲期 SIGINT 都走这条。
     Exit,
 }
@@ -142,6 +148,15 @@ pub enum InputMode {
         /// 当前会话的整条 id（列表里带 `*`）。
         current: Option<String>,
     },
+    /// 命令面板（`Ctrl+P`）：可搜索命令/技能，Enter 把选中项填进输入区，Esc 关闭。
+    Palette {
+        /// 可搜索项（静态命令 + 当前技能目录）。
+        items: Vec<PaletteItem>,
+        /// 搜索词。
+        query: String,
+        /// 过滤后列表的选中下标。
+        cursor: usize,
+    },
 }
 
 /// 进终端守卫之前就注册好的两个信号流（F4）。
@@ -191,6 +206,22 @@ pub struct TuiApp {
     /// （[`TuiApp::attach_signals`]）；没接上的应用（用例的 headless 夹具）在第一次用到时现场装
     /// 一份——`Some` 之后绝不再注册第二份。
     signals: Option<Signals>,
+    /// Agent 状态（状态行的字形/颜色）。
+    agent: AgentState,
+    /// 本轮捕获里是否出现过 `schedule_create`：成功收尾时显示 `Scheduled`。
+    scheduled: bool,
+    /// 正文段标（`◉ Response`）是否已写：每个任务轮次只写一次。
+    response_open: bool,
+    /// 本轮开始时刻（忙碌期每秒刷新耗时与 Thinking 字形）。
+    turn_started: Option<Instant>,
+    /// 上一轮结束耗时（空闲期状态行仍显示它）。
+    last_elapsed: Option<Duration>,
+    /// 上一次刷新时显示的秒数（1Hz 重绘的判据）。
+    last_second: u64,
+    /// Thinking 动画帧（0..=3，1Hz）。
+    spinner_frame: u8,
+    /// 是否显示启动欢迎面板（`--no-banner` 关闭）。
+    welcome: bool,
 }
 
 impl TuiApp {
@@ -207,7 +238,44 @@ impl TuiApp {
             confirms: None,
             cancel: None,
             signals: None,
+            agent: AgentState::Ready,
+            scheduled: false,
+            response_open: false,
+            turn_started: None,
+            last_elapsed: None,
+            last_second: 0,
+            spinner_frame: 0,
+            welcome: true,
         }
+    }
+
+    /// 关闭/开启启动欢迎面板（`--no-banner` 关闭）。
+    pub fn set_welcome(&mut self, enabled: bool) {
+        self.welcome = enabled;
+    }
+
+    /// 当前 Agent 状态（用例与状态行共用）。
+    pub fn agent_state(&self) -> AgentState {
+        self.agent
+    }
+
+    /// 结束一轮：记下耗时并落到终态；本轮创建过调度任务时显示 `Scheduled`。
+    pub fn finish_turn(&mut self, state: AgentState) {
+        if let Some(started) = self.turn_started.take() {
+            self.last_elapsed = Some(started.elapsed());
+        }
+        self.agent = if state == AgentState::Completed && self.scheduled {
+            AgentState::Scheduled
+        } else {
+            state
+        };
+    }
+
+    /// 当前展示耗时：忙碌期是实时的，空闲期是上一轮的。
+    fn elapsed(&self) -> Option<Duration> {
+        self.turn_started
+            .map(|started| started.elapsed())
+            .or(self.last_elapsed)
     }
 
     /// 接上启动时（进守卫之前）注册好的信号流：这是生产路径唯一的一次注册（F4）。
@@ -261,10 +329,15 @@ impl TuiApp {
         if matches!(self.mode, InputMode::Selector { .. }) {
             return self.selector_bytes(bytes);
         }
+        if matches!(self.mode, InputMode::Palette { .. }) {
+            return self.palette_bytes(bytes);
+        }
         if !matches!(self.mode, InputMode::Editor) {
             return Vec::new();
         }
-        let step = content_rows(self.size);
+        // `Ctrl+P` 只从编辑器态打开面板；其余模式的按键不抢。
+
+        let step = content_rows(self.size, self.input.block(self.size.cols).height()).max(1);
         let mut actions = Vec::new();
         for (key, action) in self.input.on_bytes_with_keys(bytes) {
             let scrolled = match key {
@@ -278,6 +351,12 @@ impl TuiApp {
                 }
                 _ => false,
             };
+            // `Ctrl+P` 打开面板：面板由外层带着事实构建，这里把动作和重绘一起交回。
+            if matches!(action, Action::Palette) {
+                actions.push(Action::Palette);
+                actions.push(Action::Redraw);
+                break;
+            }
             // 编辑器对翻页键是空操作（`Idle`）：滚动本身要一帧才看得见
             actions.push(match (scrolled, action) {
                 (true, Action::None) => Action::Redraw,
@@ -349,6 +428,23 @@ impl TuiApp {
         actions
     }
 
+    /// 命令面板态的一批字节：查询字符进 `query`，↑↓ 移动，Enter 填进输入区，Esc 关闭。
+    fn palette_bytes(&mut self, bytes: &[u8]) -> Vec<Action> {
+        let keys = self.input.keys(bytes);
+        let mut redraw = false;
+        for key in keys {
+            redraw |= self.palette_key(key);
+            if !matches!(self.mode, InputMode::Palette { .. }) {
+                break;
+            }
+        }
+        if redraw {
+            vec![Action::Redraw]
+        } else {
+            Vec::new()
+        }
+    }
+
     /// 每 tick：排空捕获缓冲、消化「一个裸 ESC」；返回是否需要重绘。
     ///
     /// Esc 消歧窗口 = 一个 tick（[`crate::editor::keys::Decoder::take_lone_escape`]）：吃到裸 ESC
@@ -356,9 +452,28 @@ impl TuiApp {
     /// 「吃掉即可」）。Esc 之外的按键一律由字节那条路进选择器。
     pub fn on_tick(&mut self) -> bool {
         let escaped = self.input.take_lone_escape();
-        let routed = escaped && !self.selector_key(Key::Esc).is_empty();
+        let routed = escaped
+            && if matches!(self.mode, InputMode::Palette { .. }) {
+                self.palette_key(Key::Esc)
+            } else {
+                !self.selector_key(Key::Esc).is_empty()
+            };
         let ingested = self.ingest();
-        routed || ingested
+        let ticked = self.tick_clock();
+        routed || ingested || ticked
+    }
+
+    /// 忙碌期 1Hz 刷新耗时与 Thinking 字形；空闲期不动（低 CPU，不空转重绘）。
+    fn tick_clock(&mut self) -> bool {
+        let Some(started) = self.turn_started else {
+            return false;
+        };
+        let second = started.elapsed().as_secs();
+        let frame = (second % 4) as u8;
+        let changed = second != self.last_second || frame != self.spinner_frame;
+        self.last_second = second;
+        self.spinner_frame = frame;
+        changed
     }
 
     /// 排空捕获缓冲 → 滚动区（净化解出的是 `\n` 分隔文本，半行留在滚动区里等下一次）。
@@ -372,8 +487,47 @@ impl TuiApp {
         if text.is_empty() {
             return false;
         }
+        self.note_captured(&text);
         self.scrollback.push_text(&text);
         true
+    }
+
+    /// 从捕获文本推断 Agent 状态：`⚙` → Executing、工具结果/正文 → Thinking。
+    ///
+    /// 只看渲染器输出的行首（SGR 先剥掉），不解析模型内部推理；终态由 [`TuiApp::finish_turn`]
+    /// 在任务结束时显式落定，推断不会把它改回去。正文开始前补一条 `◉ Response` 段标，
+    /// 让「思考/工具/结果」在滚动区里一眼可分。
+    fn note_captured(&mut self, text: &str) {
+        if self.busy().is_none() {
+            return;
+        }
+        for line in text.lines() {
+            let plain = capture::sanitize_plain(line.as_bytes());
+            let plain = plain.trim_start();
+            if plain.starts_with("⚙ ") {
+                self.agent = AgentState::Executing;
+                if plain.starts_with("⚙ schedule_create") {
+                    self.scheduled = true;
+                }
+            } else if plain.starts_with("✓ ") || plain.starts_with("✗ ") {
+                // 工具结果：模型接着处理；任务结束行随后由 `finish_turn` 覆盖。
+                self.agent = AgentState::Thinking;
+                if plain.starts_with("✓ schedule_create") {
+                    self.scheduled = true;
+                }
+            } else if !plain.is_empty()
+                && !plain.starts_with('─')
+                && !plain.starts_with("● ")
+                && !plain.starts_with("task ")
+                && !plain.starts_with('◈')
+            {
+                self.agent = AgentState::Thinking;
+                if !self.response_open {
+                    self.scrollback.push_text("\u{1b}[2m◉ Response\u{1b}[0m\n");
+                    self.response_open = true;
+                }
+            }
+        }
     }
 
     /// 收尾：排空捕获并把最后一半行落地（一轮结束时调一次）；返回是否有变化。
@@ -400,6 +554,13 @@ impl TuiApp {
     /// 进入忙碌态：输入禁用（输入区第 1 行换成 dim 的 `working…`）。
     pub fn begin_busy(&mut self, busy: Busy) {
         self.mode = InputMode::Busy(busy);
+        self.agent = AgentState::Thinking;
+        self.scheduled = false;
+        self.response_open = false;
+        self.turn_started = Some(Instant::now());
+        self.last_elapsed = None;
+        self.last_second = 0;
+        self.spinner_frame = 0;
     }
 
     /// 收到一次审批请求：共用文案（[`prompt_lines`]，与经典 REPL 同一份）4 行逐字进滚动区
@@ -557,6 +718,98 @@ impl TuiApp {
         self.mode = InputMode::Editor;
     }
 
+    /// 打开命令面板：静态命令 + 当前技能目录；查询从空串开始，选中第一项。
+    ///
+    /// 选中项只把命令文本填进编辑器（有参数的命令带尾随空格），由用户补参数后正常提交；
+    /// 面板本身不执行命令，也不消耗模型。
+    pub fn open_palette(&mut self, facts: &ViewFacts) {
+        let mut items: Vec<PaletteItem> = crate::commands::slash::palette_commands()
+            .into_iter()
+            .map(|(label, insert)| PaletteItem { label, insert })
+            .collect();
+        items.extend(facts.skills.iter().map(|meta| PaletteItem {
+            label: format!("/{} — skill", meta.name),
+            insert: format!("/{} ", meta.name),
+        }));
+        self.mode = InputMode::Palette {
+            items,
+            query: String::new(),
+            cursor: 0,
+        };
+    }
+
+    /// 同步技能名到编辑器补全（`/` 后能看到技能，而不只是静态命令）。
+    pub fn sync_skills(&mut self, facts: &ViewFacts) {
+        self.input
+            .set_skills(facts.skills.iter().map(|meta| meta.name.clone()).collect());
+    }
+
+    /// 命令面板的一个按键。返回是否有屏幕变化（查询/选中项/关闭）。
+    fn palette_key(&mut self, key: Key) -> bool {
+        if !matches!(self.mode, InputMode::Palette { .. }) {
+            return false;
+        }
+        match key {
+            Key::Enter => {
+                let insert = {
+                    let InputMode::Palette {
+                        items,
+                        query,
+                        cursor,
+                    } = &self.mode
+                    else {
+                        return false;
+                    };
+                    filtered_palette(items, query)
+                        .get(*cursor)
+                        .map(|item| item.insert.clone())
+                };
+                let Some(insert) = insert else {
+                    return false;
+                };
+                self.mode = InputMode::Editor;
+                self.input.set_text(&insert);
+                true
+            }
+            Key::Char(_) | Key::Backspace | Key::CtrlU | Key::Up | Key::Down => {
+                let InputMode::Palette {
+                    items,
+                    query,
+                    cursor,
+                } = &mut self.mode
+                else {
+                    return false;
+                };
+                match key {
+                    Key::Char(ch) => {
+                        query.push(ch);
+                        *cursor = 0;
+                    }
+                    Key::Backspace => {
+                        query.pop();
+                        *cursor = 0;
+                    }
+                    Key::CtrlU => {
+                        query.clear();
+                        *cursor = 0;
+                    }
+                    Key::Up => *cursor = cursor.saturating_sub(1),
+                    Key::Down => {
+                        let last = filtered_palette(items, query).len().saturating_sub(1);
+                        *cursor = (*cursor + 1).min(last);
+                    }
+                    _ => {}
+                }
+                true
+            }
+            Key::Esc | Key::CtrlC | Key::CtrlD | Key::CtrlP => {
+                self.mode = InputMode::Editor;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// 打开 `/sessions` 选择器（只在空闲期；空表也开，内容是 `(no sessions)`）。
     ///
     /// 列表就是 `/sessions` 那张表（[`selector_lines`] 只加选择前缀），游标从第一行起；
@@ -618,17 +871,18 @@ impl TuiApp {
         match self.mode {
             InputMode::Busy(busy) => Some(busy),
             InputMode::Approval { resume, .. } | InputMode::Confirm { resume, .. } => Some(resume),
-            InputMode::Editor | InputMode::Selector { .. } => None,
+            InputMode::Editor | InputMode::Selector { .. } | InputMode::Palette { .. } => None,
         }
     }
 
     /// 组装一帧（合成器是纯函数；这里只把状态拼进 [`TuiView`]）。
     pub fn view(&self, facts: &ViewFacts) -> TuiView {
         let (input, hint) = match &self.mode {
-            // 忙碌期没有可编辑的输入：光标藏起来，两行都是说明性文案
+            // 忙碌期没有可编辑的输入：光标藏起来，正文 + 提示两行都是说明性文案
             InputMode::Busy(_) => (
                 InputBlock {
-                    lines: [WORKING.to_string(), String::new(), BUSY_HINT.to_string()],
+                    lines: vec![WORKING.to_string()],
+                    hint: BUSY_HINT.to_string(),
                     cursor: None,
                 },
                 BUSY_HINT,
@@ -636,11 +890,8 @@ impl TuiApp {
             // 审批：正文（4 行提示）在滚动区，输入区首行只留经典的 `choice> `（光标停在它后面）
             InputMode::Approval { .. } => (
                 InputBlock {
-                    lines: [
-                        CHOICE_PROMPT.to_string(),
-                        String::new(),
-                        APPROVAL_HINT.to_string(),
-                    ],
+                    lines: vec![CHOICE_PROMPT.to_string()],
+                    hint: APPROVAL_HINT.to_string(),
                     cursor: Some((0, display_width(CHOICE_PROMPT))),
                 },
                 BUSY_HINT,
@@ -648,11 +899,8 @@ impl TuiApp {
             // 确认：头行/预览在滚动区，输入区首行就是经典的完整提示词（光标停在它后面）
             InputMode::Confirm { .. } => (
                 InputBlock {
-                    lines: [
-                        LEARN_PROMPT.to_string(),
-                        String::new(),
-                        CONFIRM_HINT.to_string(),
-                    ],
+                    lines: vec![LEARN_PROMPT.to_string()],
+                    hint: CONFIRM_HINT.to_string(),
                     cursor: Some((0, display_width(LEARN_PROMPT))),
                 },
                 BUSY_HINT,
@@ -660,12 +908,28 @@ impl TuiApp {
             // 选择器：列表整块进视口（下面按同一份行拼），输入区只留提示行、没有光标
             InputMode::Selector { .. } => (
                 InputBlock {
-                    lines: [String::new(), String::new(), SELECTOR_HINT.to_string()],
+                    lines: Vec::new(),
+                    hint: SELECTOR_HINT.to_string(),
                     cursor: None,
                 },
                 SELECTOR_HINT,
             ),
-            InputMode::Editor => (self.input.block(), IDLE_HINT),
+            InputMode::Palette { query, .. } => (
+                InputBlock {
+                    lines: vec![format!("⌕ {query}")],
+                    hint: PALETTE_HINT.to_string(),
+                    cursor: None,
+                },
+                PALETTE_HINT,
+            ),
+            InputMode::Editor => (self.input.block(self.size.cols), IDLE_HINT),
+        };
+        let rows = content_rows(self.size, input.height());
+        // 审批/确认是真正的「等用户」状态：状态行不能用任务内部的 Thinking/Executing 覆盖它。
+        let state = match &self.mode {
+            InputMode::Approval { .. } | InputMode::Confirm { .. } => AgentState::Waiting,
+            InputMode::Palette { .. } => AgentState::Ready,
+            _ => self.agent,
         };
         TuiView {
             size: self.size,
@@ -673,24 +937,44 @@ impl TuiApp {
             depth: facts.depth,
             theme: facts.theme,
             top: top_line(facts),
+            meta: meta_line(
+                facts,
+                state,
+                self.spinner_frame,
+                self.elapsed(),
+                self.size.cols,
+            ),
             // 视口就是「最近 rows 行」：版式切到该显示的那一段是合成器的事。选择器开着时视口整块
-            // 让给它（那一份列表就是用户此刻要看的东西）
+            // 让给它；启动欢迎面板只在「还没产生任何内容」时占据视口。
             viewport: match &self.mode {
                 InputMode::Selector {
-                    rows,
+                    rows: session_rows,
                     cursor,
                     current,
                 } => {
                     // 列表围绕光标开窗（F3）：切给可视高度那么多行，选中行（列表里第 `1 + cursor`
                     // 行，第 0 行是表头）始终在窗口里，窗口随光标移动
-                    let lines = selector_lines(rows, current.as_deref(), *cursor);
-                    selector_window(lines, 1 + *cursor, content_rows(self.size))
+                    let lines = selector_lines(session_rows, current.as_deref(), *cursor);
+                    selector_window(lines, 1 + *cursor, rows)
                 }
-                _ => self.scrollback.viewport(self.size.rows),
+                InputMode::Palette {
+                    items,
+                    query,
+                    cursor,
+                } => palette_lines(items, query, *cursor, rows),
+                InputMode::Editor if self.welcome_visible() => {
+                    welcome::welcome_lines(facts, self.size, rows)
+                }
+                _ => self.scrollback.viewport(rows),
             },
             input,
             status: status_line(facts, hint),
         }
+    }
+
+    /// 欢迎面板只在启动空闲期、且滚动区还没有任何内容时显示；首次提交/命令输出后自然消失。
+    fn welcome_visible(&self) -> bool {
+        self.welcome && self.scrollback.is_empty() && matches!(self.mode, InputMode::Editor)
     }
 
     /// 空闲期等到的一件事（主循环按它分派）。
@@ -867,15 +1151,6 @@ impl TuiApp {
         // 写失败（EPIPE 等）忽略：画不出帧不该带走一场会话
         let _ = guard.write(compose(&view).as_bytes());
     }
-}
-
-/// 内容区（消息视口 / 选择器列表）的可视行数：`rows` 减去版式的固定行（顶部状态行 1 + 输入区 3 +
-/// 底部状态行 1），至少 1 行——极小窗口里也是「看得见一行」而不是零行。
-///
-/// 这一个口径就是 PgUp/PgDn 的步长（F2）与选择器开窗的高度（F3），与帧的版式同源
-/// （[`FIXED_ROWS`]）。
-fn content_rows(size: Size) -> usize {
-    size.rows.saturating_sub(FIXED_ROWS).max(1)
 }
 
 /// 选择器列表的开窗：取包含 `selected` 行的连续 `visible` 行（窗口贴住列表两端，绝不越界）。
@@ -1061,7 +1336,9 @@ mod tests {
     use crate::tui::capture::CaptureSink;
     use crate::tui::confirm::{self, ConfirmJob};
     use crate::tui::term::TerminalGuard;
-    use crate::tui::view::{Scrollback, ViewFacts, compose, selector_lines, status_line, top_line};
+    use crate::tui::view::{
+        AgentState, Scrollback, ViewFacts, compose, selector_lines, status_line, top_line,
+    };
 
     use super::{
         Action, BUSY_HINT, Busy, IDLE_HINT, InputChunk, InputMode, SELECTOR_HINT, Signals, TuiApp,
@@ -1076,6 +1353,7 @@ mod tests {
             kernel: "native".to_string(),
             session: "new".to_string(),
             mode: OutputMode::Normal,
+            interaction_mode: crate::commands::InteractionMode::Normal,
             theme: Theme::Dark,
             color: false,
             depth: ColorDepth::Basic16,
@@ -1084,6 +1362,15 @@ mod tests {
             stats: None,
             usage: None,
             native: true,
+            model: "gpt-4o-mini".to_string(),
+            provider: "OpenAI".to_string(),
+            capabilities: ignis_runtime::caps::ModelCapabilities::static_resolve(
+                &ignis_runtime::ModelConfig::default(),
+            ),
+            context: None,
+            tools: Vec::new(),
+            skills: Vec::new(),
+            memory: None,
         }
     }
 
@@ -1211,11 +1498,12 @@ mod tests {
     ///
     /// 净化（`capture::sanitize`）的放行面是 **SGR 形状**而不是枚举出来的几条（T1 起），这里只是
     /// 帧侧的已知集合：`stray_escape` 要抓的是内容漏出来的非 SGR 转义。
-    const PALETTE_SGR: [&str; 11] = [
+    const PALETTE_SGR: [&str; 12] = [
         "\x1b[0m",
         "\x1b[1m",
         "\x1b[2m",
         "\x1b[31m",
+        "\x1b[32m",
         "\x1b[36m",
         "\x1b[90m",
         // 品牌槽（`render::palette` 的 `brand`）：dark/light × 真彩、dark/light × 256、基本色与
@@ -1285,8 +1573,8 @@ mod tests {
             view.color = color;
             view.top = "IGNIS\u{1b}[2J v0 · \u{1b}]0;top\u{7}".to_string();
             view.input.lines[0] = "❯ \u{1b}[2J输入".to_string();
-            view.input.lines[1] = "\u{1b}]0;续行\u{7}x".to_string();
-            view.input.lines[2] = "\u{1b}[2m提示\u{1b}[2J".to_string();
+            view.input.lines.push("\u{1b}]0;续行\u{7}x".to_string());
+            view.input.hint = "\u{1b}[2m提示\u{1b}[2J".to_string();
             view.status = "ctx 0\u{1b}[2J/1 chars · \u{1b}]0;s\u{7}".to_string();
 
             let frame = compose(&view);
@@ -1301,8 +1589,91 @@ mod tests {
         }
     }
 
+    /// 长输入必须按终端宽度折行，而不是被帧直接截断。
+    #[test]
+    fn long_input_wraps_instead_of_being_clipped() {
+        let (mut app, _buffer) = app();
+        app.set_size(Size { cols: 40, rows: 24 });
+        app.on_bytes("x".repeat(100).as_bytes());
+
+        let view = app.view(&facts());
+        assert_eq!(
+            view.input.lines.len(),
+            2,
+            "40 列下 100 字符应折成两个物理行：{:?}",
+            view.input.lines
+        );
+        assert!(
+            view.input.lines[0].starts_with("❯ "),
+            "{:?}",
+            view.input.lines
+        );
+        assert!(
+            view.input.lines[1].starts_with("… "),
+            "{:?}",
+            view.input.lines
+        );
+        assert_eq!(view.input.height(), 2);
+        assert_eq!(view.input.cursor.map(|(row, _)| row), Some(1));
+    }
+
+    /// Ctrl+P 打开面板；输入过滤词后 Enter 把选中命令填进输入区（不执行、不进模型）。
+    #[test]
+    fn ctrl_p_palette_filters_and_fills_the_editor() {
+        let (mut app, _buffer) = app();
+        let facts = facts();
+        assert_eq!(app.on_bytes(b"\x10"), [Action::Palette, Action::Redraw]);
+        app.open_palette(&facts);
+        assert!(matches!(&app.mode, InputMode::Palette { .. }));
+
+        app.on_bytes(b"status");
+        assert!(
+            matches!(&app.mode, InputMode::Palette { query, .. } if query == "status"),
+            "{:?}",
+            app.mode
+        );
+        app.on_bytes(b"\r");
+        assert!(matches!(app.mode, InputMode::Editor));
+        assert_eq!(app.input.text(), "/status");
+    }
+
+    /// 本轮创建过调度任务：成功收尾显示 `Scheduled`，而不是普通的 `Completed`。
+    #[test]
+    fn schedule_create_turn_ends_in_scheduled_state() {
+        let (mut app, _buffer) = app();
+        app.begin_busy(Busy::Task);
+        app.note_captured("✓ schedule_create — Done\n");
+        app.finish_turn(AgentState::Completed);
+        assert_eq!(app.agent_state(), AgentState::Scheduled);
+    }
+
+    /// 正文开始前补 `◉ Response` 段标；工具行本身不被误标成正文。
+    #[test]
+    fn response_section_header_is_emitted_once_before_body_text() {
+        let (mut app, _buffer) = app();
+        let facts = facts();
+        app.begin_busy(Busy::Task);
+        app.note_captured("⚙ shell_run — Running: echo hi\n");
+        app.note_captured("hello\n");
+        app.note_captured("world\n");
+        let viewport = app.view(&facts).viewport;
+        assert!(
+            viewport.iter().any(|line| line.contains("◉ Response")),
+            "{viewport:?}"
+        );
+        assert_eq!(
+            viewport
+                .iter()
+                .filter(|line| line.contains("◉ Response"))
+                .count(),
+            1,
+            "{viewport:?}"
+        );
+        assert_eq!(app.agent_state(), AgentState::Thinking);
+    }
+
     /// F2（终审修复波）：编辑器态里的 PgUp/PgDn 真的翻滚动区——步长 = 可视视口行数
-    /// （`rows - 5`，至少 1），翻上去看得到旧行、PgDn 一路回到贴底；字节不进编辑器缓冲。
+    /// （12 行 + 单行输入 = 6，至少 1），翻上去看得到旧行、PgDn 一路回到贴底；字节不进编辑器缓冲。
     #[test]
     fn page_keys_scroll_the_scrollback_and_return_to_the_bottom() {
         let (mut app, _buffer) = app();
@@ -1310,7 +1681,7 @@ mod tests {
         app.set_size(Size { cols: 80, rows: 12 });
         let lines: Vec<String> = (1..=40).map(|index| format!("line {index}")).collect();
         app.push_lines(lines.clone());
-        let visible = 12 - 5; // 步长与帧里的消息区行数是同一个口径
+        let visible = 12 - 6; // 空输入 1 行：固定 chrome = 顶部 + 2 分隔线 + meta + 输入 + 底行
 
         // 帧里真的画出来的那些行（每行以清行序列收尾；80 列装得下，不会截断）
         let framed = |app: &TuiApp| -> Vec<String> {
@@ -1401,10 +1772,9 @@ mod tests {
 
         // 忙碌期的输入区：dim 的 `working…` + 提示行 `Ctrl+C cancels`（没有光标）
         let block = app.view(&facts()).input;
-        assert_eq!(
-            block.lines,
-            ["working…".to_string(), String::new(), BUSY_HINT.to_string()]
-        );
+        assert_eq!(block.lines, ["working…".to_string()]);
+        assert_eq!(block.hint, BUSY_HINT);
+        assert_eq!(block.height(), 2);
         assert_eq!(block.cursor, None);
         // 上色时这两行是 dim（chrome 由合成器按槽位上色；`working…` 不是输入标记那一槽）
         let colored = app.view(&ViewFacts {
@@ -1464,7 +1834,11 @@ mod tests {
         assert_eq!(view.top, top_line(&facts));
         assert_eq!(view.status, status_line(&facts, IDLE_HINT));
         assert_eq!(view.viewport, ["答复一", "第二行"]);
-        assert_eq!(view.input, app.input.block(), "输入区就是输入态的那个块");
+        assert_eq!(
+            view.input,
+            app.input.block(app.size.cols),
+            "输入区就是输入态的那个块"
+        );
         assert_eq!(view.input.lines[0], "❯ 你好");
         assert_eq!(
             view.input.cursor,
@@ -1598,14 +1972,14 @@ mod tests {
     }
 
     /// 内联审批的版式与键位（裁定 3）：4 行共用文案逐字进滚动区（3 行输入区放不下）、输入区首行
-    /// 恰好是经典的 `choice> `、提示行 `a/s/r/d`；`a`/`s`/`r` 各回各的信并回到编辑器，`d` 打参数
+    /// 恰好是经典的 `choice> `、提示行给出 allow/session/reject/details；`a`/`s`/`r` 各回各的信并回到编辑器，`d` 打参数
     /// 明细（与经典同一份美化 JSON）后继续等，到上限的无效输入与 `Ctrl+D` 都 fail-safe 拒绝。
     #[tokio::test]
     async fn approval_keys_reply_to_the_pending_request() {
         let (mut app, _buffer) = app();
         let facts = facts();
 
-        // 版式：四行提示落在滚动区，输入区是 `choice> ` + `a/s/r/d`
+        // 版式：四行提示落在滚动区，输入区是 `choice> ` + allow/session/reject/details
         let (job, mut rx) = approval_job();
         let landed = app.begin_approval(job);
         assert_eq!(
@@ -1620,7 +1994,12 @@ mod tests {
         );
         let block = app.view(&facts).input;
         assert_eq!(block.lines[0], "choice> ", "输入区首行是经典的提示词");
-        assert_eq!(block.lines[2], "a/s/r/d", "提示行");
+        assert_eq!(block.hint, super::APPROVAL_HINT, "提示行");
+        assert!(
+            app.view(&facts).meta.contains("Waiting"),
+            "审批期状态行必须是 Waiting：{:?}",
+            app.view(&facts).meta
+        );
         assert!(
             format_prompt(&approval_request()).ends_with(&block.lines[0]),
             "输入区首行与经典提示词的最后一段逐字一致"
@@ -1821,7 +2200,7 @@ mod tests {
             assert_eq!(app.busy(), Some(busy), "回信后恢复记下的忙碌态");
             let block = app.view(&facts).input;
             assert_eq!(block.lines[0], "working…", "输入区首行是忙碌行，不是 `❯ `");
-            assert_eq!(block.lines[2], BUSY_HINT, "提示行也回到忙碌那一句");
+            assert_eq!(block.hint, BUSY_HINT, "提示行也回到忙碌那一句");
             assert_eq!(block.cursor, None, "忙碌期藏起光标");
             assert_eq!(
                 app.view(&facts).status,
@@ -1948,7 +2327,7 @@ mod tests {
         let block = app.view(&facts).input;
         assert_eq!(block.lines[0], LEARN_PROMPT, "输入区第 1 行就是经典提示词");
         assert_eq!(block.lines[0], "save this skill draft? [s]ave [d]iscard> ");
-        assert_eq!(block.lines[2], "s/d", "提示行");
+        assert_eq!(block.hint, super::CONFIRM_HINT, "提示行");
         assert!(rx.try_recv().is_err(), "还没按键：没有回信");
         assert_eq!(app.busy(), Some(Busy::Learn), "确认叠在忙碌期上");
         assert_eq!(app.view(&facts).status, status_line(&facts, BUSY_HINT));
@@ -2065,7 +2444,7 @@ mod tests {
         assert_eq!(app.busy(), Some(Busy::Learn), "回信后恢复记下的忙碌态");
         let block = app.view(&facts).input;
         assert_eq!(block.lines[0], "working…", "输入区首行是忙碌行，不是 `❯ `");
-        assert_eq!(block.lines[2], BUSY_HINT, "提示行也回到忙碌那一句");
+        assert_eq!(block.hint, BUSY_HINT, "提示行也回到忙碌那一句");
         assert_eq!(block.cursor, None, "忙碌期藏起光标");
         assert_eq!(
             app.view(&facts).status,
@@ -2190,10 +2569,8 @@ mod tests {
         assert_eq!(app.busy(), None, "选择器是空闲期的一态，不是忙碌");
         let view = app.view(&facts);
         assert_eq!(view.input.cursor, None, "选择器不落光标");
-        assert_eq!(
-            view.input.lines[2], SELECTOR_HINT,
-            "输入区提示行换选择器那一句"
-        );
+        assert!(view.input.lines.is_empty(), "选择器只留提示行");
+        assert_eq!(view.input.hint, SELECTOR_HINT, "输入区提示行换选择器那一句");
         assert_eq!(view.viewport, selector_lines(&rows, Some(middle), 0));
         assert!(
             view.viewport[1].starts_with("> "),
@@ -2322,8 +2699,8 @@ mod tests {
         );
     }
 
-    /// F3（终审修复波）：选择器列表围绕光标开窗——`rows = 8` 的终端给列表 `rows - 5` = 3 行，
-    /// 选中行（`> `）始终在窗口里，窗口随光标移动（贴头、随行、贴尾）。
+    /// F3（终审修复波）：选择器列表围绕光标开窗——`rows = 8` 的终端给列表 4 行
+    /// （顶部 + 运行状态 + 单行提示 + 底行），选中行（`> `）始终在窗口里，窗口随光标移动。
     #[test]
     fn selector_window_keeps_the_cursor_row_visible_at_eight_rows() {
         let rows: Vec<SessionSummary> = (0..6)
@@ -2340,11 +2717,11 @@ mod tests {
         let facts = facts();
         app.set_size(Size { cols: 60, rows: 8 });
         app.open_selector(rows.clone(), None);
-        let visible = 8 - 5;
+        let visible = 8 - 4;
 
-        // 游标在第 0 行：窗口贴着列表头（表头 + 第 1、2 行），选中行在窗口里
+        // 游标在第 0 行：窗口贴着列表头（表头 + 前 3 条），选中行在窗口里
         let viewport = app.view(&facts).viewport;
-        assert_eq!(viewport.len(), visible, "8 行终端给列表 3 行：{viewport:?}");
+        assert_eq!(viewport.len(), visible, "8 行终端给列表 4 行：{viewport:?}");
         assert_eq!(
             viewport,
             selector_lines(&rows, None, 0)[..visible].to_vec(),
@@ -2352,7 +2729,7 @@ mod tests {
         );
         assert!(viewport[1].starts_with("> "), "{viewport:?}");
 
-        // ↓ 到第 4 行（下标 3）：窗口跟着移到第 2..5 行，`> ` 行仍在窗口里
+        // ↓ 到第 4 行（下标 3）：窗口跟着移到第 1..5 行，`> ` 行仍在窗口里
         for _ in 0..3 {
             assert_eq!(app.selector_key(Key::Down), [Action::Redraw]);
         }
@@ -2360,11 +2737,11 @@ mod tests {
         assert_eq!(viewport.len(), visible);
         assert_eq!(
             viewport,
-            selector_lines(&rows, None, 3)[2..5].to_vec(),
+            selector_lines(&rows, None, 3)[1..5].to_vec(),
             "窗口随光标移动"
         );
         assert!(
-            viewport[2].starts_with("> "),
+            viewport[3].starts_with("> "),
             "> 行必须在窗口里：{viewport:?}"
         );
 
@@ -2375,11 +2752,11 @@ mod tests {
         let viewport = app.view(&facts).viewport;
         assert_eq!(
             viewport,
-            selector_lines(&rows, None, 5)[4..7].to_vec(),
+            selector_lines(&rows, None, 5)[3..7].to_vec(),
             "到底时窗口贴着列表尾"
         );
         assert!(
-            viewport[2].starts_with("> "),
+            viewport[3].starts_with("> "),
             "最后一行也看得见：{viewport:?}"
         );
         assert!(

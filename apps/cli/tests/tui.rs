@@ -137,10 +137,13 @@ fn pty_tui_enters_the_alt_screen_streams_an_answer_and_restores_on_exit() {
     pty.expect("\x1b[?1049h");
     pty.expect("IGNIS v");
     pty.expect("kernel native");
+    // 启动欢迎面板：真实工具与火焰缩略图都在首屏（品牌横幅由实时面板合成）。
+    pty.expect("Available Tools");
+    pty.expect("fs_read");
 
     pty.send("你好\r");
     pty.expect("答复一"); // 流式答复落进滚动区（每 100ms 的 tick 排空捕获并重绘）
-    pty.expect("● Done"); // 结束行
+    pty.expect("✓ Done"); // TUI 结束行
 
     pty.send("/exit\r");
     pty.expect("\x1b[?1049l");
@@ -159,12 +162,12 @@ fn pty_tui_enters_the_alt_screen_streams_an_answer_and_restores_on_exit() {
         "开机品牌块（火焰字模）必须真的落进滚动区：\n{output}"
     );
     assert!(
-        !output.contains("● Ready"),
-        "经典状态块不进 TUI（那一行只属于经典 REPL）：\n{output}"
+        !output.lines().any(|line| line.trim() == "● Ready"),
+        "经典状态块不进 TUI（TUI 的 Ready 在运行状态行里）：\n{output}"
     );
 }
 
-/// 任务运行中的 Ctrl+C：任务收成 `● Aborted`、TUI **不退出**（重绘出空闲输入区），随后 `/exit`
+/// 任务运行中的 Ctrl+C：任务收成 `◼ Aborted`、TUI **不退出**（重绘出空闲输入区），随后 `/exit`
 /// 照常还原备用屏并以 0 退出。
 #[test]
 fn pty_tui_ctrl_c_cancels_a_running_task_without_leaving() {
@@ -187,10 +190,10 @@ fn pty_tui_ctrl_c_cancels_a_running_task_without_leaving() {
     pty.expect("Running: sleep 5");
     pty.send("\x03");
 
-    pty.expect("● Aborted");
+    pty.expect("◼ Aborted");
     // 任务结束后 TUI 仍然活着：取消之后重绘的那一帧把空闲输入区（`❯ `）画了回来。每一帧都会
-    // 重画同一块滚动区，`● Aborted` 在上一帧里就出现过——只认它**之后**新写出的 `❯ `
-    expect_after(&pty, "● Aborted", "❯ ");
+    // 重画同一块滚动区，`◼ Aborted` 在上一帧里就出现过——只认它**之后**新写出的 `❯ `
+    expect_after(&pty, "◼ Aborted", "❯ ");
 
     pty.send("/exit\r");
     pty.expect("\x1b[?1049l");
@@ -209,13 +212,13 @@ fn pty_tui_ctrl_c_cancels_a_running_task_without_leaving() {
         "开机品牌块（火焰字模）必须真的落进滚动区：\n{output}"
     );
     assert!(
-        !output.contains("● Ready"),
-        "经典状态块不进 TUI（那一行只属于经典 REPL）：\n{output}"
+        !output.lines().any(|line| line.trim() == "● Ready"),
+        "经典状态块不进 TUI（TUI 的 Ready 在运行状态行里）：\n{output}"
     );
 }
 
-/// `--tui --no-banner`：开机品牌块整块不推（滚动区里一个火焰字形都没有），但顶行的字标照旧
-/// ——`--no-banner` 只管品牌块，顶行 `IGNIS v…` 是帧的 chrome，与品牌块无关。
+/// `--tui --no-banner`：欢迎面板整块不显示（首屏没有火焰/工具列表），但顶行的字标照旧
+/// ——`--no-banner` 只管欢迎面板，顶行 `IGNIS v…` 是帧的 chrome。
 #[test]
 fn pty_tui_no_banner_drops_the_brand_block_but_keeps_the_top_line() {
     // 空脚本：这一例不发任何模型请求（`/exit` 即退）
@@ -238,7 +241,12 @@ fn pty_tui_no_banner_drops_the_brand_block_but_keeps_the_top_line() {
     }
     assert!(
         output.contains("IGNIS v"),
-        "顶行的字标文案仍在（收掉的只是品牌块）：\n{}",
+        "顶行的字标文案仍在（收掉的只是欢迎面板）：\n{}",
+        pty.output()
+    );
+    assert!(
+        !output.contains("Available Tools"),
+        "`--no-banner` 下欢迎面板整块不显示：\n{}",
         pty.output()
     );
 
@@ -247,10 +255,237 @@ fn pty_tui_no_banner_drops_the_brand_block_but_keeps_the_top_line() {
     let code = pty.wait();
     assert_eq!(code, 0, "`/exit` 应以 0 退出：\n{}", pty.output());
     assert!(
-        !pty.output().contains("● Ready"),
+        !pty.output().lines().any(|line| line.trim() == "● Ready"),
         "经典状态块照旧不进 TUI：\n{}",
         pty.output()
     );
+}
+
+/// 80×24 下连续两轮对话：第一轮的结束行之后输入区仍可用，第二轮照常提交并收到答复。
+#[test]
+fn pty_tui_two_turns_keep_the_input_usable_at_80x24() {
+    let (mut pty, _dir, _model) = spawn_tui(
+        "tui-two-turns",
+        vec![
+            ScriptStep::Text("答复一".to_string()),
+            ScriptStep::Text("答复二".to_string()),
+        ],
+        &["--tui"],
+        Some((80, 24)),
+    );
+
+    pty.expect("\x1b[?1049h");
+    pty.send("第一问\r");
+    pty.expect("答复一");
+    pty.expect("✓ Done");
+
+    pty.send("第二问\r");
+    pty.expect("答复二");
+    // `✓ Done` 在第一轮就出现过：只认 `答复二` 之后新写出的那一条。
+    expect_after(&pty, "答复二", "✓ Done");
+
+    pty.send("/exit\r");
+    pty.expect("\x1b[?1049l");
+    assert_eq!(pty.wait(), 0, "两轮对话后 /exit 应以 0 退出");
+}
+
+/// 成功的工具调用：`⚙` 开始行、`✓` 完成行与最终答复都出现在同一条流里。
+#[test]
+fn pty_tui_streams_a_successful_tool_call() {
+    let (mut pty, _dir, _model) = spawn_tui(
+        "tui-tool-success",
+        vec![
+            common::tool_call("shell_run", json!({"command": "echo hi"})),
+            ScriptStep::Text("答复二".to_string()),
+        ],
+        &["--tui", "--yes"],
+        None,
+    );
+
+    pty.expect("\x1b[?1049h");
+    pty.send("跑一下\r");
+    pty.expect("⚙ shell_run — Running: echo hi");
+    pty.expect("✓ shell_run — Done");
+    pty.expect("答复二");
+    pty.expect("✓ Done");
+
+    pty.send("/exit\r");
+    pty.expect("\x1b[?1049l");
+    assert_eq!(pty.wait(), 0, "成功工具调用后 /exit 应以 0 退出");
+}
+
+/// Ctrl+P 命令面板：过滤命令、选中后填进编辑器，再按一次 Enter 正常执行。
+#[test]
+fn pty_tui_ctrl_p_palette_filters_and_fills_a_command() {
+    let (mut pty, _dir, _model) = spawn_tui("tui-palette", Vec::new(), &["--tui"], Some((80, 24)));
+
+    pty.expect("\x1b[?1049h");
+    pty.send("\x10");
+    pty.expect("Command Palette");
+    pty.send("status");
+    pty.expect("> /status");
+    pty.send("\r");
+    pty.expect("❯ /status");
+    pty.send("\r");
+    pty.expect("kernel: native");
+
+    pty.send("/exit\r");
+    pty.expect("\x1b[?1049l");
+    assert_eq!(pty.wait(), 0);
+}
+
+/// 项目级 `.ignis/skills` 里的技能可以直接用 `/<name> <task>` 调用：
+/// 分类 → 任务提示 → 模型 `load_skill` 读到正文 → 回答。
+#[test]
+fn pty_tui_invokes_a_project_skill_with_slash() {
+    let dir = TempDir::new("tui-skill-slash");
+    let home = dir.join("home");
+    let workspace = dir.join("workspace");
+    let skill = workspace.join(".ignis/skills/demo");
+    fs::create_dir_all(&skill).expect("技能目录应可创建");
+    fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: demo\ndescription: Demo project skill.\n---\n# Demo\n\nSKILL-BODY-MARKER\n",
+    )
+    .expect("技能文件应可写");
+
+    let model = ScriptedModel::start(vec![
+        common::tool_call("load_skill", json!({"name": "demo"})),
+        ScriptStep::Text("skill-answer".to_string()),
+    ]);
+    let base_url = model.base_url();
+    let mut pty = Pty::spawn(&PtyOptions {
+        home: &home,
+        workspace: &workspace,
+        base_url: &base_url,
+        args: &["--tui"],
+        env: &[],
+        window: Some((80, 24)),
+    });
+
+    pty.expect("\x1b[?1049h");
+    pty.send("/demo use it\r");
+    pty.expect("⚙ load_skill");
+    pty.expect("skill-answer");
+    pty.expect("✓ Done");
+
+    // 技能正文经 load_skill 的工具结果进入第二次模型请求（不是只凭名字假装加载）。
+    let requests = model.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.to_string().contains("SKILL-BODY-MARKER")),
+        "模型请求里应出现项目技能正文：{requests:?}"
+    );
+
+    pty.send("/exit\r");
+    pty.expect("\x1b[?1049l");
+    assert_eq!(pty.wait(), 0);
+}
+
+/// `--tui -c`：同一 home/workspace 的第二次启动必须把上一轮的对话重放出来，
+/// 而不是只显示欢迎面板和一个 session id。
+#[test]
+fn pty_tui_continue_replays_the_previous_transcript() {
+    let dir = TempDir::new("tui-continue");
+    let home = dir.join("home");
+    let workspace = dir.join("workspace");
+    fs::create_dir_all(&workspace).expect("workspace 应可创建");
+    let model = ScriptedModel::start(vec![ScriptStep::Text("resume-answer".to_string())]);
+    let base_url = model.base_url();
+
+    let options = |args: &'static [&'static str]| PtyOptions {
+        home: &home,
+        workspace: &workspace,
+        base_url: &base_url,
+        args,
+        env: &[],
+        window: None,
+    };
+
+    // 第一次：正常问答，落一条会话。
+    let mut first = Pty::spawn(&options(&["--tui"]));
+    first.expect("\x1b[?1049h");
+    first.expect("Available Tools");
+    first.send("resume-question\r");
+    first.expect("resume-answer");
+    first.expect("✓ Done");
+    first.send("/exit\r");
+    first.expect("\x1b[?1049l");
+    assert_eq!(first.wait(), 0);
+
+    // 第二次：同一工作区 `-c`，历史应作为可见 transcript 重放。
+    let mut second = Pty::spawn(&options(&["--tui", "-c"]));
+    second.expect("\x1b[?1049h");
+    second.expect("resumed session");
+    second.expect("resume-question");
+    second.expect("resume-answer");
+    second.send("/exit\r");
+    second.expect("\x1b[?1049l");
+    assert_eq!(second.wait(), 0);
+}
+
+/// 长输入在真实终端里必须折行（续行 `… `），而不是被右边界截断。
+#[test]
+fn pty_tui_wraps_long_input_instead_of_clipping_it() {
+    let (mut pty, _dir, _model) =
+        spawn_tui("tui-input-wrap", Vec::new(), &["--tui"], Some((80, 24)));
+
+    pty.expect("\x1b[?1049h");
+    pty.expect("Fire, With Intent.");
+    pty.send(&"A".repeat(100));
+    pty.expect("… A");
+
+    pty.send("\x03");
+    pty.expect("\x1b[?1049l");
+    assert_eq!(pty.wait(), 0);
+}
+
+/// 四个目标尺寸的真终端渲染：欢迎面板、真实工具名与欢迎语都在首屏。
+#[test]
+fn pty_tui_welcome_panel_renders_at_target_sizes() {
+    for (cols, rows) in [(80, 24), (100, 30), (140, 40), (180, 50)] {
+        let (mut pty, _dir, _model) = spawn_tui(
+            "tui-target-size",
+            Vec::new(),
+            &["--tui"],
+            Some((cols, rows)),
+        );
+
+        pty.expect("\x1b[?1049h");
+        pty.expect("IGNIS v");
+        pty.expect("Available Tools");
+        pty.expect("fs_read");
+        pty.expect("Fire, With Intent.");
+
+        pty.send("/exit\r");
+        pty.expect("\x1b[?1049l");
+        assert_eq!(pty.wait(), 0, "{cols}x{rows}：/exit 应以 0 退出");
+    }
+}
+
+/// Resize：80×24 的小档横幅在拉到 140×40 后重排成大档（副标题出现），面板不丢。
+#[test]
+fn pty_tui_resize_recomposes_the_welcome_panel() {
+    let (mut pty, _dir, _model) = spawn_tui("tui-resize", Vec::new(), &["--tui"], Some((80, 24)));
+
+    pty.expect("\x1b[?1049h");
+    pty.expect("Available Tools");
+    pty.expect("Fire, With Intent.");
+    assert!(
+        !pty.output().contains("Your Heraclitus."),
+        "80×24 走 Small 档，不该有大型横幅副标题：\n{}",
+        pty.output()
+    );
+
+    pty.resize(140, 40);
+    pty.expect("Your Heraclitus.");
+    pty.expect("Ever-Living Fire.");
+    pty.expect("Available Tools");
+
+    pty.send("/exit\r");
+    pty.expect("\x1b[?1049l");
+    assert_eq!(pty.wait(), 0, "/exit 应以 0 退出");
 }
 
 /// `TERM=dumb`：`--tui` 只多打一行 note，一个字节都不进备用屏；经典 REPL 照常跑完一轮、Ctrl+D

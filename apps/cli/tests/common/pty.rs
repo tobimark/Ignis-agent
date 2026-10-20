@@ -91,12 +91,14 @@ impl Pty {
     ///
     /// 启动失败直接 panic（用例失败），不给「没有 pty 就跳过」的软路径：这条路线是设计钉死的。
     pub fn spawn(options: &PtyOptions<'_>) -> Pty {
+        // 先放一份空目录缓存：TUI 启动会刷新模型能力，测试不该依赖 models.dev 网络。
+        seed_empty_model_catalog(options.home);
         let (master, slave) = openpty();
-        set_window_size(&master, WINDOW_COLUMNS, WINDOW_ROWS);
+        set_window_size(master.as_raw_fd(), WINDOW_COLUMNS, WINDOW_ROWS);
         // 用例要的尺寸（过小终端的降级）：在子进程起来之前按从端设好；`None` 时上面那份 200×50
         // 一个字节都不动
         if let Some((columns, rows)) = options.window {
-            set_window_size(&slave, columns, rows);
+            set_window_size(slave.as_raw_fd(), columns, rows);
         }
 
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ignis"));
@@ -168,6 +170,11 @@ impl Pty {
             slave: Some(slave),
             output,
         }
+    }
+
+    /// 改变从端窗口尺寸（模拟用户拖拽窗口）：内核会给前台进程组发 SIGWINCH。
+    pub fn resize(&self, columns: u16, rows: u16) {
+        set_window_size(self.master.as_raw_fd(), columns, rows);
     }
 
     /// 往主端写一段字节并立刻冲刷：等同于在终端上按键或粘贴。
@@ -299,6 +306,21 @@ impl Drop for Pty {
     }
 }
 
+/// 在测试 home 里放一份「刚拉取」的空模型目录缓存：避免测试启动时访问 models.dev。
+///
+/// 空目录不会命中任何模型，能力解析继续走内置 Registry；用例的断言都是终端行为，
+/// 不依赖目录内容。真实运行会写同一份缓存（`~/.ignis/model_catalog.json`）。
+fn seed_empty_model_catalog(home: &Path) {
+    if std::fs::create_dir_all(home).is_err() {
+        return;
+    }
+    let _ = ignis_runtime::catalog::ModelCatalog::write_cache(
+        &home.join("model_catalog.json"),
+        &ignis_runtime::catalog::ModelCatalog::empty(),
+        ignis_runtime::catalog::unix_now(),
+    );
+}
+
 /// 开一对 pty：主端（终端模拟器一侧）+ 从端（子进程看到的那个 tty）。
 ///
 /// `termios` / `winsize` 传 NULL 表示用系统默认：从端初值是行规范 + 回显 + `ISIG` 的常规形态，
@@ -340,7 +362,7 @@ fn set_cloexec(fd: &OwnedFd) {
 }
 
 /// 给从端定窗口尺寸（主端与从端共享同一份 winsize）。
-fn set_window_size(master: &OwnedFd, columns: u16, rows: u16) {
+fn set_window_size(fd: RawFd, columns: u16, rows: u16) {
     let size = libc::winsize {
         ws_row: rows,
         ws_col: columns,
@@ -348,7 +370,7 @@ fn set_window_size(master: &OwnedFd, columns: u16, rows: u16) {
         ws_ypixel: 0,
     };
     // SAFETY: `size` 是本函数独占的一块 `winsize`；`TIOCSWINSZ` 只读它，失败时返回非 0。
-    let rc = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size) };
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &size) };
     assert_eq!(rc, 0, "TIOCSWINSZ 失败：{}", io::Error::last_os_error());
 }
 

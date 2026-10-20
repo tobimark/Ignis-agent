@@ -1,8 +1,9 @@
 //! 技能（skills）：兼容 SKILL.md 约定的技能目录与渐进披露。
 //!
 //! 技能来源两类：仓库内置的三个（构建时嵌入二进制，见 [`BUILTIN_SKILLS`]）与用户目录
-//! `~/.ignis/skills/`（目录由调用方给出，本模块不读环境变量）。两者合并扫描：**同名 user 覆盖
-//! builtin**，畸形技能跳过并记一条警告，绝不 panic。
+//!（`~/.ignis/skills/`、项目级 `<workspace>/.ignis/skills/`；目录由调用方给出，本模块不读环境
+//! 变量）。所有目录合并扫描：**同名 user 覆盖 builtin**，畸形技能/悬空符号链接跳过并记一条警告，
+//! 绝不 panic。
 //!
 //! 渐进披露分两步：任务启动时只把名称 + 描述注入系统提示（[`skills_prompt_section`]），模型需要
 //! 时再经工具读取 SKILL.md 全文（[`SkillCatalog::get`] 的 `body`）。

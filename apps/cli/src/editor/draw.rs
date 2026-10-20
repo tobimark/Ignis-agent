@@ -107,6 +107,22 @@ pub fn cursor_row(
     walk(prefix, continuation, text, cursor, width).cursor_row
 }
 
+/// TUI 输入块复用的折行入口：返回物理行（含各自的 `prefix`/`continuation` 标记）、
+/// 光标所在物理行（0 基）与光标列数（含该行标记）。
+///
+/// 与 [`frame_with`] / [`cursor_row`] 共用 [`walk`]：TUI 与经典 REPL 的折行、制表位和
+/// 显示宽度口径因此只有一份实现。
+pub(crate) fn wrapped(
+    prefix: &str,
+    continuation: &str,
+    text: &str,
+    cursor: usize,
+    width: usize,
+) -> (Vec<String>, usize, usize) {
+    let wrapped = walk(prefix, continuation, text, cursor, width);
+    (wrapped.rows, wrapped.cursor_row, wrapped.cursor_columns)
+}
+
 /// 折行走行的产物：物理行与光标落点。
 struct Wrapped {
     /// 已经定稿的物理行（标记 + 正文），[`frame_with`] 逐行拼进帧。

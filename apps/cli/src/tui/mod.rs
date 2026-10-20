@@ -50,6 +50,7 @@ pub mod confirm;
 pub mod input;
 pub mod term;
 pub mod view;
+pub mod welcome;
 
 /// 终端尺寸（列 × 行）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,25 +112,29 @@ use std::ffi::OsStr;
 use std::io::{self, IsTerminal};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
+use ignis_core::skills::SkillCatalog;
 use ignis_core::task::TaskKind;
+use ignis_runtime::{Role, RunStatus, RuntimeEvent};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::brand;
 use crate::cli::Cli;
 use crate::commands::slash::{self, Dispatch, Parsed, Slash};
 use crate::commands::{Session, env_text_value, kernel_note, no_color_value};
 use crate::editor::draw::CONTINUATION;
 use crate::editor::history::History;
-use crate::render::{color_depth, resolve_color};
+use crate::render::{RenderFlavor, Renderer, RendererOptions, color_depth, resolve_color};
 use crate::repl::{alerts_banner_line, resume_continue};
 use crate::tui::app::{Action, Busy, InputChunk, TuiApp, Wake};
 use crate::tui::approval::{ApprovalJob, TuiApproval};
 use crate::tui::capture::CaptureSink;
 use crate::tui::term::{TerminalGuard, install_panic_hook};
-use crate::tui::view::{Scrollback, ViewFacts, compose};
+use crate::tui::view::{
+    AgentState, ContextUsage, Scrollback, ViewFacts, compose, estimate_tokens_from_chars,
+};
 
 /// 提交回显的首行标记（与输入区、编辑器同一对标记）。
 const ECHO_MARK: &str = "❯ ";
@@ -157,12 +162,15 @@ pub fn refresh_facts_with(
     let ui = session.ui_config();
     // TUI 只在终端上跑：stdout 恒是 tty，颜色只看 `ui.color` 与 `NO_COLOR`；色阶在它的结论之上
     let color = resolve_color(ui.color, true, no_color);
+    let capabilities = session.model_capabilities();
+    let context = context_usage(session, &capabilities);
     ViewFacts {
         version: env!("CARGO_PKG_VERSION"),
         workspace: session.workspace().display().to_string(),
         kernel: session.kernel().to_string(),
         session: slash::session_label(session.current_session()),
         mode: session.output_mode(),
+        interaction_mode: session.interaction_mode(),
         theme: ui.theme,
         color,
         depth: color_depth(color, colorterm, term),
@@ -171,7 +179,41 @@ pub fn refresh_facts_with(
         stats: session.last_prompt_stats().copied(),
         usage: session.last_usage().copied(),
         native: session.is_native(),
+        model: session.model().to_string(),
+        provider: capabilities.provider.clone(),
+        capabilities,
+        context,
+        tools: session.tool_names(),
+        skills: session.skill_metas(),
+        memory: session.memory_count(),
     }
+}
+
+/// 上下文占用：Provider Usage 优先（exact/estimated 都照它的标记），否则用 PromptStats 的
+/// 字符数做**明确估算**；窗口来自能力解析的 `effective_limit`，未知时显示 `?`。
+fn context_usage(
+    session: &Session,
+    capabilities: &ignis_runtime::caps::ModelCapabilities,
+) -> Option<ContextUsage> {
+    let window = capabilities.effective_limit;
+    if let Some(usage) = session.last_context_usage() {
+        // 上下文占用是这次请求的输入 token；输出 token 属于最近一轮用量，不混进窗口占用。
+        return Some(ContextUsage::new(
+            usage.input_tokens,
+            usage.estimated,
+            window,
+        ));
+    }
+    if let Some(stats) = session.last_prompt_stats() {
+        let chars = stats.system_chars.saturating_add(stats.history_chars);
+        return Some(ContextUsage::new(
+            estimate_tokens_from_chars(chars),
+            true,
+            window,
+        ));
+    }
+    // 还没有任何用量/组装统计：窗口已知时仍然展示窗口（用量显示 `-`），不假装 0。
+    Some(ContextUsage::unknown(window))
 }
 
 /// 一条已提交输入的本地分类（复用 [`slash::parse`]，只把四个需要会话/模型的形状分出来）。
@@ -191,13 +233,15 @@ pub enum Submitted {
     Learn(Option<String>),
     /// 其余同步命令：外层借用会话走一遍 `slash::dispatch`。
     Command(slash::Slash, Vec<String>),
+    /// 已发现的技能：`/<name> <task>`，转成带 `load_skill` 指令的任务。
+    Skill(String, String),
     /// 任务文本。
     Task(String),
 }
 
-/// 分类一行已提交的输入：只按 TUI 的执行方式把四个形状挑出来，其余照 `slash` 那一份口径走。
-pub fn classify(line: &str) -> Submitted {
-    match slash::parse(line) {
+/// 分类一行已提交的输入：只按 TUI 的执行方式把几个形状挑出来，其余照 `slash` 那一份口径走。
+pub fn classify(line: &str, skills: &SkillCatalog) -> Submitted {
+    match slash::parse_with_skills(line, skills) {
         Parsed::Empty => Submitted::Empty,
         Parsed::Unknown(name) => Submitted::Unknown(name),
         Parsed::Command(Slash::Exit, _) => Submitted::Exit,
@@ -205,6 +249,7 @@ pub fn classify(line: &str) -> Submitted {
         Parsed::Command(Slash::Compact, _) => Submitted::Compact,
         Parsed::Command(Slash::Learn, args) => Submitted::Learn(args.first().cloned()),
         Parsed::Command(command, args) => Submitted::Command(command, args),
+        Parsed::Skill(name, prompt) => Submitted::Skill(name, prompt),
         Parsed::Task(text) => Submitted::Task(text),
     }
 }
@@ -291,23 +336,40 @@ where
         }
     };
 
-    // 3. 会话（含 `-c`）与开机行：品牌块（`--no-banner` 时不推）、`-c` 的装载、内核能力提示与
-    //    未读告警行——TUI 不打印经典**状态块**（`● Ready` 不出现），品牌块与经典路径同一份
+    // 3. 会话（含 `-c`）与开机行：TUI 用新的渲染风味；模型能力在首帧前解析一次（Registry +
+    //    用户配置是同步的，只有 OpenRouter/Ollama/vLLM 会做一次短超时探测）。
     let (mut session, approvals) = build()?;
+    session.set_render_flavor(RenderFlavor::Tui);
+    session.refresh_model_capabilities().await;
     let resume_note =
         resume_continue(&mut session, cli.continue_session).map_err(anyhow::Error::msg)?;
-    let startup = startup_lines(&session, resume_note, term.size().cols, cli.no_banner);
+    let mut startup = startup_lines(&session, resume_note, term.size().cols, cli.no_banner);
+    // `-c` 命中时把 canonical 历史重放进滚动区：只恢复模型上下文、不显示旧对话会让人以为
+    // 开了一个新会话。欢迎面板因此自然让位给 transcript。
+    if cli.continue_session && session.current_session().is_some() {
+        let facts = refresh_facts(&session);
+        startup.extend(resumed_transcript_lines(&session, &facts, term.size().cols));
+    }
 
     // 4. 主循环：输入读取线程 + 块通道；退出码原样交回
     let (tx, chunks) = mpsc::unbounded_channel();
     app::spawn_input_reader(tx);
-    let code = run(&mut session, &mut term, chunks, approvals, startup, signals).await?;
+    let code = run(
+        &mut session,
+        &mut term,
+        chunks,
+        approvals,
+        startup,
+        signals,
+        !cli.no_banner,
+    )
+    .await?;
     Ok(Some(code))
 }
 
-/// 开机行进滚动区的行（顺序即落地顺序）：品牌块（`--no-banner` 时不推）→ `-c` 的 note（未命中才有）
-/// → 内核能力提示（非 native 才有）→ 未读告警行（有才有）——每一句都来自经典路径同一份函数/常量
-/// （品牌块是 [`crate::brand::brand_block`]），TUI 不另写文案。
+/// 开机行进滚动区的行（顺序即落地顺序）：`-c` 的 note（未命中才有）→ 内核能力提示（非 native
+/// 才有）→ 未读告警行（有才有）——每一句都来自经典路径同一份函数/常量，TUI 不另写文案。
+/// 品牌横幅不进这里：它由实时欢迎面板按当前尺寸合成。
 ///
 /// 终端现场（`COLORTERM`/`TERM`/`NO_COLOR`）从进程环境读，转发给 [`startup_lines_with`]
 /// ——与 [`refresh_facts`] 同一手法。宽度由调用方给（[`start_with`] 传 `term.size().cols`）。
@@ -335,26 +397,15 @@ fn startup_lines(
 fn startup_lines_with(
     session: &Session,
     resume_note: Option<&'static str>,
-    cols: usize,
-    no_banner: bool,
-    colorterm: Option<&str>,
-    term: Option<&str>,
-    no_color: Option<&str>,
+    _cols: usize,
+    _no_banner: bool,
+    _colorterm: Option<&str>,
+    _term: Option<&str>,
+    _no_color: Option<&str>,
 ) -> Vec<String> {
+    // 品牌横幅进的是 TUI 的实时欢迎面板（可随 Resize 重排），不再写进 scrollback；
+    // 开机行只保留 `-c` note、内核能力提示与未读告警。
     let mut lines: Vec<String> = Vec::new();
-    // 品牌块：与经典路径同一个函数、同一份档位判定（宽度不足自然降档），只多了「进滚动区」这个落点
-    if !no_banner {
-        let style = brand::startup_style(
-            &session.ui_config(),
-            cols,
-            true,
-            true,
-            colorterm,
-            term,
-            no_color,
-        );
-        lines.extend(brand::brand_block(env!("CARGO_PKG_VERSION"), &style));
-    }
     lines.extend(resume_note.map(str::to_string));
     if let Some(note) = kernel_note(session.kernel()) {
         lines.push(note);
@@ -363,6 +414,57 @@ fn startup_lines_with(
         lines.push(alert);
     }
     lines
+}
+
+/// `-c` 命中后的可见 transcript：`resumed session …` 提示 + 用户回显 + assistant Markdown。
+///
+/// 只恢复模型历史而不把旧对话画出来，用户会以为开了一个新会话；这里把 canonical 历史
+/// 按与实时轮次一致的 `❯`/Markdown 排版重放进滚动区，欢迎面板因此自然让位。
+fn resumed_transcript_lines(session: &Session, facts: &ViewFacts, cols: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(id) = session.current_session() {
+        lines.extend(slash::resume_lines(id, session.history().len()));
+        lines.push(String::new());
+    }
+    let options = RendererOptions {
+        mode: session.output_mode(),
+        color: facts.color,
+        theme: facts.theme,
+        depth: facts.depth,
+        width: cols.max(1),
+    };
+    for message in session.history() {
+        match message.role {
+            Role::User => {
+                lines.extend(echo_lines(&message.content));
+                lines.push(String::new());
+            }
+            Role::Assistant => {
+                lines.extend(render_history_text(&message.content, options));
+                lines.push(String::new());
+            }
+            Role::System | Role::Tool => {}
+        }
+    }
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    lines
+}
+
+/// 用实时轮次同一个 Markdown 渲染器重放一条 assistant 历史。
+fn render_history_text(text: &str, options: RendererOptions) -> Vec<String> {
+    let (sink, buffer) = CaptureSink::pair();
+    let sink: Box<dyn std::io::Write + Send> = Box::new(sink);
+    let mut renderer = Renderer::new(sink, options, Arc::new(AtomicBool::new(false)))
+        .with_flavor(RenderFlavor::Tui);
+    renderer.on_event(&RuntimeEvent::TextDelta {
+        text: text.to_string(),
+    });
+    renderer.finish();
+    let bytes = capture::drain(&buffer);
+    let text = capture::sanitize(&bytes);
+    text.lines().map(str::to_string).collect()
 }
 
 /// TUI 主循环：空闲期读输入并执行动作，忙碌期驱动 future。返回进程退出码。
@@ -382,6 +484,7 @@ pub async fn run(
     approvals: mpsc::UnboundedReceiver<ApprovalJob>,
     startup: Vec<String>,
     signals: app::Signals,
+    welcome: bool,
 ) -> Result<ExitCode> {
     // 捕获缓冲：渲染器与滚动区共持（每轮任务的 `CaptureSink` 由 `TuiApp::capture_sink` 现取）
     let (_, buffer) = CaptureSink::pair();
@@ -396,11 +499,14 @@ pub async fn run(
     // 信号流接上（进守卫之前注册的那一份）：启动窗口里的 SIGINT 由主循环接住
     app.attach_signals(signals);
     app.set_size(term.size());
+    // `--no-banner` 关闭实时欢迎面板（开机行仍照常落地）
+    app.set_welcome(welcome);
     // 开机行先落滚动区：第一帧就带着它们（与经典路径同一份文案）
     if !startup.is_empty() {
         app.push_lines(startup);
     }
     let mut facts = refresh_facts(session);
+    app.sync_skills(&facts);
     draw_frame(term, &app, &facts);
 
     loop {
@@ -447,6 +553,7 @@ async fn handle_actions(
             // 空操作与重绘都在批末统一处理（一批至多一帧）
             Action::None | Action::Redraw => {}
             Action::Exit => return Ok(Some(ExitCode::SUCCESS)),
+            Action::Palette => app.open_palette(facts),
             Action::Submit(line) => {
                 if let Some(code) =
                     submit_line(session, app, facts, term.as_deref_mut(), &line).await?
@@ -463,6 +570,7 @@ async fn handle_actions(
                     Err(error) => app.push_lines([format!("error: {error}")]),
                 }
                 *facts = refresh_facts(session);
+                app.sync_skills(facts);
             }
         }
     }
@@ -479,14 +587,22 @@ async fn submit_line(
     term: Option<&mut TerminalGuard>,
     line: &str,
 ) -> Result<Option<ExitCode>> {
-    // 回显：用户提交的内容留在滚动区（空行不留）
+    // 回显：用户提交的内容留在滚动区（空行不留）；任务轮次后留一个空行，正文不贴在 ❯ 行下面
     let echo = echo_lines(line);
-    if !echo.is_empty() {
+    let has_echo = !echo.is_empty();
+    if has_echo {
         app.push_lines(echo);
+    }
+    let submitted = {
+        let skills = session.skills();
+        classify(line, &skills)
+    };
+    if matches!(&submitted, Submitted::Task(_) | Submitted::Skill(_, _)) && has_echo {
+        app.push_lines([String::new()]);
     }
 
     let mut exit = false;
-    match classify(line) {
+    match submitted {
         // 空行：什么都不做（编辑器可能提交空串）
         Submitted::Empty => {}
         // 未知命令：本地报错行，绝不送模型
@@ -503,11 +619,30 @@ async fn submit_line(
         // `/learn` 需要模型往返 + 内联确认：同一个忙碌子循环里驱动（确认面接进本轮）
         Submitted::Learn(arg) => learn_turn(session, app, facts, term, arg).await,
         Submitted::Command(command, args) => {
+            // `/model <name>` 改的是会话覆盖；`/kernel` 可能从外部内核切回 native。两种情况下
+            // 能力解析都要跟着刷新；`/model info` 读的是当前缓存，不重复探测。
+            let refresh_caps =
+                (matches!(command, Slash::Model) && !args.is_empty() && args[0] != "info")
+                    || matches!(command, Slash::Kernel);
             exit = sync_command(session, app, command, &args);
+            if refresh_caps {
+                session.refresh_model_capabilities().await;
+            }
+        }
+        Submitted::Skill(name, prompt) => {
+            task_turn(
+                session,
+                app,
+                facts,
+                term,
+                slash::skill_task_prompt(&name, &prompt),
+            )
+            .await
         }
         Submitted::Task(prompt) => task_turn(session, app, facts, term, prompt).await,
     }
     *facts = refresh_facts(session);
+    app.sync_skills(facts);
     Ok(exit.then_some(ExitCode::SUCCESS))
 }
 
@@ -548,7 +683,13 @@ async fn compact_turn(
                 .await
         }
     };
+    let state = if result.is_ok() {
+        AgentState::Completed
+    } else {
+        AgentState::Failed
+    };
     app.end_busy();
+    app.finish_turn(state);
     match result {
         Ok(lines) => app.push_lines(lines),
         Err(error) => app.push_lines([format!("error: {error}")]),
@@ -577,7 +718,13 @@ async fn learn_turn(
         Some(term) => app.drive(term, facts, learn, Some(cancel)).await,
         None => app.drive_headless(facts, learn, Some(cancel)).await,
     };
+    let state = if result.is_ok() {
+        AgentState::Completed
+    } else {
+        AgentState::Failed
+    };
     app.end_busy();
+    app.finish_turn(state);
     match result {
         Ok(lines) => app.push_lines(lines),
         Err(error) => app.push_lines([format!("error: {error}")]),
@@ -595,6 +742,8 @@ async fn task_turn(
     prompt: String,
 ) {
     app.begin_busy(Busy::Task);
+    // 段标：滚动区里明确区分「模型在想」与「结果正文」；正文开始时会再补 `◉ Response`。
+    app.push_lines(["\u{1b}[2m◈ Thinking…\u{1b}[0m".to_string()]);
     let out: Box<dyn std::io::Write + Send> = Box::new(app.capture_sink());
     let result = match term {
         Some(term) => {
@@ -616,6 +765,11 @@ async fn task_turn(
         }
     };
     app.end_busy();
+    let state = match &result {
+        Ok(outcome) if outcome.status == RunStatus::Success => AgentState::Completed,
+        Ok(_) | Err(_) => AgentState::Failed,
+    };
+    app.finish_turn(state);
     if let Err(error) = result {
         app.push_lines([format!("error: {error}")]);
     }
@@ -624,17 +778,19 @@ async fn task_turn(
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
+    use std::path::Path;
     use std::process::ExitCode;
     use std::time::Duration;
 
     use clap::Parser;
     use ignis_core::config::{ColorChoice, Config, UiConfig};
+    use ignis_core::skills::SkillCatalog;
     use ignis_core::task::TaskKind;
+    use ignis_runtime::caps::CapabilitySource;
     use ignis_runtime::test_support::{ScriptStep, ScriptedModel};
     use ignis_storage::NewAlert;
     use tokio::sync::mpsc;
 
-    use crate::brand;
     use crate::cli::Cli;
     use crate::commands::Session;
     use crate::commands::fixtures::{
@@ -786,13 +942,18 @@ mod tests {
         super::handle_actions(session, app, facts, None, actions).await
     }
 
-    /// 一条已提交输入的本地分类：四个需要会话/模型的形状分出来，其余原样走 `slash` 那条路。
+    /// 一条已提交输入的本地分类：命令、技能、任务与未知命令各走各的路。
     #[test]
-    fn classify_routes_commands_tasks_and_unknown() {
+    fn classify_routes_commands_skills_tasks_and_unknown() {
+        let skills = SkillCatalog::load(Path::new("/nonexistent/ignis-tui-classify-skills"));
         let cases = [
             ("", Submitted::Empty),
             ("  ", Submitted::Empty),
             ("/nope", Submitted::Unknown("nope".to_string())),
+            (
+                "/server-health check disk",
+                Submitted::Skill("server-health".to_string(), "check disk".to_string()),
+            ),
             ("/exit", Submitted::Exit),
             ("/sessions", Submitted::Sessions),
             ("/compact", Submitted::Compact),
@@ -813,7 +974,7 @@ mod tests {
             ),
         ];
         for (line, want) in cases {
-            assert_eq!(classify(line), want, "{line:?}");
+            assert_eq!(classify(line, &skills), want, "{line:?}");
         }
     }
 
@@ -835,6 +996,17 @@ mod tests {
         assert_eq!(facts.history_messages, session.history().len());
         assert_eq!(facts.stats, session.last_prompt_stats().copied());
         assert_eq!(facts.usage, session.last_usage().copied());
+        assert_eq!(facts.model, session.model());
+        assert_eq!(facts.provider, "OpenAI");
+        assert_eq!(facts.capabilities.context_window, Some(128_000));
+        assert_eq!(
+            facts.context.map(|context| context.segment(10)).as_deref(),
+            Some("ctx -/128K [----------] --"),
+            "首帧已知窗口，没有用量时显示 `-` 而不是假 0"
+        );
+        assert_eq!(facts.tools.len(), 10, "6 内置 + 4 元工具");
+        assert_eq!(facts.skills.len(), 3, "内置技能目录");
+        assert_eq!(facts.memory, Some(0), "空记忆库");
         assert!(facts.native, "native 内核");
         assert!(!facts.color, "`NO_COLOR=1`（非空）恒无色");
         assert_eq!(facts.depth, ColorDepth::None, "不上色时色阶恒 None");
@@ -891,6 +1063,61 @@ mod tests {
 
         // 不带注入的入口读进程环境（这里只钉它不 panic、且与注入变体同形）
         assert_eq!(refresh_facts(&session).version, env!("CARGO_PKG_VERSION"));
+    }
+
+    /// `-c` 的可见历史：用户回显与 assistant Markdown 都要重放，且无色现场零 SGR。
+    #[test]
+    fn resumed_transcript_replays_user_and_assistant_messages() {
+        let (_dir, mut session) = session_fixture("tui-transcript", "native");
+        let id = session
+            .store()
+            .create_session(session.workspace(), "native", None, "问一句")
+            .expect("创建会话")
+            .id;
+        session
+            .store()
+            .append_turn(&id, "问一句", Some("答一句"))
+            .expect("追加轮次");
+        session.resume_session(&id).expect("恢复会话");
+
+        let facts = refresh_facts_with(&session, Some("1"), None, Some("xterm-256color"));
+        let lines = super::resumed_transcript_lines(&session, &facts, 80);
+        let joined = lines.join("\n");
+        assert!(joined.contains("resumed session"), "{joined}");
+        assert!(joined.contains("❯ 问一句"), "{joined}");
+        assert!(joined.contains("答一句"), "{joined}");
+        assert!(
+            !lines.iter().any(|line| line.contains('\u{1b}')),
+            "无色现场零 SGR：{joined}"
+        );
+    }
+
+    /// `/model <name>`：切换后能力解析与状态栏窗口必须跟着换，不能沿用旧模型的缓存。
+    #[tokio::test]
+    async fn model_switch_refreshes_capabilities_and_facts() {
+        let (_dir, mut session) = session_fixture("tui-model-switch", "native");
+        let mut app = headless_app();
+        let mut facts = refresh_facts(&session);
+        assert_eq!(facts.model, "gpt-4o-mini");
+        assert_eq!(facts.capabilities.context_window, Some(128_000));
+        assert_eq!(
+            facts.context.map(|context| context.segment(10)).as_deref(),
+            Some("ctx -/128K [----------] --")
+        );
+
+        submit(&mut session, &mut app, &mut facts, "/model gpt-4.1")
+            .await
+            .unwrap();
+
+        assert_eq!(session.model(), "gpt-4.1");
+        assert_eq!(facts.model, "gpt-4.1");
+        assert_eq!(facts.capabilities.context_window, Some(1_047_576));
+        assert_eq!(facts.capabilities.source, CapabilitySource::Registry);
+        assert_eq!(
+            facts.context.map(|context| context.segment(10)).as_deref(),
+            Some("ctx -/1M [----------] --"),
+            "切换模型后窗口跟着换，不能沿用旧模型的 128K"
+        );
     }
 
     /// 同步命令：回显与命令的输出行都进滚动区，动作之后会话事实跟着刷新；`/exit` 交回退出码 0。
@@ -977,7 +1204,8 @@ mod tests {
         assert_eq!(
             view.input,
             InputBlock {
-                lines: [String::new(), String::new(), SELECTOR_HINT.to_string()],
+                lines: Vec::new(),
+                hint: SELECTOR_HINT.to_string(),
                 cursor: None,
             },
             "选择器不落光标、提示行是选择器那一句"
@@ -1169,25 +1397,13 @@ mod tests {
         );
     }
 
-    /// 开机行（进滚动区）：品牌块（`--no-banner` 时不推）→ `-c` 的 note → 内核能力提示（非 native
-    /// 才有）→ 未读告警行（有才有）——三句文案与品牌块都来自经典路径同一份函数，TUI 不另写文案，
-    /// 也不打印经典状态块（`● Ready` 不在这条路上）。
+    /// 开机行（进滚动区）：`-c` 的 note → 内核能力提示（非 native 才有）→ 未读告警行（有才有）。
+    ///
+    /// 品牌横幅由 TUI 的实时欢迎面板合成（可随 Resize 重排），**不再**写进 scrollback；
+    /// `--no-banner` 只关欢迎面板，不改变开机行。
     #[test]
-    fn tui_startup_lines_are_the_classic_copies() {
-        // 非 native：200 列的可用终端走 Full 档（品牌块 = 字模 13 行）+ `-c` 未命中的 note +
-        // 内核能力提示。`NO_COLOR=1` 现场零 SGR，品牌块逐字可读。
+    fn tui_startup_lines_skip_the_brand_block() {
         let (_dir, codex) = session_fixture("tui-startup", "codex");
-        let style = brand::startup_style(
-            &codex.ui_config(),
-            200,
-            true,
-            true,
-            None,
-            Some("xterm-256color"),
-            Some("1"),
-        );
-        let brand_lines = brand::brand_block(env!("CARGO_PKG_VERSION"), &style);
-        assert_eq!(brand_lines.len(), 13, "Full 档是字模的 13 行");
         let lines = startup_lines_with(
             &codex,
             Some(no_session_note()),
@@ -1197,19 +1413,17 @@ mod tests {
             Some("xterm-256color"),
             Some("1"),
         );
-        assert_eq!(lines.len(), 13 + 2, "{lines:?}");
-        assert_eq!(lines[..13], brand_lines[..], "前 13 行就是品牌块");
-        assert!(
-            lines[..13].iter().any(|line| line.contains("IGNIS v")),
-            "品牌块里有字标那一行：{lines:?}"
-        );
         assert_eq!(
-            lines[13..],
+            lines,
             [
                 no_session_note().to_string(),
                 kernel_note("codex").expect("非 native 有能力提示"),
             ],
-            "末尾两行仍是 `-c` 的 note 与内核提示"
+            "只剩 note 与内核提示"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("IGNIS v")),
+            "品牌横幅不写 scrollback：{lines:?}"
         );
         assert!(
             !lines.iter().any(|line| line == "● Ready"),
@@ -1220,7 +1434,7 @@ mod tests {
             "0 条未读：没有告警行：{lines:?}"
         );
 
-        // `--no-banner`：品牌块整块不推，只剩 note 与内核提示
+        // `--no-banner` 只影响欢迎面板，不改变开机行。
         assert_eq!(
             startup_lines_with(
                 &codex,
@@ -1231,13 +1445,10 @@ mod tests {
                 Some("xterm-256color"),
                 Some("1"),
             ),
-            [
-                no_session_note().to_string(),
-                kernel_note("codex").expect("非 native 有能力提示"),
-            ]
+            lines
         );
 
-        // 上色现场（真彩 + 暗色主题）：品牌块的字标那一段是 `bold + brand` 的品牌橙
+        // 上色现场也不会凭空多出品牌块（欢迎面板自己上色）。
         let colored = startup_lines_with(
             &codex,
             None,
@@ -1247,12 +1458,11 @@ mod tests {
             Some("xterm-256color"),
             None,
         );
-        assert!(
-            colored
-                .iter()
-                .any(|line| line.contains("\u{1b}[1m\u{1b}[38;2;247;131;64mIGNIS v")),
-            "字标必须带上品牌色：{colored:?}"
+        assert_eq!(
+            colored,
+            [kernel_note("codex").expect("非 native 有能力提示")]
         );
+        assert!(!colored.iter().any(|line| line.contains('\u{1b}')));
 
         // 未读告警：告警行就是 `alerts_banner_line` 那一份（排在最后）
         let (_dir, alerting) = session_fixture("tui-startup-alerts", "native");
@@ -1282,18 +1492,15 @@ mod tests {
             [alerts_banner_line(Some(2)).expect("有未读就有告警行")]
         );
 
-        // native 且 `-c` 命中：三句 note 都不出现
+        // native 且 `-c` 命中：所有 note 都不出现
         let (_dir, native) = session_fixture("tui-startup-native", "native");
         assert_eq!(
             startup_lines_with(&native, None, 80, true, None, Some("xterm-256color"), None),
             Vec::<String>::new()
         );
-        // 不带注入的入口读进程环境（这里只钉它照样走品牌块那条路、且不掺经典状态块）
-        let lines = startup_lines(&native, None, 80, false);
-        assert!(
-            lines.iter().any(|line| line.contains("IGNIS v")),
-            "{lines:?}"
+        assert_eq!(
+            startup_lines(&native, None, 80, false),
+            Vec::<String>::new()
         );
-        assert!(!lines.iter().any(|line| line == "● Ready"), "{lines:?}");
     }
 }

@@ -1,4 +1,5 @@
-//! `ignis skills list`：打印合并后的技能目录（内置三技能 + `~/.ignis/skills/`）。
+//! `ignis skills list`：打印合并后的技能目录（内置三技能 + 项目级 `.ignis/skills/` +
+//! `~/.ignis/skills/`），并给出 `/ <skill> <task>` 的调用方式。
 
 use std::process::ExitCode;
 
@@ -13,8 +14,14 @@ use crate::cli::SkillsCommand;
 pub fn run(command: &SkillsCommand) -> Result<ExitCode> {
     match command {
         SkillsCommand::List => {
-            // 技能目录不存在不算错误（`SkillCatalog::load` 只回内置三技能）
-            let catalog = SkillCatalog::load(&ignis_home().join("skills"));
+            // 技能目录不存在不算错误（`SkillCatalog::load_all` 只回内置三技能）。
+            // 当前目录的项目级 `.ignis/skills` 在前，全局 `~/.ignis/skills` 在后。
+            let mut dirs = Vec::new();
+            if let Ok(cwd) = std::env::current_dir() {
+                dirs.push(cwd.join(".ignis/skills"));
+            }
+            dirs.push(ignis_home().join("skills"));
+            let catalog = SkillCatalog::load_all(&dirs);
             print!("{}", render(&catalog));
             Ok(ExitCode::SUCCESS)
         }
@@ -47,6 +54,7 @@ pub(crate) fn render(catalog: &SkillCatalog) -> String {
     for warning in catalog.warnings() {
         out.push_str(&format!("! {warning}\n"));
     }
+    out.push_str("Invoke: /<name> <task>\n");
     out
 }
 
@@ -120,13 +128,12 @@ mod tests {
         let catalog = SkillCatalog::load(dir.path());
         let out = render(&catalog);
 
-        // 表头 + 每个技能一行；内置三技能 + 用户技能，行的顺序即目录顺序（按名称排序）
-        assert_eq!(out.lines().count(), catalog.metas().len() + 1, "{out}");
-        assert_eq!(
-            cells(out.lines().next().unwrap()),
-            ["NAME", "SOURCE", "DESCRIPTION"],
-            "{out}"
-        );
+        // 表头 + 每个技能一行 + 末尾一行调用提示；内置三技能 + 用户技能，顺序即目录顺序。
+        let lines: Vec<&str> = out.lines().collect();
+        let table_rows = catalog.metas().len() + 1;
+        assert_eq!(lines.len(), table_rows + 1, "{out}");
+        assert_eq!(cells(lines[0]), ["NAME", "SOURCE", "DESCRIPTION"], "{out}");
+        assert_eq!(lines.last(), Some(&"Invoke: /<name> <task>"), "{out}");
         let row = |name: &str| {
             out.lines()
                 .find(|line| line.starts_with(name))
@@ -140,8 +147,11 @@ mod tests {
             "{out}"
         );
         assert_eq!(cells(row("server-health"))[0], "server-health");
-        // 用户技能排在内置之后（ID 列就是目录顺序）
-        let names: Vec<String> = out.lines().map(|line| cells(line)[0].to_string()).collect();
+        // 用户技能排在内置之后（ID 列就是目录顺序；末尾调用提示不算技能行）
+        let names: Vec<String> = lines[..table_rows]
+            .iter()
+            .map(|line| cells(line)[0].to_string())
+            .collect();
         let expected: Vec<String> = ["NAME"]
             .into_iter()
             .map(str::to_string)
@@ -162,15 +172,24 @@ mod tests {
 
         let lines: Vec<&str> = out.lines().collect();
         let table_rows = catalog.metas().len() + 1;
-        assert_eq!(lines.len(), table_rows + catalog.warnings().len(), "{out}");
+        let warnings = catalog.warnings().len();
+        assert_eq!(
+            lines.len(),
+            table_rows + warnings + 1,
+            "表格 + 警告 + 调用提示：{out}"
+        );
         assert!(
             !lines[..table_rows]
                 .iter()
                 .any(|line| line.starts_with("! ")),
             "警告只能在表后：{out}"
         );
-        for (line, warning) in lines[table_rows..].iter().zip(catalog.warnings()) {
+        for (line, warning) in lines[table_rows..table_rows + warnings]
+            .iter()
+            .zip(catalog.warnings())
+        {
             assert_eq!(*line, format!("! {warning}"));
         }
+        assert_eq!(lines.last(), Some(&"Invoke: /<name> <task>"), "{out}");
     }
 }

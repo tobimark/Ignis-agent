@@ -1,7 +1,8 @@
 //! REPL 的斜杠命令：命令表、解析、纯渲染函数与分发。
 //!
 //! 三条纪律：
-//! - **解析**只认「首词逐字命中命令表」：[`COMMANDS`] 之外的所有 `/…` 都是 [`Parsed::Unknown`]，
+//! - **解析**先认「首词逐字命中命令表」：命令表之外，若首词是当前目录里已发现的技能名，
+//!   则是 [`Parsed::Skill`]（`/<skill> <task>`）；其余 `/…` 才是 [`Parsed::Unknown`]，
 //!   由 REPL 打到 stderr（v0.1 里它们会被当成任务送给模型）。
 //! - **渲染**是纯函数（名字/模式/用量 → 行）：文案、分组与对齐都写在它们里；[`dispatch`] 只做
 //!   「读会话字段 → 调渲染函数 / 调 setter」的薄接线，不自己拼字符串。
@@ -11,12 +12,14 @@ use std::path::Path;
 
 use ignis_core::config::OutputMode;
 use ignis_core::memory::FactScope;
+use ignis_core::skills::SkillCatalog;
 use ignis_core::task::PromptStats;
 use ignis_runtime::Usage;
+use ignis_runtime::caps::{CapabilitySource, ModelCapabilities};
 use ignis_storage::{SessionSummary, TaskRecord};
 
-use super::Session;
 use super::kernel::{KERNELS, NATIVE_KERNEL, kernel_note};
+use super::{InteractionMode, Session};
 use super::{memory, skills, task};
 use crate::render::short_id;
 
@@ -37,6 +40,8 @@ pub enum Slash {
     Tasks,
     /// `/skills [reload]`：技能目录（与 `ignis skills list` 同一份渲染），或重扫目录。
     Skills,
+    /// `/mode [normal|plan|auto]`：显示或切换交互模式（Plan/Auto 有真实执行边界）。
+    Mode,
     /// `/memory …`：长期记忆（list/search/add/edit/delete，复用 `ignis memory …` 的口径）。
     Memory,
     /// `/details [minimal|normal|debug]`：显示或切换输出模式。
@@ -49,6 +54,8 @@ pub enum Slash {
     Resume,
     /// `/context`：本会话的上下文预算与最近一轮用量（只读）。
     Context,
+    /// `/usage`：上下文窗口/来源、真实 Provider 用量与历史上限（只读）。
+    Usage,
     /// `/compact`：把较早轮次摘要化（保留最近两轮，原始消息保留；需要模型往返的命令）。
     Compact,
     /// `/learn [task-id]`：从一条已完成任务生成 SKILL.md 草稿，确认后落盘并 reload。
@@ -64,6 +71,8 @@ pub enum Parsed {
     Unknown(String),
     /// 认识命令：命令本身 + 按空白切分的参数。
     Command(Slash, Vec<String>),
+    /// 已发现的技能：技能名（不含 `/`）+ 其余任务文本（原样，保留内部空白/换行）。
+    Skill(String, String),
     /// 其余输入：一次任务的内容（只裁首尾空白，内部换行保留）。
     Task(String),
 }
@@ -96,8 +105,8 @@ pub enum Completion {
 const DETAILS_ERROR: &str = "details: mode must be minimal, normal or debug";
 /// `/kernel` 参数多于一个的错误（逐字）。
 const KERNEL_USAGE: &str = "kernel: usage: /kernel [native|codex|claude]";
-/// `/model` 参数多于一个的错误：与 `/kernel` 同一形状（`[name]` 只有一个位置）。
-const MODEL_USAGE: &str = "model: usage: /model [name]";
+/// `/model` 参数多于一个的错误：与 `/kernel` 同一形状（`[name|info]` 只有一个位置）。
+const MODEL_USAGE: &str = "model: usage: /model [name|info]";
 /// 会话级模型覆盖的持久化提示（`/model` 有无参两条路径共用同一份文案）。
 const MODEL_NOTE: &str = "note: session override; persist with `ignis config set model.model`";
 /// `/memory` 的形状不对时的用法行（未知子命令与 `list` 的非法旗标共用）。
@@ -114,6 +123,8 @@ const TASKS_LIMIT_ERROR: &str = "tasks: limit must be a positive number";
 const TASKS_DEFAULT_LIMIT: usize = 10;
 /// `/skills` 的参数面：只认 `reload` 这一个取值，其余（含多词）都是这条用法行。
 const SKILLS_USAGE: &str = "usage: /skills [reload]";
+/// `/mode` 的参数面：只认 normal / plan / auto。
+const MODE_USAGE: &str = "usage: /mode [normal|plan|auto]";
 /// `/resume` 缺参或多参时的用法行（命令只收一个位置）。
 const RESUME_USAGE: &str = "resume: usage: /resume <id>";
 /// `/compact` 的参数面：命令不收参数（多余词给这条用法行）。
@@ -165,9 +176,9 @@ struct Spec {
 
 /// 命令表：帮助与补全的唯一事实来源（条目、分组、参数提示与描述都只写一遍）。
 ///
-/// 顺序即组内顺序（`SESSION` 组排在最前；`INTELLIGENCE` 组按 `/memory` → `/context` → `/compact`
-/// → `/learn`）。
-const COMMANDS: [Spec; 15] = [
+/// 顺序即组内顺序（`SESSION` 组排在最前；`INTELLIGENCE` 组按 `/memory` → `/context` → `/usage`
+/// → `/compact` → `/learn`）。
+const COMMANDS: [Spec; 17] = [
     Spec {
         command: Slash::New,
         group: Group::Session,
@@ -196,8 +207,8 @@ const COMMANDS: [Spec; 15] = [
         command: Slash::Model,
         group: Group::Agent,
         name: "/model",
-        arg_hint: "[name]",
-        summary: "Show or set the model of this session",
+        arg_hint: "[name|info]",
+        summary: "Show model capabilities, or set the session model",
         expects_args: true,
     },
     Spec {
@@ -225,6 +236,14 @@ const COMMANDS: [Spec; 15] = [
         expects_args: true,
     },
     Spec {
+        command: Slash::Mode,
+        group: Group::Agent,
+        name: "/mode",
+        arg_hint: "[normal|plan|auto]",
+        summary: "Show or set the interaction mode",
+        expects_args: true,
+    },
+    Spec {
         command: Slash::Memory,
         group: Group::Intelligence,
         name: "/memory",
@@ -238,6 +257,14 @@ const COMMANDS: [Spec; 15] = [
         name: "/context",
         arg_hint: "",
         summary: "Show the context budget and the last turn usage",
+        expects_args: false,
+    },
+    Spec {
+        command: Slash::Usage,
+        group: Group::Intelligence,
+        name: "/usage",
+        arg_hint: "",
+        summary: "Show context window, source and provider usage",
         expects_args: false,
     },
     Spec {
@@ -363,6 +390,42 @@ pub fn parse(line: &str) -> Parsed {
     }
 }
 
+/// 在 [`parse`] 之上识别已发现的技能：命令表优先，其次 `/<skill> <task>`。
+///
+/// 技能目录是会话快照；调用方每轮把当前 [`SkillCatalog`] 传进来。首词不是命令、也不是技能时
+/// 仍是 [`Parsed::Unknown`]（本地报错，不送模型）。
+pub fn parse_with_skills(line: &str, skills: &SkillCatalog) -> Parsed {
+    let parsed = parse(line);
+    let Parsed::Unknown(name) = &parsed else {
+        return parsed;
+    };
+    if skills.get(name).is_none() {
+        return parsed;
+    }
+    // `parse` 已确认首词是 `/…`；按原文切掉首词，保留任务里的空格与换行。
+    let trimmed = line.trim();
+    let first = trimmed.split_whitespace().next().unwrap_or_default();
+    let prompt = trimmed[first.len()..].trim_start().to_string();
+    Parsed::Skill(name.clone(), prompt)
+}
+
+/// `/<skill> <task>` 送给模型的任务文本：先显式要求 `load_skill` 读全文，再执行用户任务。
+///
+/// 技能正文不在这里拼进 prompt（渐进披露与任务历史都保持干净）；模型经元工具读到正文，
+/// `skills_used` 也照常由事件流记账。
+pub fn skill_task_prompt(name: &str, prompt: &str) -> String {
+    let instruction = format!(
+        "Use the `{name}` skill. First call `load_skill` with name \"{name}\" to read its \
+         instructions, then follow them."
+    );
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        instruction
+    } else {
+        format!("{instruction}\n\n{prompt}")
+    }
+}
+
 /// 未知命令的报错行（REPL 打到 stderr；**绝不**送给模型）。
 pub fn unknown_command_line(name: &str) -> String {
     format!("Unknown command: /{name} — /help lists commands")
@@ -419,6 +482,136 @@ pub fn model_lines(kernel: &str, model: &str, overridden: bool) -> Result<Vec<St
         lines.push(MODEL_NOTE.to_string());
     }
     Ok(lines)
+}
+
+/// `/usage`：只列能说清来源的数字——窗口/来源、最近一次 Provider 用量、历史与字符预算。
+/// Provider 没给的缓存/累计/压缩记录不猜，直接不展示。
+fn usage_lines(session: &Session) -> Vec<String> {
+    let caps = session.model_capabilities();
+    let rule = "───────────────────────────────────";
+    let mut lines = vec!["Usage".to_string(), rule.to_string()];
+    lines.push(info_field("Model", session.model()));
+    lines.push(info_field("Provider", &caps.provider));
+    lines.push(info_field(
+        "Context Window",
+        &tokens_or_unknown(caps.effective_limit),
+    ));
+    lines.push(info_field("Window Source", caps.source.label()));
+    lines.push(info_field(
+        "Max Output",
+        &tokens_or_dash(caps.max_output_tokens),
+    ));
+    let used = match session.last_context_usage() {
+        Some(usage) => format!(
+            "{}{} input tokens (last request)",
+            if usage.estimated { "≈" } else { "" },
+            usage.input_tokens
+        ),
+        None => "- (no provider usage yet)".to_string(),
+    };
+    lines.push(info_field("Context Used", &used));
+    let last = match session.last_usage() {
+        Some(usage) => format!(
+            "{}in={} out={}",
+            if usage.estimated { "≈ " } else { "" },
+            usage.input_tokens,
+            usage.output_tokens
+        ),
+        None if session.is_native() => "-".to_string(),
+        None => "n/a (kernel reports no usage)".to_string(),
+    };
+    lines.push(info_field("Last Turn", &last));
+    let stats = session
+        .last_prompt_stats()
+        .map(|stats| {
+            format!(
+                "system {} chars · history {} chars",
+                stats.system_chars, stats.history_chars
+            )
+        })
+        .unwrap_or_else(|| "-".to_string());
+    lines.push(info_field("Prompt Stats", &stats));
+    lines.push(info_field(
+        "History",
+        &format!(
+            "{} messages · {} chars budget",
+            session.history().len(),
+            session.context_budget()
+        ),
+    ));
+    lines.push(rule.to_string());
+    lines
+}
+
+/// `/model info` 的输出：能力来源、原生窗口、运行时/用户限制与有效限制。
+///
+/// 未知值一律 `Unknown` / `--`，绝不猜一个 200K 顶上；用户把原生窗口压低时，有效限制后面
+/// 标注 `(capped by user config)`，同时保留原生窗口那一行，便于判断是谁在约束。
+pub fn model_info_lines(kernel: &str, caps: &ModelCapabilities) -> Result<Vec<String>, String> {
+    if kernel != NATIVE_KERNEL {
+        return Err(format!(
+            "model: not applicable — kernel {kernel} uses its own default model"
+        ));
+    }
+    let rule = "───────────────────────────────────";
+    let mut lines = vec![
+        "Model Information".to_string(),
+        rule.to_string(),
+        info_field("Provider", &caps.provider),
+        info_field("Model", &caps.model_id),
+        info_field("Context Window", &tokens_or_unknown(caps.context_window)),
+        info_field("Max Input", &tokens_or_dash(caps.max_input_tokens)),
+        info_field("Max Output", &tokens_or_dash(caps.max_output_tokens)),
+        info_field("Runtime Limit", &tokens_or_dash(caps.runtime_limit)),
+        info_field("User Limit", &tokens_or_dash(caps.user_limit)),
+    ];
+    let mut effective = tokens_or_unknown(caps.effective_limit);
+    if caps.effective_source == CapabilitySource::UserConfig
+        && caps.context_window.is_some()
+        && caps.effective_limit != caps.context_window
+    {
+        effective.push_str(" (capped by user config)");
+    }
+    lines.push(info_field("Effective Limit", &effective));
+    lines.push(info_field("Source", caps.source.label()));
+    lines.push(rule.to_string());
+    if caps.effective_limit.is_none() {
+        lines.push("hint: set model.context_window for custom endpoints".to_string());
+        lines.push("      ignis config set model.context_window <tokens>".to_string());
+    }
+    Ok(lines)
+}
+
+/// `/model info` 的一行：标签列宽 16（最长 `Effective Limit` 15 列）。
+fn info_field(label: &str, value: &str) -> String {
+    format!("{label:<16}{value}")
+}
+
+fn tokens_or_unknown(value: Option<u64>) -> String {
+    value.map_or_else(
+        || "Unknown".to_string(),
+        |tokens| format!("{} tokens", grouped_tokens(tokens)),
+    )
+}
+
+fn tokens_or_dash(value: Option<u64>) -> String {
+    value.map_or_else(
+        || "--".to_string(),
+        |tokens| format!("{} tokens", grouped_tokens(tokens)),
+    )
+}
+
+/// 千位分隔：`128000` → `128,000`（`/model info` 的可读性）。
+fn grouped_tokens(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// banner 与 `/status` 共用的会话行取值：`new` 或 13 字符短 id（与任务短 id 同一 helper——
@@ -550,6 +743,65 @@ pub fn complete(buffer: &str) -> Completion {
         Some(spec) if spec.command == Slash::Kernel => complete_kernel_value(spec.name, argument),
         // 已知命令但参数面还没有候选（`/memory` 的子命令补全留待后续阶段），未知命令更没有
         _ => Completion::None,
+    }
+}
+
+/// 命令面板的静态命令项：`(可搜索的标签, 选中后填进输入区的文本)`。
+///
+/// 标签带参数提示与一行描述；选中只填命令（有参数的命令补一个空格），由用户补参数再提交。
+pub fn palette_commands() -> Vec<(String, String)> {
+    COMMANDS
+        .iter()
+        .map(|spec| {
+            let label = format!("{} — {}", spec_label(spec), spec.summary);
+            let insert = if spec.expects_args {
+                format!("{} ", spec.name)
+            } else {
+                spec.name.to_string()
+            };
+            (label, insert)
+        })
+        .collect()
+}
+
+/// 在 [`complete`] 之上补已发现技能：命令表优先，行首位置同时列出技能名。
+///
+/// 参数位（空白之后）完全复用 [`complete`]；技能只参与首词补全。唯一命中时补一个空格，
+/// 多候选把静态命令行与技能行一起列出。
+pub fn complete_with_skills(buffer: &str, skills: &[String]) -> Completion {
+    let text = buffer.trim_start();
+    if !text.starts_with('/') {
+        return Completion::None;
+    }
+    if text.split_once(char::is_whitespace).is_some() {
+        return complete(buffer);
+    }
+    match complete_command_name(text) {
+        Completion::Accepted(value) => return Completion::Accepted(value),
+        Completion::None => {}
+        Completion::Listing(mut lines) => {
+            lines.extend(
+                skills
+                    .iter()
+                    .filter(|name| format!("/{name}").starts_with(text))
+                    .map(|name| format!("  /{name}  skill")),
+            );
+            return if lines.is_empty() {
+                Completion::None
+            } else {
+                Completion::Listing(lines)
+            };
+        }
+    }
+    let matches: Vec<String> = skills
+        .iter()
+        .map(|name| format!("/{name}"))
+        .filter(|name| name.starts_with(text))
+        .collect();
+    match matches.as_slice() {
+        [] => Completion::None,
+        [only] => Completion::Accepted(format!("{only} ")),
+        many => Completion::Listing(many.iter().map(|name| format!("  {name}  skill")).collect()),
     }
 }
 
@@ -786,6 +1038,10 @@ pub fn dispatch(
         }
         Slash::Model => {
             let lines = match args {
+                // `info` 是保留子命令：展示能力来源与有效限制（模型名恰好叫 info 时请用配置）。
+                [word] if word == "info" => {
+                    model_info_lines(session.kernel(), &session.model_capabilities())?
+                }
                 [] => model_lines(
                     session.kernel(),
                     session.model(),
@@ -821,6 +1077,7 @@ pub fn dispatch(
             session.context_budget(),
             session.last_usage(),
         ))),
+        Slash::Usage => Ok(Dispatch::Lines(usage_lines(session))),
         // `/compact` 与 `/learn` 需要模型往返：分发只交回意图（`/compact`）或参数（`/learn`），
         // REPL 接住并 `await` 会话的执行（执行在会话侧，参数面在这里判定——多余词不查库、不动会话）
         Slash::Compact => match args {
@@ -866,6 +1123,23 @@ pub fn dispatch(
                 Ok(Dispatch::Lines(vec![skills::reloaded_line(count)]))
             }
             _ => Err(SKILLS_USAGE.to_string()),
+        },
+        Slash::Mode => match args {
+            [] => Ok(Dispatch::Lines(vec![format!(
+                "interaction mode: {}",
+                session.interaction_mode().label()
+            )])),
+            [word] => {
+                let Some(mode) = InteractionMode::parse(word) else {
+                    return Err(MODE_USAGE.to_string());
+                };
+                session.set_interaction_mode(mode)?;
+                Ok(Dispatch::Lines(vec![format!(
+                    "interaction mode: {}",
+                    mode.label()
+                )]))
+            }
+            _ => Err(MODE_USAGE.to_string()),
         },
         Slash::Tasks => {
             let limit = tasks_limit(args)?;
@@ -1050,6 +1324,104 @@ mod tests {
         );
     }
 
+    /// 命令面板与技能补全共用命令表：静态项可搜索，技能只在首词位置出现。
+    #[test]
+    fn palette_and_skill_completion_share_the_command_surface() {
+        let commands = palette_commands();
+        assert!(
+            commands
+                .iter()
+                .any(|(label, insert)| label.contains("/status") && insert == "/status"),
+            "{commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|(label, insert)| label.contains("/model") && insert == "/model "),
+            "{commands:?}"
+        );
+
+        let skills = vec!["brainstorming".to_string(), "writing-plans".to_string()];
+        assert_eq!(
+            complete_with_skills("/brain", &skills),
+            Completion::Accepted("/brainstorming ".into())
+        );
+        match complete_with_skills("/", &skills) {
+            Completion::Listing(lines) => {
+                assert!(
+                    lines.iter().any(|line| line.contains("/status")),
+                    "{lines:?}"
+                );
+                assert!(
+                    lines.iter().any(|line| line.contains("/brainstorming")),
+                    "{lines:?}"
+                );
+            }
+            other => panic!("expected listing, got {other:?}"),
+        }
+        assert_eq!(
+            complete_with_skills("/kernel n", &skills),
+            Completion::Accepted("/kernel native".into()),
+            "参数位仍走原来的补全"
+        );
+        assert_eq!(complete_with_skills("/nope", &skills), Completion::None);
+    }
+
+    /// 已发现的技能名成为 `/ <skill> <task>`；命令表优先，未发现仍是未知命令。
+    #[test]
+    fn skill_parse_wins_only_after_the_command_table() {
+        let skills = SkillCatalog::load(std::path::Path::new("/nonexistent/ignis-parse-skills"));
+        assert_eq!(
+            parse_with_skills("/server-health 检查磁盘", &skills),
+            Parsed::Skill("server-health".into(), "检查磁盘".into())
+        );
+        assert_eq!(
+            parse_with_skills("/server-health", &skills),
+            Parsed::Skill("server-health".into(), String::new())
+        );
+        assert_eq!(
+            parse_with_skills("/help", &skills),
+            Parsed::Command(Slash::Help, Vec::new()),
+            "命令表优先于同名技能"
+        );
+        assert_eq!(
+            parse_with_skills("/brainstorming 做点东西", &skills),
+            Parsed::Unknown("brainstorming".into()),
+            "未发现的技能仍是未知命令"
+        );
+        assert_eq!(
+            skill_task_prompt("brainstorming", "给我做一个物业系统。"),
+            "Use the `brainstorming` skill. First call `load_skill` with name \"brainstorming\" \
+             to read its instructions, then follow them.\n\n给我做一个物业系统。"
+        );
+        assert_eq!(
+            skill_task_prompt("brainstorming", "   "),
+            "Use the `brainstorming` skill. First call `load_skill` with name \"brainstorming\" \
+             to read its instructions, then follow them."
+        );
+    }
+
+    /// 项目级 `<workspace>/.ignis/skills` 会被会话加载，并进入动态技能命令。
+    #[test]
+    fn project_skills_load_and_invoke() {
+        let (_dir, mut session) = session_fixture("slash-project-skill", "native");
+        let skill = session.workspace().join(".ignis/skills/brainstorming");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: brainstorming\ndescription: Brainstorm.\n---\n# Brainstorming\n",
+        )
+        .unwrap();
+
+        session.reload_skills();
+        let skills = session.skills();
+        assert!(skills.get("brainstorming").is_some());
+        assert_eq!(
+            parse_with_skills("/brainstorming 给我做一个物业系统。", &skills),
+            Parsed::Skill("brainstorming".into(), "给我做一个物业系统。".into())
+        );
+    }
+
     /// `/help` 的形状：组名独占一行、每个条目恰好一行、描述逐字。
     #[test]
     fn help_lines_lists_every_command_in_its_group() {
@@ -1078,18 +1450,31 @@ mod tests {
             assert!(hits[0].ends_with(spec.summary), "{:?}", hits[0]);
         }
 
-        // 分组对齐逐字钉住：AGENT 组最宽是 `/skills [reload]`（16 列），列间两个空格
+        // 分组对齐逐字钉住：AGENT 组最宽是 `/mode [normal|plan|auto]`（24 列），列间两个空格
         let agent = lines
             .iter()
             .position(|line| line == "AGENT")
             .expect("AGENT 组标题");
+        let agent_line = |label: &str, summary: &str| {
+            format!("  {label}{}  {summary}", " ".repeat(24 - label.len()))
+        };
         assert_eq!(
-            &lines[agent + 1..agent + 5],
+            &lines[agent + 1..agent + 6],
             [
-                "  /model [name]     Show or set the model of this session",
-                "  /status           Show kernel, model, workspace, alerts and last usage",
-                "  /tasks [N]        List the most recent tasks (default 10)",
-                "  /skills [reload]  List the skill catalog, or reload it",
+                agent_line(
+                    "/model [name|info]",
+                    "Show model capabilities, or set the session model"
+                ),
+                agent_line(
+                    "/status",
+                    "Show kernel, model, workspace, alerts and last usage"
+                ),
+                agent_line("/tasks [N]", "List the most recent tasks (default 10)"),
+                agent_line("/skills [reload]", "List the skill catalog, or reload it"),
+                agent_line(
+                    "/mode [normal|plan|auto]",
+                    "Show or set the interaction mode"
+                ),
             ]
         );
 
@@ -1194,7 +1579,7 @@ mod tests {
         );
         // 组里没有多余的行：`/context` 之后是 `/compact`（Task 7 进表，逐字断言在
         // `help_lines_carry_the_compact_row` 里）、再后面是 `/learn`（P4），然后才是下一个分组的标题
-        assert_eq!(lines[intelligence + 5], "INTERFACE", "{lines:?}");
+        assert_eq!(lines[intelligence + 6], "INTERFACE", "{lines:?}");
 
         // 条目本身：无参数提示、不进参数补全，解析与 Tab 补全都认它
         let spec = COMMANDS
@@ -1215,6 +1600,57 @@ mod tests {
         assert_eq!(
             complete("/con"),
             Completion::Accepted("/context".to_string())
+        );
+        assert_eq!(parse("/usage"), Parsed::Command(Slash::Usage, Vec::new()));
+        assert_eq!(complete("/usa"), Completion::Accepted("/usage".to_string()));
+    }
+
+    /// `/mode`：显示/切换 Normal/Plan/Auto；Plan/Auto 的真实边界在任务执行层。
+    #[test]
+    fn mode_command_shows_and_switches_interaction_mode() {
+        let (_dir, mut session) = session_fixture("slash-mode", "native");
+        assert_eq!(
+            dispatch_lines(&mut session, Slash::Mode, &[]),
+            ["interaction mode: Normal"]
+        );
+        assert_eq!(
+            dispatch_lines(&mut session, Slash::Mode, &["plan".to_string()]),
+            ["interaction mode: Plan"]
+        );
+        assert_eq!(session.interaction_mode(), InteractionMode::Plan);
+        assert_eq!(
+            dispatch_lines(&mut session, Slash::Mode, &["auto".to_string()]),
+            ["interaction mode: Auto"]
+        );
+        assert_eq!(session.interaction_mode(), InteractionMode::Auto);
+        assert_eq!(
+            dispatch(&mut session, Slash::Mode, &["turbo".to_string()]).unwrap_err(),
+            MODE_USAGE
+        );
+        assert_eq!(
+            session.interaction_mode(),
+            InteractionMode::Auto,
+            "非法值不改模式"
+        );
+        assert_eq!(
+            complete("/mode"),
+            Completion::Accepted("/mode ".to_string())
+        );
+    }
+
+    /// `/usage` 只报能说清来源的数字：窗口/来源、Provider 用量与历史；不伪造缓存/累计。
+    #[test]
+    fn usage_lines_separate_window_source_from_provider_usage() {
+        let (_dir, session) = session_fixture("slash-usage", "native");
+        let lines = usage_lines(&session);
+        let joined = lines.join("\n");
+        assert!(joined.contains("Context Window"), "{joined}");
+        assert!(joined.contains("Window Source"), "{joined}");
+        assert!(joined.contains("Context Used"), "{joined}");
+        assert!(joined.contains("History"), "{joined}");
+        assert!(
+            !joined.to_lowercase().contains("cache"),
+            "没有可靠缓存数据就不展示：{joined}"
         );
     }
 
@@ -1245,7 +1681,7 @@ mod tests {
         // 收尾条目：`/compact` 只有 8 列，组内最宽条目不变，对齐按 37 列重算（列间两个空格）
         let compact_pad = memory_label.chars().count() - "/compact".chars().count();
         assert_eq!(
-            lines[intelligence + 3],
+            lines[intelligence + 4],
             format!(
                 "  /compact{}  Summarize older turns into a summary message",
                 " ".repeat(compact_pad)
@@ -1253,7 +1689,7 @@ mod tests {
         );
         // 组里没有多余的行：`/compact` 之后是 `/learn`（P4 的收尾条目，逐字断言在
         // `help_lines_carry_the_learn_row` 里），再后面才是下一个分组的标题
-        assert_eq!(lines[intelligence + 5], "INTERFACE", "{lines:?}");
+        assert_eq!(lines[intelligence + 6], "INTERFACE", "{lines:?}");
 
         // 条目本身：无参数提示、不进参数补全，解析与 Tab 补全都认它
         let spec = COMMANDS
@@ -1300,7 +1736,7 @@ mod tests {
             )
         );
         assert_eq!(
-            lines[intelligence + 3],
+            lines[intelligence + 4],
             format!(
                 "  /compact{}  Summarize older turns into a summary message",
                 " ".repeat(memory_label.chars().count() - "/compact".chars().count())
@@ -1308,14 +1744,14 @@ mod tests {
         );
         // 收尾条目：`/learn [task-id]`（16 列），组内最宽仍是 37 列的 `/memory <…>`
         assert_eq!(
-            lines[intelligence + 4],
+            lines[intelligence + 5],
             format!(
                 "  /learn [task-id]{}  Draft a skill from a completed task",
                 " ".repeat(37 - 16)
             )
         );
         // 组里没有多余的行：`/learn` 之后就是下一个分组的标题
-        assert_eq!(lines[intelligence + 5], "INTERFACE", "{lines:?}");
+        assert_eq!(lines[intelligence + 6], "INTERFACE", "{lines:?}");
 
         // 条目本身：参数提示进表，解析与 Tab 补全都认它
         let spec = COMMANDS
@@ -2033,7 +2469,8 @@ mod tests {
             ambiguous,
             [
                 "AGENT",
-                "  /model [name]  Show or set the model of this session",
+                "  /model [name|info]        Show model capabilities, or set the session model",
+                "  /mode [normal|plan|auto]  Show or set the interaction mode",
                 "INTELLIGENCE",
                 "  /memory <list|search|add|edit|delete>  Read or edit long-term memory",
             ]
@@ -2169,9 +2606,124 @@ mod tests {
             )
             .unwrap_err();
 
-            assert_eq!(error, "model: usage: /model [name]", "{kernel}");
+            assert_eq!(error, "model: usage: /model [name|info]", "{kernel}");
             assert_eq!(session.model(), before, "{kernel}: usage 错误不该改状态");
         }
+    }
+
+    /// `/model info`：展示真实能力、有效限制与来源；用户压低窗口时标注 capped。
+    #[test]
+    fn model_info_reports_capabilities_and_sources() {
+        let (_dir, mut session) = session_fixture("slash-model-info", "native");
+        let lines = dispatch_lines(&mut session, Slash::Model, &["info".to_string()]);
+        assert_eq!(lines[0], "Model Information");
+        assert!(
+            lines.iter().any(|line| line == "Provider        OpenAI"),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "Context Window  128,000 tokens"),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "Max Output      16,384 tokens"),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "Effective Limit 128,000 tokens"),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "Source          Model Registry"),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.starts_with("hint:")),
+            "已知模型不该出现未知提示：{lines:?}"
+        );
+
+        // 用户把窗口压到 32K：原生窗口仍展示，有效限制标注来源。
+        let capped = Config {
+            model: ignis_runtime::ModelConfig {
+                context_window: Some(32_000),
+                ..ignis_runtime::ModelConfig::default()
+            },
+            ..Config::default()
+        };
+        let (_dir, mut capped_session) =
+            session_fixture_with_config("slash-model-info-capped", "native", capped);
+        let lines = dispatch_lines(&mut capped_session, Slash::Model, &["info".to_string()]);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "User Limit      32,000 tokens"),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "Effective Limit 32,000 tokens (capped by user config)"),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "Source          Model Registry"),
+            "来源仍是原生窗口的来源：{lines:?}"
+        );
+
+        // 未知模型：不猜窗口，给出可执行的配置提示。
+        let unknown = Config {
+            model: ignis_runtime::ModelConfig {
+                model: "totally-unknown-model".into(),
+                ..ignis_runtime::ModelConfig::default()
+            },
+            ..Config::default()
+        };
+        let (_dir, mut unknown_session) =
+            session_fixture_with_config("slash-model-info-unknown", "native", unknown);
+        let lines = dispatch_lines(&mut unknown_session, Slash::Model, &["info".to_string()]);
+        assert!(
+            lines.iter().any(|line| line == "Context Window  Unknown"),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line == "Effective Limit Unknown"),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line == "Source          Unknown"),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "      ignis config set model.context_window <tokens>"),
+            "{lines:?}"
+        );
+
+        // 外部内核：与 `/model` 同一句 not-applicable，不伪造 Ignis 模型能力。
+        let (_dir, mut codex) = session_fixture("slash-model-info-codex", "codex");
+        let error = dispatch(&mut codex, Slash::Model, &["info".to_string()]).unwrap_err();
+        assert!(error.contains("not applicable"), "{error}");
+    }
+
+    /// `/model info` 的千位分隔只影响展示，不改变数值。
+    #[test]
+    fn grouped_tokens_inserts_thousands_separators() {
+        assert_eq!(grouped_tokens(0), "0");
+        assert_eq!(grouped_tokens(999), "999");
+        assert_eq!(grouped_tokens(1_000), "1,000");
+        assert_eq!(grouped_tokens(128_000), "128,000");
+        assert_eq!(grouped_tokens(1_048_576), "1,048,576");
     }
 
     /// `/kernel`：无参显示、有参切换（失败原样交回、内核不动）、多参给 usage。
@@ -2495,19 +3047,20 @@ mod tests {
 
         let lines = dispatch_lines(&mut session, Slash::Skills, &[]);
         assert_eq!(lines, expected, "与 `ignis skills list` 不同");
-        // 形状：表头 + 每个技能一行 + `! {warning}` 行（不是「空的成功」）
-        assert_eq!(lines.len(), table_rows + warnings, "{lines:?}");
+        // 形状：表头 + 每个技能一行 + `! {warning}` 行 + 调用提示（不是「空的成功」）
+        assert_eq!(lines.len(), table_rows + warnings + 1, "{lines:?}");
         assert_eq!(cells(&lines[0]), ["NAME", "SOURCE", "DESCRIPTION"]);
         assert!(
             lines.iter().any(|line| line.starts_with("zzz-skill")),
             "{lines:?}"
         );
         assert!(
-            lines[table_rows..]
+            lines[table_rows..table_rows + warnings]
                 .iter()
                 .all(|line| line.starts_with("! ")),
             "警告只能跟在表后：{lines:?}"
         );
+        assert_eq!(lines.last().unwrap(), "Invoke: /<name> <task>");
     }
 
     /// `/skills reload` 重扫 `~/.ignis/skills`：启动之后落下的技能进目录，旧快照一位不动，

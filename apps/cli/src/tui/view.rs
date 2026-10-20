@@ -30,13 +30,16 @@
 //! 每行结尾补一条重置：被截断的行不会把颜色漏到下一行。
 
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use ignis_core::config::{OutputMode, Theme};
+use ignis_core::skills::SkillMeta;
 use ignis_core::task::PromptStats;
 use ignis_runtime::Usage;
+use ignis_runtime::caps::ModelCapabilities;
 use ignis_storage::SessionSummary;
 
-use crate::commands::slash;
+use crate::commands::{InteractionMode, slash};
 use crate::render::width::{char_width, display_width, truncate_to_width};
 use crate::render::{ColorDepth, Palette, palette};
 
@@ -47,20 +50,11 @@ use super::term::{CURSOR_HOME, HIDE_CURSOR, SHOW_CURSOR};
 /// 滚动区上限（设计 §2.2：不做无界 scrollback）。
 pub const SCROLLBACK_LINES: usize = 2000;
 
-/// 输入区行数（固定三行：首行 `❯ `、续行 `… `、提示行）。
-const INPUT_ROWS: usize = 3;
-
-/// 输入区提示行的行号（只有它 dim）。
-const HINT_ROW: usize = INPUT_ROWS - 1;
-
 /// 输入区首行的标记（与 `editor::draw` 的前缀同字面量）。
 const INPUT_MARK: &str = "❯ ";
 
-/// 版式里的固定行数：顶部状态行 1 + 输入区 3 + 底部状态行 1。
-///
-/// `pub(crate)`：应用层用它算「视口里有几行」（`rows - FIXED_ROWS`）——PgUp/PgDn 的步长与
-/// 选择器开窗的高度都按它来，口径与 [`layout`] 只有这一处。
-pub(crate) const FIXED_ROWS: usize = 1 + INPUT_ROWS + 1;
+/// 带分隔线的完整版式的最小行数：低于它去掉两条分隔线，但不牺牲输入区。
+pub(crate) const RULE_MIN_ROWS: usize = 12;
 
 /// 每行结尾的清行序列（清到行尾：截断留下的旧内容不留残影）。
 const CLEAR_TO_EOL: &str = "\x1b[K";
@@ -200,6 +194,169 @@ fn expand_tabs(line: &str) -> String {
     out
 }
 
+/// 当前 Agent 状态（状态行与动画用）。
+///
+/// 这是 IGNIS 的运行时状态语言，不是普通聊天框的「正在输入」：`Waiting` 表示等人审批/外部结果，
+/// `Scheduled` 表示本轮把任务交给了调度系统，`Executing` 覆盖工具与 Skill 加载。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentState {
+    /// 空闲。
+    Ready,
+    /// 模型正在生成或规划（含正文流式输出）。
+    Thinking,
+    /// 工具或 Skill 执行中。
+    Executing,
+    /// 等待用户审批或外部结果。
+    Waiting,
+    /// 任务已排入调度系统。
+    Scheduled,
+    /// 最近一轮成功结束。
+    Completed,
+    /// 最近一轮失败/取消/触限。
+    Failed,
+}
+
+impl AgentState {
+    /// 状态词（CLI chrome）。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "Ready",
+            Self::Thinking => "Thinking",
+            Self::Executing => "Executing",
+            Self::Waiting => "Waiting",
+            Self::Scheduled => "Scheduled",
+            Self::Completed => "Completed",
+            Self::Failed => "Failed",
+        }
+    }
+
+    /// 状态字形。Thinking 按 `frame` 在四个字形间轮换（1Hz）；其余状态固定。
+    pub fn glyph(self, frame: u8) -> &'static str {
+        match self {
+            Self::Ready => "●",
+            Self::Thinking => ["◈", "◇", "◆", "◇"][usize::from(frame) % 4],
+            Self::Executing => "⚙",
+            Self::Waiting => "◇",
+            Self::Scheduled => "◷",
+            Self::Completed => "✓",
+            Self::Failed => "✗",
+        }
+    }
+}
+
+/// 上下文用量与窗口：tokens 是实际/估算值，window 未知时为 `None`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextUsage {
+    /// 当前占用（tokens）；`None` = 还没有可用的用量数据（窗口可能仍然已知）。
+    pub tokens: Option<u64>,
+    /// 是否是估算值（UI 会加 `≈`）。
+    pub estimated: bool,
+    /// 有效窗口；`None` = 无法确定。
+    pub window: Option<u64>,
+    /// 使用率（0–100）；用量或窗口未知时为 `None`。
+    pub percent: Option<u8>,
+}
+
+impl ContextUsage {
+    /// 按窗口算使用率；`window == 0` 与未知窗口都按 `None` 处理。
+    pub fn new(tokens: u64, estimated: bool, window: Option<u64>) -> Self {
+        let percent = window.filter(|window| *window > 0).map(|window| {
+            let percent = (tokens.saturating_mul(100) + window / 2) / window;
+            percent.min(100) as u8
+        });
+        Self {
+            tokens: Some(tokens),
+            estimated,
+            window,
+            percent,
+        }
+    }
+
+    /// 有用量窗口但还没有用量：`ctx -/128K [----------] --`，绝不把 0 当成真实占用。
+    pub fn unknown(window: Option<u64>) -> Self {
+        Self {
+            tokens: None,
+            estimated: false,
+            window,
+            percent: None,
+        }
+    }
+
+    /// 用量展示：`12.5K` / `128K` / `1.0M`；没有数据时 `-`。
+    pub fn used_word(&self) -> String {
+        self.tokens.map_or_else(|| "-".to_string(), format_tokens)
+    }
+
+    /// 窗口展示：`128K` / `?`。
+    pub fn window_word(&self) -> String {
+        self.window.map_or_else(|| "?".to_string(), format_tokens)
+    }
+
+    /// 百分比展示：`10%` / `--`。
+    pub fn percent_word(&self) -> String {
+        self.percent
+            .map_or_else(|| "--".to_string(), |percent| format!("{percent}%"))
+    }
+
+    /// 10 格进度条：`[██████░░░░]`；窗口未知时 `[----------]`。
+    pub fn bar(&self, width: usize) -> String {
+        let width = width.max(1);
+        let Some(percent) = self.percent else {
+            return format!("[{}]", "-".repeat(width));
+        };
+        let filled = (usize::from(percent) * width + 50) / 100;
+        let filled = filled.min(width);
+        format!("[{}{}]", "█".repeat(filled), "░".repeat(width - filled))
+    }
+
+    /// 运行状态行里的完整片段：`ctx ≈12.5K/128K [████░░░░░░] 10%`。
+    pub fn segment(&self, bar_width: usize) -> String {
+        format!(
+            "ctx {}{}/{} {} {}",
+            if self.estimated { "≈" } else { "" },
+            self.used_word(),
+            self.window_word(),
+            self.bar(bar_width),
+            self.percent_word()
+        )
+    }
+}
+
+/// 没有 Provider Usage 时的保守 token 估算：约 0.4 token/字符（英文约 4 字符/token，
+/// 中文约 1.5 字符/token，取中间偏保守的值）。UI 必须加 `≈`，不能把它当成精确值。
+pub fn estimate_tokens_from_chars(chars: usize) -> u64 {
+    (chars as u64)
+        .saturating_mul(2)
+        .saturating_add(4)
+        .saturating_div(5)
+}
+
+/// token 数的短写：<1000 原样；<1000K 一位小数（>=100K 取整）；>=1M 一位小数。
+pub fn format_tokens(tokens: u64) -> String {
+    if tokens < 1_000 {
+        return tokens.to_string();
+    }
+    if tokens < 1_000_000 {
+        if tokens < 100_000 {
+            let tenths = (tokens + 50) / 100;
+            if tenths.is_multiple_of(10) {
+                format!("{}K", tenths / 10)
+            } else {
+                format!("{}.{}K", tenths / 10, tenths % 10)
+            }
+        } else {
+            format!("{}K", (tokens + 500) / 1_000)
+        }
+    } else {
+        let tenths = (tokens + 50_000) / 100_000;
+        if tenths.is_multiple_of(10) {
+            format!("{}M", tenths / 10)
+        } else {
+            format!("{}.{}M", tenths / 10, tenths % 10)
+        }
+    }
+}
+
 /// 组装一帧要用的会话事实快照（忙碌期不能借用会话，所以一切都先取成这里的值）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewFacts {
@@ -213,6 +370,8 @@ pub struct ViewFacts {
     pub session: String,
     /// 输出模式。
     pub mode: OutputMode,
+    /// 交互模式（Normal / Plan / Auto）。
+    pub interaction_mode: InteractionMode,
     /// 配色主题。
     pub theme: Theme,
     /// 是否上色（`resolve_color(ui.color, true, NO_COLOR)`）。
@@ -229,18 +388,44 @@ pub struct ViewFacts {
     pub usage: Option<Usage>,
     /// 当前内核是不是 native（决定 usage 展示成数字还是 `n/a`）。
     pub native: bool,
+    /// 当前生效模型名。
+    pub model: String,
+    /// Provider 展示名。
+    pub provider: String,
+    /// 模型能力快照（窗口/输出上限/来源）。
+    pub capabilities: ModelCapabilities,
+    /// 当前上下文用量（Provider Usage 或明确标记的估算）。
+    pub context: Option<ContextUsage>,
+    /// 真实注册的工具名（内置 + 元工具）。
+    pub tools: Vec<String>,
+    /// 当前技能目录元信息。
+    pub skills: Vec<SkillMeta>,
+    /// active 记忆条数；读库失败为 `None`。
+    pub memory: Option<usize>,
 }
 
-/// 输入区三行 + 光标（`None` = 藏光标，例如选择器）。
+/// 输入区正文 + 可选提示行 + 光标（`None` = 藏光标，例如选择器）。
 ///
-/// `cursor` 是**输入区块内**的 0 基（行、列）：列含 `❯ `/`… ` 前缀的显示宽度；[`compose`] 把它
+/// 高度不是固定的：正文 0–2 行（编辑器 1–2、忙碌/审批 1、选择器 0），提示行非空时再加 1 行。
+/// 空输入因此只占一行；多行输入与 Tab/斜杠提示会自动长高。
+///
+/// `cursor` 是**输入正文内**的 0 基（行、列）：列含 `❯ `/`… ` 前缀的显示宽度；[`compose`] 把它
 /// 映射成帧里的绝对坐标（1 基）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputBlock {
-    /// 三行（首行 `❯ `、续行 `… `、提示行）。
-    pub lines: [String; 3],
-    /// 光标（行、列，区块内 0 基）。
+    /// 正文行（首行 `❯ `、续行 `… `；选择器可以为空）。
+    pub lines: Vec<String>,
+    /// 提示行（空串 = 不占行）。
+    pub hint: String,
+    /// 光标（正文内行、列，0 基）。
     pub cursor: Option<(usize, usize)>,
+}
+
+impl InputBlock {
+    /// 实际占用的行数：正文 + 非空提示行；两者都空时保底一行。
+    pub fn height(&self) -> usize {
+        (self.lines.len() + usize::from(!self.hint.is_empty())).max(1)
+    }
 }
 
 /// 一帧的全部内容（合成器不认识会话、终端与 IO）。
@@ -256,9 +441,11 @@ pub struct TuiView {
     pub theme: Theme,
     /// 顶部状态行（未截断；合成时按宽度截断）。
     pub top: String,
-    /// 消息视口 / 选择器列表（自顶向下）。
+    /// 运行状态行（模型/上下文/Agent 状态/耗时；输入区上方）。
+    pub meta: String,
+    /// 消息视口 / 选择器列表 / 欢迎面板（自顶向下）。
     pub viewport: Vec<String>,
-    /// 输入区三行 + 光标。
+    /// 输入区正文/提示行 + 光标。
     pub input: InputBlock,
     /// 底部状态行（未截断；合成时按宽度截断）。
     pub status: String,
@@ -274,19 +461,87 @@ pub fn top_line(facts: &ViewFacts) -> String {
     )
 }
 
-/// 底部状态行（逐字）：`ctx {chars}/{budget} chars · last {usage} · mode {mode} · {hint}`。
+/// 底部状态行（逐字）：`mode {mode} · last {usage} · {hint}`。
 ///
-/// `{chars}` 取最近一次组装量到的历史字符数（[`PromptStats::history_chars`]；还没跑过任务时 0），
-/// `{budget}` 取会话的字符预算。usage 三态：native 有值 `in={i} out={o}`、native 没值 `-`、外置
-/// 内核 `n/a`。`hint` 由调用方给（空闲 `PgUp/PgDn scroll`、忙碌 `Ctrl+C cancels`）。
+/// 上下文/模型/状态已经移到输入区上方的 [`meta_line`]；底行只留模式、最近用量与操作提示。
+/// usage 三态：native 有值 `in={i} out={o}`、native 没值 `-`、外置内核 `n/a`。
 pub fn status_line(facts: &ViewFacts, hint: &str) -> String {
-    let chars = facts.stats.map_or(0, |stats| stats.history_chars);
     format!(
-        "ctx {chars}/{} chars · last {} · mode {} · {hint}",
-        facts.budget,
-        usage_word(facts),
-        mode_word(facts.mode)
+        "mode {} · output {} · last {} · {hint}",
+        facts.interaction_mode.label(),
+        mode_word(facts.mode),
+        usage_word(facts)
     )
+}
+
+/// 运行状态行（输入区上方）：`✦ model │ ctx ... │ ● Ready │ 4.2s`。
+///
+/// 宽度分档优先保住「状态 + 上下文」：>=110 全量；80–109 去耗时；60–79 去模型；
+/// <60 只留状态与上下文（无进度条）。所有片段都按显示宽度截断，合成器仍会兜底。
+pub fn meta_line(
+    facts: &ViewFacts,
+    state: AgentState,
+    frame: u8,
+    elapsed: Option<Duration>,
+    cols: usize,
+) -> String {
+    let model = if facts.native {
+        truncate_to_width(&facts.model, 24).to_string()
+    } else {
+        "(kernel default)".to_string()
+    };
+    let ctx = facts
+        .context
+        .map(|context| context.segment(10))
+        .unwrap_or_else(|| "ctx -/? [----------] --".to_string());
+    let ctx_short = facts
+        .context
+        .map(|context| {
+            format!(
+                "ctx {}{}/{}",
+                if context.estimated { "≈" } else { "" },
+                context.used_word(),
+                context.window_word()
+            )
+        })
+        .unwrap_or_else(|| "ctx -/?".to_string());
+    let state = format!("{} {}", state.glyph(frame), state.label());
+    let interaction = match facts.interaction_mode {
+        InteractionMode::Normal => None,
+        InteractionMode::Plan => Some("Plan"),
+        InteractionMode::Auto => Some("Auto"),
+    };
+    let elapsed = elapsed.map(format_elapsed_word);
+    let mut parts: Vec<String> = if cols >= 80 {
+        vec![format!("✦ {model}"), ctx]
+    } else if cols >= 60 {
+        vec![ctx]
+    } else {
+        vec![state.clone(), ctx_short]
+    };
+    if cols >= 60 {
+        if let Some(interaction) = interaction {
+            parts.push(interaction.to_string());
+        }
+        parts.push(state);
+    }
+    if cols >= 110
+        && let Some(elapsed) = elapsed
+    {
+        parts.push(elapsed);
+    }
+    parts.join(" │ ")
+}
+
+/// 耗时展示：`4.2s` / `1m 02s`。
+fn format_elapsed_word(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs_f64();
+    if seconds < 60.0 {
+        format!("{seconds:.1}s")
+    } else {
+        let total = elapsed.as_secs();
+        format!("{}m {:02}s", total / 60, total % 60)
+    }
 }
 
 /// usage 的展示词：外置内核给 `n/a`（估算与否都不展示数字），native 没值给 `-`。
@@ -307,6 +562,47 @@ fn mode_word(mode: OutputMode) -> &'static str {
         OutputMode::Normal => "normal",
         OutputMode::Debug => "debug",
     }
+}
+
+/// 命令面板的一项：可搜索的标签 + 选中后填进输入区的文本。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaletteItem {
+    pub label: String,
+    pub insert: String,
+}
+
+/// 按查询过滤命令面板（大小写不敏感，匹配标签或要填入的命令）。
+pub fn filtered_palette<'a>(items: &'a [PaletteItem], query: &str) -> Vec<&'a PaletteItem> {
+    let needle = query.trim().to_lowercase();
+    items
+        .iter()
+        .filter(|item| {
+            needle.is_empty()
+                || item.label.to_lowercase().contains(&needle)
+                || item.insert.to_lowercase().contains(&needle)
+        })
+        .collect()
+}
+
+/// 命令面板列表：标题 + 过滤后的项，选中行前缀 `"> "`，空结果给一句说明。
+pub fn palette_lines(
+    items: &[PaletteItem],
+    query: &str,
+    cursor: usize,
+    max_rows: usize,
+) -> Vec<String> {
+    let filtered = filtered_palette(items, query);
+    let mut lines = vec![format!("Command Palette · {} actions", filtered.len())];
+    if filtered.is_empty() {
+        lines.push("(no matching commands)".to_string());
+    } else {
+        for (index, item) in filtered.iter().enumerate() {
+            let prefix = if index == cursor { "> " } else { "  " };
+            lines.push(format!("{prefix}{}", item.label));
+        }
+    }
+    lines.truncate(max_rows);
+    lines
 }
 
 /// 选择器列表：复用 [`slash::sessions_lines`] 的表格语义（同一表头、同一短 id、当前会话带 `*`），
@@ -392,28 +688,63 @@ fn sanitized(rows: Vec<(Slot, String)>, colored: bool) -> Vec<(Slot, String)> {
 enum Slot {
     /// 顶部状态行（字标 `bold + brand`，其余 dim）。
     Top,
-    /// 消息视口 / 选择器列表：正文自带渲染器的颜色，chrome 不再上色。
+    /// 分隔线（dim）。
+    Rule,
+    /// 运行状态行（模型/上下文/Agent 状态/耗时）：分段上色。
+    Meta,
+    /// 消息视口 / 选择器列表 / 欢迎面板：正文自带渲染器的颜色，chrome 不再上色。
     Viewport,
-    /// 输入区：`0` 首行（标记 `bold + brand`）、`1` 续行、`2` 提示行（dim）。
+    /// 输入区正文：`0` 首行（标记 `bold + brand`）、`1` 续行。
     Input(usize),
+    /// 输入区提示行（dim；Tab/斜杠建议/忙碌说明）。
+    Hint,
     /// 底部状态行（dim）。
     Status,
 }
 
-/// 版式：一帧的 `rows` 行各归谁（内容未截断、未上色）。
-fn layout(view: &TuiView) -> Vec<(Slot, String)> {
-    let rows = view.size.rows;
-    let mut lines: Vec<(Slot, String)> = Vec::with_capacity(rows);
-    lines.push((Slot::Top, view.top.clone()));
-    if rows < FIXED_ROWS {
-        // 极小尺寸：视口整块让位，按 `[top] ++ input(3) ++ [status]` 取前 rows 行
-        lines.extend(input_slots(&view.input));
-        lines.push((Slot::Status, view.status.clone()));
-        lines.truncate(rows);
-        return lines;
+/// 版式档位：完整（带分隔线）/ 紧凑 / 极小（只有顶行 + 输入 + 底行）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayoutKind {
+    Full,
+    Compact,
+    Degraded,
+}
+
+fn layout_kind(rows: usize) -> LayoutKind {
+    if rows >= RULE_MIN_ROWS {
+        LayoutKind::Full
+    } else if rows >= 6 {
+        LayoutKind::Compact
+    } else {
+        LayoutKind::Degraded
     }
-    // 视口：只要最新的一段（自顶向下），不足的行在下方补空行
-    let count = rows - FIXED_ROWS;
+}
+
+/// 一帧的固定行数（不含内容区）：应用层算 PgUp/PgDn 步长与选择器开窗都用它。
+///
+/// `input_height` 是 [`InputBlock::height`] 的实际值——输入区随多行/提示展开或收起，
+/// 内容区因此会相应增减。
+pub(crate) fn fixed_rows(rows: usize, input_height: usize) -> usize {
+    match layout_kind(rows) {
+        LayoutKind::Full => 1 + 2 + 1 + input_height + 1,
+        LayoutKind::Compact => 1 + 1 + input_height + 1,
+        LayoutKind::Degraded => 0,
+    }
+}
+
+/// 内容区（消息视口 / 欢迎面板 / 选择器列表）的可视行数。
+pub(crate) fn content_rows(size: Size, input_height: usize) -> usize {
+    size.rows
+        .saturating_sub(fixed_rows(size.rows, input_height))
+}
+
+/// 一条分隔线：正好 `cols` 列（合成器仍会兜底截断）。
+fn rule_text(cols: usize) -> String {
+    "─".repeat(cols)
+}
+
+/// 视口：取最新的一段（自顶向下），不足的行在下方补空行。
+fn push_viewport(lines: &mut Vec<(Slot, String)>, view: &TuiView, count: usize) {
     let start = view.viewport.len().saturating_sub(count);
     lines.extend(
         view.viewport[start..]
@@ -424,19 +755,59 @@ fn layout(view: &TuiView) -> Vec<(Slot, String)> {
     for _ in view.viewport.len().min(count)..count {
         lines.push((Slot::Viewport, String::new()));
     }
-    lines.extend(input_slots(&view.input));
-    lines.push((Slot::Status, view.status.clone()));
+}
+
+/// 版式：一帧的 `rows` 行各归谁（内容未截断、未上色）。
+fn layout(view: &TuiView) -> Vec<(Slot, String)> {
+    let rows = view.size.rows;
+    let input_rows = input_slots(&view.input);
+    let input_height = input_rows.len();
+    let fixed = fixed_rows(rows, input_height);
+    let mut lines: Vec<(Slot, String)> = Vec::with_capacity(rows);
+    lines.push((Slot::Top, view.top.clone()));
+    match layout_kind(rows) {
+        LayoutKind::Full => {
+            push_viewport(&mut lines, view, rows.saturating_sub(fixed));
+            lines.push((Slot::Rule, rule_text(view.size.cols)));
+            lines.push((Slot::Meta, view.meta.clone()));
+            lines.extend(input_rows);
+            lines.push((Slot::Rule, rule_text(view.size.cols)));
+            lines.push((Slot::Status, view.status.clone()));
+        }
+        LayoutKind::Compact => {
+            push_viewport(&mut lines, view, rows.saturating_sub(fixed));
+            lines.push((Slot::Meta, view.meta.clone()));
+            lines.extend(input_rows);
+            lines.push((Slot::Status, view.status.clone()));
+        }
+        // 极小尺寸：视口整块让位，输入区贴底（`[top] ++ padding ++ input ++ [status]`）。
+        // 补空行保证帧仍恰好 `rows` 行；行数不足时照旧截断。
+        LayoutKind::Degraded => {
+            let padding = rows.saturating_sub(1 + input_height + 1);
+            lines.extend(std::iter::repeat_with(|| (Slot::Viewport, String::new())).take(padding));
+            lines.extend(input_rows);
+            lines.push((Slot::Status, view.status.clone()));
+        }
+    }
+    lines.truncate(rows);
     lines
 }
 
-/// 输入区三行（顺序即版式顺序）。
+/// 输入区实际行（正文在前、提示行在后；顺序即版式顺序）。
 fn input_slots(input: &InputBlock) -> Vec<(Slot, String)> {
-    input
+    let mut slots: Vec<(Slot, String)> = input
         .lines
         .iter()
         .enumerate()
         .map(|(row, line)| (Slot::Input(row), line.clone()))
-        .collect()
+        .collect();
+    if !input.hint.is_empty() {
+        slots.push((Slot::Hint, input.hint.clone()));
+    }
+    if slots.is_empty() {
+        slots.push((Slot::Input(0), String::new()));
+    }
+    slots
 }
 
 /// 一行普通文本 → 帧里的一行：`color=true` 时按槽位上 chrome。
@@ -463,6 +834,11 @@ fn paint(slot: Slot, text: &str, palette: &Palette, colored: bool) -> String {
                 format!("{dim}{text}")
             }
         },
+        Slot::Rule => {
+            let dim = palette.dim;
+            format!("{dim}{text}")
+        }
+        Slot::Meta => paint_meta(text, palette),
         Slot::Input(0) => match text.strip_prefix(INPUT_MARK) {
             Some(rest) => {
                 let (bold, brand) = (palette.bold, palette.brand);
@@ -474,7 +850,7 @@ fn paint(slot: Slot, text: &str, palette: &Palette, colored: bool) -> String {
                 format!("{dim}{text}")
             }
         },
-        Slot::Input(HINT_ROW) | Slot::Status => {
+        Slot::Hint | Slot::Status => {
             let dim = palette.dim;
             format!("{dim}{text}")
         }
@@ -483,17 +859,74 @@ fn paint(slot: Slot, text: &str, palette: &Palette, colored: bool) -> String {
     }
 }
 
-/// 光标落位（1 基）：输入区给的 `(行, 列)` 是区块内 0 基（列含 `❯ ` 前缀的显示宽度），`None` 落在
-/// 最后一行的行尾。行列都夹在 `1..=rows`/`1..=cols` 里——极小窗口下输入区可能整块被裁掉，坐标
-/// 不能跟着越界。
+/// 运行状态行分段上色：品牌菱形、上下文阈值色、Agent 状态色，分隔符保持 dim。
+fn paint_meta(text: &str, palette: &Palette) -> String {
+    let dim = palette.dim;
+    let mut out = String::new();
+    for (index, segment) in text.split(" │ ").enumerate() {
+        if index > 0 {
+            out.push_str(RESET);
+            out.push_str(&format!("{dim} │ "));
+        }
+        let color = if segment.starts_with('✦') {
+            format!("{}{}", palette.bold, palette.brand)
+        } else if segment.starts_with('●') || segment.starts_with('✓') {
+            palette.ok.to_string()
+        } else if segment.starts_with('◈') || segment.starts_with('◇') || segment.starts_with('◆')
+        {
+            palette.warn.to_string()
+        } else if segment.starts_with('⚙') || segment.starts_with('◷') {
+            palette.accent.to_string()
+        } else if segment.starts_with('✗') {
+            palette.error.to_string()
+        } else if segment.starts_with("ctx ") {
+            context_color(segment, palette).to_string()
+        } else {
+            dim.to_string()
+        };
+        out.push_str(&color);
+        out.push_str(segment);
+        out.push_str(RESET);
+    }
+    out
+}
+
+/// 上下文片段按使用率取色：>=85% 红、>=60% 黄、其余 dim。
+fn context_color(segment: &str, palette: &Palette) -> &'static str {
+    let Some(percent) = segment
+        .find('%')
+        .and_then(|index| segment[..index].split_whitespace().last())
+        .and_then(|word| word.trim_end_matches('%').parse::<u8>().ok())
+    else {
+        return palette.dim;
+    };
+    if percent >= 85 {
+        palette.error
+    } else if percent >= 60 {
+        palette.warn
+    } else {
+        palette.dim
+    }
+}
+
+/// 光标落位（1 基）：输入区给的 `(行, 列)` 是正文内 0 基（列含 `❯ ` 前缀的显示宽度），`None`
+/// 落在最后一行的行尾。行列都夹在 `1..=rows`/`1..=cols` 里——极小窗口下输入区可能整块被裁掉，
+/// 坐标不能跟着越界。
 fn cursor(view: &TuiView, rows: &[(Slot, String)]) -> (usize, usize) {
     let max_row = view.size.rows.max(1);
     let max_col = view.size.cols.max(1);
     match view.input.cursor {
-        Some((row, col)) => (
-            (input_base(view.size.rows) + row + 1).clamp(1, max_row),
-            (col + 1).clamp(1, max_col),
-        ),
+        Some((row, col)) => {
+            // 从实际版式里找输入正文首行：输入区高度会随内容变化，不能再按固定行数倒推。
+            let base = rows
+                .iter()
+                .position(|(slot, _)| matches!(slot, Slot::Input(0)))
+                .unwrap_or(0);
+            (
+                (base + row + 1).clamp(1, max_row),
+                (col + 1).clamp(1, max_col),
+            )
+        }
         None => {
             let end = rows.last().map_or(0, |(_, text)| {
                 display_width(truncate_to_width(text, view.size.cols))
@@ -503,31 +936,25 @@ fn cursor(view: &TuiView, rows: &[(Slot, String)]) -> (usize, usize) {
     }
 }
 
-/// 输入区首行在帧里的 0 基行号：正常版式是 `rows-4`（顶行 1 + 视口 `rows-5`），退化版式
-/// （`rows < 5`，视口整块让位）里它紧跟顶行。
-fn input_base(rows: usize) -> usize {
-    if rows < FIXED_ROWS {
-        1
-    } else {
-        rows - FIXED_ROWS + 1
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use ignis_core::config::{OutputMode, Theme};
     use ignis_core::task::PromptStats;
     use ignis_runtime::Usage;
     use ignis_storage::{SessionRecord, SessionSummary};
 
+    use crate::commands::InteractionMode;
     use crate::commands::slash;
     use crate::render::ColorDepth;
     use crate::render::width::{display_width, truncate_to_width};
     use crate::tui::Size;
 
     use super::{
-        InputBlock, SCROLLBACK_LINES, Scrollback, TuiView, ViewFacts, compose, selector_lines,
-        status_line, top_line,
+        AgentState, ContextUsage, InputBlock, PaletteItem, SCROLLBACK_LINES, Scrollback, TuiView,
+        ViewFacts, compose, estimate_tokens_from_chars, filtered_palette, format_tokens, meta_line,
+        palette_lines, selector_lines, status_line, top_line,
     };
 
     /// 空闲期的提示词（调用方给的那一条）。
@@ -552,6 +979,7 @@ mod tests {
             kernel: "native".to_string(),
             session: "new".to_string(),
             mode: OutputMode::Normal,
+            interaction_mode: InteractionMode::Normal,
             theme: Theme::Dark,
             color: false,
             depth: ColorDepth::Basic16,
@@ -560,11 +988,21 @@ mod tests {
             stats: None,
             usage: None,
             native: true,
+            model: "gpt-4o-mini".to_string(),
+            provider: "OpenAI".to_string(),
+            capabilities: ignis_runtime::caps::ModelCapabilities::static_resolve(
+                &ignis_runtime::ModelConfig::default(),
+            ),
+            context: None,
+            tools: Vec::new(),
+            skills: Vec::new(),
+            memory: None,
         }
     }
 
     /// 金帧的固定视图（两份尺寸共用）：顶/底状态行取 `top_line`/`status_line` 的逐字输出，
-    /// 视口两行，输入区 `["❯ 你好", "", ""]`，光标停在输入文本末尾（`❯ ` 2 列 + 文本 4 列）。
+    /// 视口两行，输入区单行 `❯ 你好`（空输入不再留续行/提示行），光标停在文本末尾
+    /// （`❯ ` 2 列 + 文本 4 列）。
     fn golden_view(cols: usize, rows: usize) -> TuiView {
         let facts = facts();
         TuiView {
@@ -573,9 +1011,11 @@ mod tests {
             depth: ColorDepth::Basic16,
             theme: Theme::Dark,
             top: top_line(&facts),
+            meta: meta_line(&facts, AgentState::Ready, 0, None, cols),
             viewport: vec!["答复一".to_string(), DONE_LINE.to_string()],
             input: InputBlock {
-                lines: ["❯ 你好".to_string(), String::new(), String::new()],
+                lines: vec!["❯ 你好".to_string()],
+                hint: String::new(),
                 cursor: Some((0, 6)),
             },
             status: status_line(&facts, IDLE_HINT),
@@ -725,9 +1165,11 @@ mod tests {
             depth: ColorDepth::Basic16,
             theme: Theme::Dark,
             top: "T".to_string(),
+            meta: "M".to_string(),
             viewport: Vec::new(),
             input: InputBlock {
-                lines: ["❯ a".to_string(), "… b".to_string(), "hint".to_string()],
+                lines: vec!["❯ a".to_string(), "… b".to_string()],
+                hint: "hint".to_string(),
                 cursor: Some((1, 0)),
             },
             status: "S".to_string(),
@@ -748,7 +1190,8 @@ mod tests {
         // 藏光标（`cursor = None`）：落到最后一行的行尾，且**不写**显光标那一条
         let hidden = TuiView {
             input: InputBlock {
-                lines: ["❯ a".to_string(), "… b".to_string(), "hint".to_string()],
+                lines: vec!["❯ a".to_string(), "… b".to_string()],
+                hint: "hint".to_string(),
                 cursor: None,
             },
             ..view
@@ -765,23 +1208,95 @@ mod tests {
         );
     }
 
-    /// 80×24 的金帧：24 行的归属（顶行 / 视口 19 行 / 输入区 3 行 / 底行）与逐字节协议。
+    /// 命令面板：过滤大小写不敏感、选中行带 `> `、空结果有明确说明。
+    #[test]
+    fn palette_filters_and_marks_the_selected_action() {
+        let items = vec![
+            PaletteItem {
+                label: "/status — Show status".into(),
+                insert: "/status".into(),
+            },
+            PaletteItem {
+                label: "/brainstorming — skill".into(),
+                insert: "/brainstorming ".into(),
+            },
+        ];
+        let lines = palette_lines(&items, "BRAIN", 0, 10);
+        assert!(lines[0].starts_with("Command Palette"), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("> /brainstorming")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("/status")),
+            "{lines:?}"
+        );
+
+        let empty = palette_lines(&items, "zzz", 0, 10);
+        assert!(
+            empty.iter().any(|line| line.contains("no matching")),
+            "{empty:?}"
+        );
+        assert_eq!(filtered_palette(&items, "").len(), 2);
+    }
+
+    /// 运行状态行必须紧贴输入区上方：顶行 → 内容 → 分隔线 → 运行状态 → 输入 → 分隔线 → 底行。
+    #[test]
+    fn meta_row_sits_immediately_above_the_input() {
+        let view = golden_view(80, 24);
+        let parsed = parse_frame(&compose(&view));
+        let rule = "─".repeat(80);
+
+        assert_eq!(parsed.rows[0], view.top, "顶行仍在最上面");
+        assert_eq!(parsed.rows[1], "答复一", "内容紧接顶行（不再被状态行隔开）");
+        assert_eq!(parsed.rows[19], rule, "输入区上方的分隔线");
+        assert_eq!(parsed.rows[20], view.meta, "运行状态行紧贴分隔线");
+        assert_eq!(parsed.rows[21], view.input.lines[0], "输入区紧随其后");
+        assert_eq!(parsed.rows[22], rule, "输入区下方的分隔线");
+        assert_eq!(parsed.rows[23], view.status, "底行仍在最后");
+    }
+
+    /// 空输入只占一行：`❯` 之后应直接是输入区下方的分隔线，而不是空白续行/提示行。
+    #[test]
+    fn empty_input_does_not_leave_blank_rows_below_the_prompt() {
+        let view = golden_view(80, 24);
+        assert_eq!(view.input.height(), 1, "单行输入只占一行");
+        let parsed = parse_frame(&compose(&view));
+        let input = parsed
+            .rows
+            .iter()
+            .position(|row| row == &view.input.lines[0])
+            .expect("输入首行必须在帧里");
+        assert_eq!(
+            parsed.rows[input + 1],
+            "─".repeat(80),
+            "空输入后应直接是分隔线，而不是空白续行/提示行"
+        );
+    }
+
+    /// 80×24 的金帧：顶行 / 视口 18 行 / 分隔线 / 运行状态行 / 输入 1 行 / 分隔线 / 底行。
     #[test]
     fn golden_frame_at_80x24() {
         let view = golden_view(80, 24);
-        // 1 顶行 + 2 行视口内容 + 17 行补空 + 3 行输入 + 1 底行
+        let rule = "─".repeat(80);
         let mut rows = vec![
             view.top.clone(),
             "答复一".to_string(),
             DONE_LINE.to_string(),
         ];
-        rows.extend(std::iter::repeat_n(String::new(), 24 - 5 - 2));
+        // 内容区 18 行：2 行内容 + 16 行补空
+        rows.extend(std::iter::repeat_n(String::new(), 18 - 2));
+        rows.push(rule.clone());
+        rows.push(view.meta.clone());
         rows.extend(view.input.lines.iter().cloned());
+        rows.push(rule);
         rows.push(view.status.clone());
         assert_eq!(rows.len(), view.size.rows);
 
-        // 光标：输入区首行是第 21 行（1 基），文本末尾在第 7 列（`❯ ` 2 列 + 文本 4 列 + 1）
-        let expected = pinned_frame(&rows, (21, 7), true);
+        // 光标：输入区首行是第 22 行（1 基），文本末尾在第 7 列（`❯ ` 2 列 + 文本 4 列 + 1）
+        let expected = pinned_frame(&rows, (22, 7), true);
         assert_eq!(compose(&view), expected);
 
         // 不变量：行数 == rows、每行显示宽度 ≤ cols、屏内换行只有 `\r\n`
@@ -797,28 +1312,26 @@ mod tests {
         );
     }
 
-    /// 40×12 的金帧：视口只剩 7 行（5 行补空），顶/底状态行与超宽的视口行都被截断。
+    /// 40×12 的金帧：内容区 6 行（2 行补空），顶/运行/底行与超宽的视口行都被截断。
     #[test]
     fn golden_frame_at_40x12() {
         let view = golden_view(40, 12);
+        let rule = "─".repeat(40);
         let mut rows = vec![
-            // 52 列的一行在 40 列下停在 `kernel native ·`（末位正是第 40 列）
-            format!(
-                "IGNIS v{} · /tmp/ws · kernel native ·",
-                env!("CARGO_PKG_VERSION")
-            ),
+            truncate_to_width(&view.top, 40).to_string(),
             "答复一".to_string(),
-            // 43 列的结束行在 40 列下停在短 id 的中间
-            "● Done · 0.1s · 1 tool · task 019a1b2c-3".to_string(),
+            truncate_to_width(DONE_LINE, 40).to_string(),
         ];
-        rows.extend(std::iter::repeat_n(String::new(), 12 - 5 - 2));
+        rows.extend(std::iter::repeat_n(String::new(), 6 - 2));
+        rows.push(rule.clone());
+        rows.push(truncate_to_width(&view.meta, 40).to_string());
         rows.extend(view.input.lines.iter().cloned());
-        // 60 列的底行在 40 列下停在 `mode norma`
-        rows.push("ctx 0/200000 chars · last - · mode norma".to_string());
+        rows.push(rule);
+        rows.push(truncate_to_width(&view.status, 40).to_string());
         assert_eq!(rows.len(), view.size.rows);
 
-        // 光标：输入区首行是第 9 行（1 基），文本末尾在第 7 列
-        let expected = pinned_frame(&rows, (9, 7), true);
+        // 光标：输入区首行是第 10 行（1 基），文本末尾在第 7 列
+        let expected = pinned_frame(&rows, (10, 7), true);
         assert_eq!(compose(&view), expected);
 
         assert_eq!(expected.matches("\x1b[K").count(), view.size.rows);
@@ -847,14 +1360,12 @@ mod tests {
                     depth: ColorDepth::Basic16,
                     theme: Theme::Light,
                     top: "IGNIS 很长的顶部状态行".to_string(),
+                    meta: "IGNIS 很长的运行状态行".to_string(),
                     viewport: vec!["你".repeat(20), "ab".to_string(), String::new()],
                     input: InputBlock {
-                        lines: [
-                            "❯ 你好世界".to_string(),
-                            "… 续行".to_string(),
-                            "hint".to_string(),
-                        ],
-                        cursor: Some((2, 3)),
+                        lines: vec!["❯ 你好世界".to_string(), "… 续行".to_string()],
+                        hint: "hint".to_string(),
+                        cursor: Some((1, 3)),
                     },
                     status: "ctx 0/200000 chars · last - · mode normal".to_string(),
                 };
@@ -897,9 +1408,11 @@ mod tests {
             depth: ColorDepth::Basic16,
             theme: Theme::Dark,
             top: long.clone(),
+            meta: long.clone(),
             viewport: vec![long.clone()],
             input: InputBlock {
-                lines: [long.clone(), String::new(), String::new()],
+                lines: vec![long.clone()],
+                hint: String::new(),
                 // 列坐标远超面板宽度：必须被夹在 1..=cols
                 cursor: Some((0, 199)),
             },
@@ -914,7 +1427,7 @@ mod tests {
         // 40 列正好 20 个宽字符：第 21 个放不下，停在它前面（宁少一列，不切半格）
         assert_eq!(parsed.rows[0], "你".repeat(20));
         assert_eq!(display_width(&parsed.rows[0]), 40);
-        assert_eq!(parsed.cursor, (3, 40), "光标列被夹在 1..=cols");
+        assert_eq!(parsed.cursor, (5, 40), "光标列被夹在 1..=cols");
 
         // 奇数宽度：41 列下只能放 20 个宽字符（40 列），绝不切半格
         let odd = TuiView {
@@ -970,7 +1483,7 @@ mod tests {
             "无色帧里一条 SGR 都不许有：{frame:?}"
         );
 
-        // 视口两行落在 rows[1..=2]：序列去掉、文本逐字留下、行里没有 ESC。
+        // 视口两行落在 rows[1..=2]（顶行之后、输入区分隔线之前）：序列去掉、文本逐字留下。
         let parsed = parse_frame(&frame);
         assert_eq!(parsed.rows[1], "hidden", "隐藏属性丢掉、文本逐字留下");
         assert_eq!(parsed.rows[2], "reverse", "反显属性丢掉、文本逐字留下");
@@ -991,8 +1504,8 @@ mod tests {
     fn compose_with_color_uses_the_palette() {
         let mut view = golden_view(80, 24);
         view.color = true;
-        view.input.lines[1] = "… 续行".to_string();
-        view.input.lines[2] = "hint".to_string();
+        view.input.lines.push("… 续行".to_string());
+        view.input.hint = "hint".to_string();
         let frame = compose(&view);
 
         // 顶行：`{bold}{brand}IGNIS v…{RESET}{dim} · 其余`（basic 16 档的 brand 槽落黄 `33m`）
@@ -1075,10 +1588,10 @@ mod tests {
             )
         );
 
-        // native + 还没跑过任务：`last -`
+        // native + 还没跑过任务：`last -`；上下文已移到输入区上方的 meta 行
         assert_eq!(
             status_line(&facts, IDLE_HINT),
-            "ctx 0/200000 chars · last - · mode normal · PgUp/PgDn scroll"
+            "mode Normal · output normal · last - · PgUp/PgDn scroll"
         );
         // native + 有值
         let mut used = facts.clone();
@@ -1089,7 +1602,7 @@ mod tests {
         });
         assert_eq!(
             status_line(&used, BUSY_HINT),
-            "ctx 0/200000 chars · last in=1234 out=567 · mode normal · Ctrl+C cancels"
+            "mode Normal · output normal · last in=1234 out=567 · Ctrl+C cancels"
         );
         // 外置内核：usage 一律 `n/a`（有值、没值都不展示数字）
         let mut external = used.clone();
@@ -1097,16 +1610,16 @@ mod tests {
         external.mode = OutputMode::Debug;
         assert_eq!(
             status_line(&external, BUSY_HINT),
-            "ctx 0/200000 chars · last n/a · mode debug · Ctrl+C cancels"
+            "mode Normal · output debug · last n/a · Ctrl+C cancels"
         );
         let mut external_empty = facts.clone();
         external_empty.native = false;
         assert_eq!(
             status_line(&external_empty, IDLE_HINT),
-            "ctx 0/200000 chars · last n/a · mode normal · PgUp/PgDn scroll"
+            "mode Normal · output normal · last n/a · PgUp/PgDn scroll"
         );
 
-        // `{chars}` 取最近一次组装量到的历史字符数；模式字面量与 `ui.output_mode` 的 serde 名一致
+        // 模式字面量与 `ui.output_mode` 的 serde 名一致；char 预算只留在 `/context`
         let mut measured = facts.clone();
         measured.stats = Some(PromptStats {
             facts_injected: 2,
@@ -1118,8 +1631,77 @@ mod tests {
         measured.mode = OutputMode::Minimal;
         assert_eq!(
             status_line(&measured, IDLE_HINT),
-            "ctx 4096/100000 chars · last - · mode minimal · PgUp/PgDn scroll"
+            "mode Normal · output minimal · last - · PgUp/PgDn scroll"
         );
+
+        // 运行状态行：模型 / 上下文 / 状态 / 耗时；宽度分档。
+        assert_eq!(
+            meta_line(&facts, AgentState::Ready, 0, None, 120),
+            "✦ gpt-4o-mini │ ctx -/? [----------] -- │ ● Ready"
+        );
+        let mut measured = facts.clone();
+        measured.context = Some(ContextUsage::new(12_500, false, Some(128_000)));
+        assert_eq!(
+            meta_line(
+                &measured,
+                AgentState::Thinking,
+                0,
+                Some(Duration::from_millis(4200)),
+                120
+            ),
+            "✦ gpt-4o-mini │ ctx 12.5K/128K [█░░░░░░░░░] 10% │ ◈ Thinking │ 4.2s"
+        );
+        assert_eq!(
+            meta_line(&measured, AgentState::Thinking, 1, None, 70),
+            "ctx 12.5K/128K [█░░░░░░░░░] 10% │ ◇ Thinking"
+        );
+        assert_eq!(
+            meta_line(&measured, AgentState::Waiting, 0, None, 70),
+            "ctx 12.5K/128K [█░░░░░░░░░] 10% │ ◇ Waiting"
+        );
+        assert_eq!(
+            meta_line(&measured, AgentState::Scheduled, 0, None, 70),
+            "ctx 12.5K/128K [█░░░░░░░░░] 10% │ ◷ Scheduled"
+        );
+        let mut plan = measured.clone();
+        plan.interaction_mode = InteractionMode::Plan;
+        assert_eq!(
+            meta_line(&plan, AgentState::Thinking, 0, None, 120),
+            "✦ gpt-4o-mini │ ctx 12.5K/128K [█░░░░░░░░░] 10% │ Plan │ ◈ Thinking"
+        );
+        plan.interaction_mode = InteractionMode::Auto;
+        assert_eq!(
+            status_line(&plan, IDLE_HINT),
+            "mode Auto · output normal · last - · PgUp/PgDn scroll"
+        );
+        assert_eq!(
+            meta_line(&measured, AgentState::Failed, 0, None, 50),
+            "✗ Failed │ ctx 12.5K/128K"
+        );
+        // 估算值必须带 `≈`；窗口未知时百分比 `--`、进度条全空。
+        let estimated = ContextUsage::new(12_500, true, None);
+        assert_eq!(estimated.segment(10), "ctx ≈12.5K/? [----------] --");
+        assert_eq!(estimated.percent_word(), "--");
+        // 窗口已知、用量未知：显示窗口但不把 0 当真实占用。
+        let no_usage = ContextUsage::unknown(Some(128_000));
+        assert_eq!(no_usage.segment(10), "ctx -/128K [----------] --");
+        assert_eq!(no_usage.percent_word(), "--");
+    }
+
+    /// token 短写与无 Usage 时的估算口径。
+    #[test]
+    fn token_words_and_estimates_are_pinned() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1_000), "1K");
+        assert_eq!(format_tokens(12_500), "12.5K");
+        assert_eq!(format_tokens(128_000), "128K");
+        assert_eq!(format_tokens(1_048_576), "1M");
+        // 0.4 token/char 的保守估算；估算值必须由调用方标 `≈`。
+        assert_eq!(estimate_tokens_from_chars(0), 0);
+        assert_eq!(estimate_tokens_from_chars(1), 1);
+        assert_eq!(estimate_tokens_from_chars(10), 4);
+        assert_eq!(estimate_tokens_from_chars(12_000), 4_800);
     }
 
     // ---- 滚动区 ----

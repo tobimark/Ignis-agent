@@ -106,6 +106,7 @@ impl EditorState {
             Key::Tab
             | Key::PasteStart
             | Key::PasteEnd
+            | Key::CtrlP
             | Key::CtrlC
             | Key::Esc
             | Key::PageUp

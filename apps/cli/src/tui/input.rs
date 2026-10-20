@@ -16,11 +16,10 @@
 //!   缓冲无关），编辑器的解码器仍复用这一份（跨批缓存不丢）。
 
 use crate::commands::slash::{self, Completion};
-use crate::editor::draw::CONTINUATION;
+use crate::editor::draw::{CONTINUATION, wrapped};
 use crate::editor::history::History;
 use crate::editor::keys::{Decoder, Key};
 use crate::editor::state::{EditorState, Event};
-use crate::render::width::{display_width, expand_tabs};
 use crate::tui::app::Action;
 use crate::tui::view::InputBlock;
 
@@ -35,6 +34,8 @@ pub struct InputState {
     decoder: Decoder,
     /// 瞬时提示行（Tab 候选拼接；空串 = 没有）。
     hint: String,
+    /// 当前技能目录的技能名（`/` 补全与命令面板共用；由应用层在事实刷新后同步）。
+    skill_names: Vec<String>,
 }
 
 impl InputState {
@@ -44,7 +45,19 @@ impl InputState {
             state: EditorState::new(history),
             decoder: Decoder::new(),
             hint: String::new(),
+            skill_names: Vec::new(),
         }
+    }
+
+    /// 同步当前技能目录（`/skills reload` 后由应用层调用；只影响补全，不进提交文本）。
+    pub fn set_skills(&mut self, names: Vec<String>) {
+        self.skill_names = names;
+    }
+
+    /// 用一段文本替换编辑缓冲（命令面板选中项落进输入区；光标到末尾）。
+    pub fn set_text(&mut self, text: &str) {
+        self.state.replace(text);
+        self.hint.clear();
     }
 
     /// 解码一段字节（跨批缓存留在解码器里），按键交给调用方处置。
@@ -98,59 +111,58 @@ impl InputState {
         self.hint = hint;
     }
 
-    /// 编辑器区（`❯ `/`… ` 前缀 + 光标显示列，按显示宽度算）。
+    /// 编辑器区：按终端宽度折行后，取光标附近的 1–2 个物理行。
     ///
-    /// 窗口取「光标所在行起的两行」（`window_start = cursor_line.min(text_lines - 2)`）：光标
-    /// 因此在窗口里（末行也不越界），多行输入只看得到光标附近的两行。光标列按显示宽度算——`你`
-    /// 占 2 列，`❯ `/`… ` 各 2 列。
+    /// 折行、制表位展开与光标列都复用 `editor::draw` 的同一套走行算法（与经典 REPL 同口径）：
+    /// 超过可用列数的单行会折成多个物理行（续行 `… `），光标落在它所属的物理行/列上。
+    /// 窗口最多两行：光标所在物理行起取后续行，靠近文本末尾时向前收，保证光标总在窗口里；
+    /// 单行短输入只生成一行，不再留空的续行。
     ///
-    /// `\t` 只在显示层展开（8 列制表位，从行内容的列 0 起算，与滚动区同一口径）：落进
-    /// [`InputBlock::lines`] 的两个显示行里不再有制表符，光标列也在**展开后的**文本上算——
-    /// 缓冲里那份文本（提交时交给内核的）一个字节不动。
-    pub fn block(&self) -> InputBlock {
+    /// 折行只改显示层：提交的文本、历史与送进内核的 prompt 一个字节都不动。
+    pub fn block(&self, width: usize) -> InputBlock {
         let text = self.state.text();
-        let chars: Vec<char> = text.chars().collect();
-        let cursor = self.state.cursor().min(chars.len());
-        let lines: Vec<&str> = text.split('\n').collect();
+        let cursor = self.state.cursor().min(text.chars().count());
+        let (rows, cursor_row, cursor_columns) =
+            wrapped(INPUT_MARK, CONTINUATION, &text, cursor, width);
 
-        // 光标在第几行、这一行内光标之前有多少显示列
-        let mut cursor_line = 0usize;
-        let mut line_start = 0usize;
-        for (index, ch) in chars.iter().enumerate().take(cursor) {
-            if *ch == '\n' {
-                cursor_line += 1;
-                line_start = index + 1;
-            }
+        let window_start = cursor_row.min(rows.len().saturating_sub(2));
+        let mut lines: Vec<String> = rows.into_iter().skip(window_start).take(2).collect();
+        // 窗口顶部统一用输入提示符；上一段若是续行标记，这里换回 `❯ `（宽度不变）。
+        if let Some(first) = lines.first_mut() {
+            let content = first
+                .strip_prefix(INPUT_MARK)
+                .or_else(|| first.strip_prefix(CONTINUATION))
+                .unwrap_or(first.as_str())
+                .to_string();
+            *first = format!("{INPUT_MARK}{content}");
         }
-        let before: String = chars[line_start..cursor].iter().collect();
-        // 光标列按展开后的行内文本算（`\t` 占几列只有展开之后才知道）
-        let before = expand_tabs(&before, 0);
 
-        let window_start = cursor_line.min(lines.len().saturating_sub(2));
-        let mut rows = [String::new(), String::new(), self.hint.clone()];
-        for (offset, row) in rows.iter_mut().take(2).enumerate() {
-            // 文本没有这一行时留空（不画孤零零的标记）
-            let Some(content) = lines.get(window_start + offset) else {
-                continue;
-            };
-            let marker = if offset == 0 {
-                INPUT_MARK
-            } else {
-                CONTINUATION
-            };
-            // `\t` 只在这一层展开：提交层与历史里仍是字面制表符
-            *row = format!("{marker}{}", expand_tabs(content, 0));
-        }
-        // 光标行在窗口内的相对位置（0 或 1），列 = 该行标记的显示宽度 + 光标前文本的显示宽度
-        let cursor_row = cursor_line - window_start;
-        let marker_width = if cursor_row == 0 {
-            display_width(INPUT_MARK)
+        // 提示行：Tab 的瞬时候选优先；否则给 `/` 输入实时建议（不虚构命令，直接复用 slash::complete）。
+        let hint = if self.hint.is_empty() {
+            self.suggestion()
         } else {
-            display_width(CONTINUATION)
+            self.hint.clone()
         };
         InputBlock {
-            lines: rows,
-            cursor: Some((cursor_row, marker_width + display_width(&before))),
+            lines,
+            hint,
+            cursor: Some((cursor_row - window_start, cursor_columns)),
+        }
+    }
+
+    /// `/` 输入的实时建议：复用 [`slash::complete`]，唯一命中/多候选都压成一行提示。
+    ///
+    /// 不写进 [`InputState::hint`]（那是 Tab 的瞬时状态），因此输入继续变化时建议会自动重算。
+    fn suggestion(&self) -> String {
+        let text = self.state.text();
+        let trimmed = text.trim_start();
+        if !trimmed.starts_with('/') {
+            return String::new();
+        }
+        match slash::complete_with_skills(trimmed, &self.skill_names) {
+            Completion::Accepted(candidate) => format!("↹ {candidate}"),
+            Completion::Listing(lines) if !lines.is_empty() => format!("↹ {}", lines.join("  ")),
+            Completion::None | Completion::Listing(_) => String::new(),
         }
     }
 
@@ -170,6 +182,7 @@ impl InputState {
             Key::Tab => self.on_tab(),
             // `ISIG` 关掉的终端上 `Ctrl+C` 只是一个字节：与 SIGINT 同义（外层决定退出/留在界内）
             Key::CtrlC => Action::Exit,
+            Key::CtrlP => Action::Palette,
             key => match self.state.handle(key) {
                 Event::Idle => Action::None,
                 Event::Redraw => Action::Redraw,
@@ -182,7 +195,7 @@ impl InputState {
 
     /// Tab：唯一命中整行替换、多候选拼成一行提示、没有候选清空提示。
     fn on_tab(&mut self) -> Action {
-        match slash::complete(&self.state.text()) {
+        match slash::complete_with_skills(&self.state.text(), &self.skill_names) {
             Completion::Accepted(text) => {
                 self.state.replace(&text);
                 self.set_hint(String::new());
@@ -208,10 +221,12 @@ impl InputState {
 
 #[cfg(test)]
 mod tests {
+    use crate::editor::draw::CONTINUATION;
     use crate::editor::history::History;
     use crate::render::width::{display_width, truncate_to_width};
     use crate::tui::app::Action;
     use crate::tui::{Submitted, classify};
+    use ignis_core::skills::SkillCatalog;
 
     use super::InputState;
 
@@ -268,8 +283,9 @@ mod tests {
 
         // 空行：提交空串，由分类判成空操作（不送模型、不留行）
         assert_eq!(state.on_bytes(b"\r"), [Action::Submit(String::new())]);
+        let skills = SkillCatalog::load(std::path::Path::new("/nonexistent/ignis-input-classify"));
         assert_eq!(
-            classify(""),
+            classify("", &skills),
             Submitted::Empty,
             "空提交在分类那一步变成空操作"
         );
@@ -343,7 +359,7 @@ mod tests {
         );
         assert_eq!(state.text(), "a\tb", "缓冲里仍是字面制表符");
 
-        let block = state.block();
+        let block = state.block(80);
         assert_eq!(block.lines[0], "❯ a       b");
         assert!(
             !block.lines[0].contains('\t'),
@@ -352,8 +368,84 @@ mod tests {
         );
         // `a` 之后补到第 8 列（7 个空格）再放 `b` → 行内正文 9 列，光标在末尾
         assert_eq!(block.cursor, Some((0, 2 + 9)));
-        assert_eq!(block.lines[1], "", "单行输入的第二条显示行是空的");
-        assert_eq!(block.lines[2], "", "没有 Tab 候选提示");
+        assert_eq!(block.lines.len(), 1, "单行输入只占一行，不留空白续行");
+        assert!(block.hint.is_empty(), "没有 Tab 候选提示");
+        assert_eq!(block.height(), 1);
+    }
+
+    /// Ctrl+P 交给应用层打开命令面板；技能名进入 `/` 的实时建议。
+    #[test]
+    fn ctrl_p_is_a_palette_action_and_skills_complete_slash_input() {
+        let mut state = input();
+        assert_eq!(state.on_bytes(b"\x10"), [Action::Palette]);
+
+        state.set_skills(vec!["brainstorming".to_string()]);
+        assert_eq!(state.on_bytes(b"/brain"), vec![Action::Redraw; 6]);
+        assert!(
+            state.block(80).hint.contains("/brainstorming"),
+            "{:?}",
+            state.block(80).hint
+        );
+        let before = state.text();
+        state.on_bytes(b"\t");
+        assert_eq!(state.text(), "/brainstorming ", "{before:?}");
+    }
+
+    /// 超过终端列数的单行输入按显示宽度折成两个物理行，光标落在续行末尾。
+    #[test]
+    fn long_input_wraps_at_the_terminal_width() {
+        let mut state = input();
+        state.on_bytes("0123456789".repeat(10).as_bytes());
+        let block = state.block(80);
+        assert_eq!(block.lines.len(), 2);
+        assert_eq!(
+            display_width(&block.lines[0]),
+            80,
+            "首行 2 列标记 + 78 列正文"
+        );
+        assert_eq!(
+            display_width(&block.lines[1]),
+            24,
+            "续行 2 列标记 + 22 列正文"
+        );
+        assert!(
+            block.lines[1].starts_with(CONTINUATION),
+            "{:?}",
+            block.lines[1]
+        );
+        assert_eq!(block.cursor, Some((1, 24)), "光标在续行末尾（含标记列）");
+        assert_eq!(block.height(), 2);
+    }
+
+    /// `/` 输入的实时建议：复用 slash::complete，Tab 的瞬时提示优先。
+    #[test]
+    fn slash_input_shows_live_suggestions_on_the_hint_line() {
+        let mut state = input();
+        assert_eq!(state.on_bytes(b"/"), [Action::Redraw]);
+        let block = state.block(80);
+        assert!(block.hint.starts_with("↹ "), "{:?}", block.hint);
+        assert!(block.hint.contains("/memory"), "{:?}", block.hint);
+        assert_eq!(state.hint(), "", "实时建议不写进 Tab 的瞬时提示状态");
+
+        // 完整命令且没有参数可补：不显示建议，输入区收回一行。
+        state.on_bytes(b"help");
+        let block = state.block(80);
+        assert!(block.hint.is_empty());
+        assert_eq!(block.height(), 1);
+
+        // `/kernel` 的取值建议。
+        let mut kernel = input();
+        kernel.on_bytes(b"/kernel n");
+        assert!(
+            kernel.block(80).hint.contains("/kernel native"),
+            "{:?}",
+            kernel.block(80).hint
+        );
+
+        // 普通文本没有建议。
+        let mut text = input();
+        text.on_bytes("你好".as_bytes());
+        assert!(text.block(80).hint.is_empty());
     }
 
     /// Tab 走 `slash::complete`：唯一命中替换整行、多候选拼成一行提示、没有候选清空提示。
@@ -376,10 +468,10 @@ mod tests {
         assert!(hint.contains("  "), "候选之间用两个空格拼接：{hint:?}");
         assert!(!hint.contains('\n'), "提示就是一行：{hint:?}");
 
-        // 提示行是输入区第 3 行；宽度截断由帧合成器统一做（这里量给它看）
-        let block = many.block();
-        assert_eq!(block.lines[2], hint);
-        let narrow = truncate_to_width(&block.lines[2], 20);
+        // 提示行在正文之后；宽度截断由帧合成器统一做（这里量给它看）
+        let block = many.block(80);
+        assert_eq!(block.hint, hint);
+        let narrow = truncate_to_width(&block.hint, 20);
         assert_eq!(
             display_width(narrow),
             20,

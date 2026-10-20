@@ -46,7 +46,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub tui: bool,
 
-    /// 跳过启动屏（仅交互式 REPL）——与 `-c`/`--tui` 一样是 REPL 专属开关
+    /// 跳过启动屏（TUI 下关闭整个欢迎面板；仅交互式 REPL）——与 `-c`/`--tui` 一样是 REPL 专属开关
     #[arg(long = "no-banner", global = true)]
     pub no_banner: bool,
 
@@ -171,7 +171,7 @@ pub enum MemoryCommand {
 /// `ignis skills` 的子命令。
 #[derive(Debug, Subcommand)]
 pub enum SkillsCommand {
-    /// 列出技能（内置 + `~/.ignis/skills`，按名称排序）
+    /// 列出技能（内置 + 项目 `.ignis/skills` + `~/.ignis/skills`，按名称排序）
     List,
 }
 

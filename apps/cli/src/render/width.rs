@@ -37,6 +37,27 @@ pub fn display_width(text: &str) -> usize {
     text.chars().map(char_width).sum()
 }
 
+/// 已上色字符串的显示宽度：跳过 CSI 序列，只数可见字符。
+///
+/// [`display_width`] 是纯文本口径；字符串里带 SGR 时（欢迎面板的火焰/横幅/标题），
+/// 序列里的 `[`、数字、`;`、`m` 会被误算成列。布局对齐必须用这个函数。
+pub fn visible_width(text: &str) -> usize {
+    let mut width = 0usize;
+    let mut index = 0usize;
+    while let Some(c) = text[index..].chars().next() {
+        if c == ESC_CHAR {
+            let Some(next) = csi_end(text, index) else {
+                break;
+            };
+            index = next;
+            continue;
+        }
+        width += char_width(c);
+        index += c.len_utf8();
+    }
+    width
+}
+
 /// 制表位步长：`\t` 前进到下一个 8 列的整数倍（与 TUI 滚动区的显示口径一致）。
 pub const TAB_STOP: usize = 8;
 
@@ -284,7 +305,8 @@ impl Wrapper {
 #[cfg(test)]
 mod tests {
     use super::{
-        TAB_STOP, advance_column, char_width, display_width, expand_tabs, truncate_to_width, wrap,
+        TAB_STOP, advance_column, char_width, display_width, expand_tabs, truncate_to_width,
+        visible_width, wrap,
     };
 
     /// P6 T2：制表位口径——`\t` 前进到下一个 8 列的整数倍，其余按显示宽度走。
@@ -339,6 +361,14 @@ mod tests {
         assert_eq!(display_width("，。"), 4);
         // 控制字符不占列（`\n` 既不换行也不占宽）
         assert_eq!(display_width("a\nb"), 2);
+        // 上色串：SGR 的参数字符不能算进可见宽度
+        assert_eq!(
+            visible_width("\u{1b}[38;2;255;107;26m██\u{1b}[0m"),
+            2,
+            "CSI 序列零宽"
+        );
+        assert_eq!(visible_width("\u{1b}[1m\x1b[33mIGNIS\u{1b}[0m"), 5);
+        assert!(display_width("\u{1b}[38;2;255;107;26m██\u{1b}[0m") > 2);
     }
 
     #[test]

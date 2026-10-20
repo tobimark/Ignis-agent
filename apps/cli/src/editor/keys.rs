@@ -59,6 +59,8 @@ pub enum Key {
     CtrlD,
     /// Ctrl+U（0x15）。
     CtrlU,
+    /// Ctrl+P（0x10）：TUI 打开命令面板。
+    CtrlP,
     /// Ctrl+C（0x03）。
     CtrlC,
     /// Tab（0x09；粘贴区间里不产生它，那里按字面出 `Char('\t')`）。
@@ -340,6 +342,7 @@ fn control_key(byte: u8) -> Option<Key> {
         0x05 => Some(Key::End),
         0x04 => Some(Key::CtrlD),
         0x15 => Some(Key::CtrlU),
+        0x10 => Some(Key::CtrlP),
         0x03 => Some(Key::CtrlC),
         0x09 => Some(Key::Tab),
         b'\x7f' | 0x08 => Some(Key::Backspace),
@@ -500,6 +503,7 @@ mod tests {
         assert_eq!(decode(b"\x05"), vec![Key::End], "Ctrl+E = 行尾");
         assert_eq!(decode(b"\x04"), vec![Key::CtrlD], "Ctrl+D");
         assert_eq!(decode(b"\x15"), vec![Key::CtrlU], "Ctrl+U");
+        assert_eq!(decode(b"\x10"), vec![Key::CtrlP], "Ctrl+P");
         assert_eq!(decode(b"\x03"), vec![Key::CtrlC], "Ctrl+C");
         assert_eq!(decode(b"\x09"), vec![Key::Tab], "Tab");
         assert_eq!(decode(b"\x7f"), vec![Key::Backspace], "0x7F 是 Backspace");

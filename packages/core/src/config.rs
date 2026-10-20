@@ -623,6 +623,8 @@ mod tests {
                 model: "qwen3".into(),
                 api_key_env: "MY_KEY".into(),
                 protocol: ModelProtocol::OpenAi,
+                context_window: None,
+                max_output_tokens: None,
             },
             api_key: Some("sk-roundtrip".into()),
             limits: Limits {
